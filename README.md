@@ -127,6 +127,12 @@ python run_benchmark.py \
 如果你要和你当前终端里的命令保持一致（例如加入 `--use_wandb`），可以在上面基础上补充：
 `--use_wandb --wandb_project <your_project>`
 
+提示：使用 nohup 前建议先创建日志目录：
+
+```bash
+mkdir -p logs
+```
+
 ### 1.1) DDP 多卡冒烟测试（torchrun）
 在 Linux 多卡环境下，建议先用极小步数验证结构演化与 reward 不分裂：
 
@@ -169,6 +175,33 @@ python run_benchmark.py \
   --export_csv results_main.csv
 ```
 
+双卡（torchrun）+ nohup 后台运行：
+
+```bash
+nohup torchrun --nproc_per_node=2 --master_port=29500 \
+  run_benchmark.py \
+  --ddp \
+  --methods lora adalora evorank \
+  --task_list sst2 qnli rte mnli \
+  --model_list roberta-base \
+  --target_rank 8 \
+  --epochs 3 \
+  --batch_size 16 \
+  --lr 2e-5 \
+  --weight_decay 0.01 \
+  --warmup_ratio 0.1 \
+  --T_es 200 \
+  --mini_val_k 8 \
+  --adalora_delta_t 200 \
+  --lambda_c 0.0 \
+  --complexity_mode rank_sum \
+  --population_strategy all \
+  --seed 42 \
+  --log_dir runs/main_results_ddp \
+  --export_csv results_main_ddp.csv \
+  > logs/main_results_ddp.out 2>&1 &
+```
+
 ### 3) 消融模板（EvoRank）
 
 ```bash
@@ -188,6 +221,30 @@ python run_benchmark.py \
   --seed 42 \
   --log_dir runs/ablation/full \
   --export_csv results_ablation_full.csv
+```
+
+双卡（torchrun）+ nohup 后台运行：
+
+```bash
+nohup torchrun --nproc_per_node=2 --master_port=29500 \
+  run_benchmark.py \
+  --ddp \
+  --methods evorank \
+  --task_name sst2 \
+  --model_name roberta-base \
+  --target_rank 8 \
+  --epochs 3 \
+  --lr 2e-5 \
+  --T_es 200 \
+  --warmup_ratio 0.1 \
+  --lambda_c 0.001 \
+  --complexity_mode rank_sum \
+  --lambda_pop 16 \
+  --population_strategy all \
+  --seed 42 \
+  --log_dir runs/ablation_full_ddp \
+  --export_csv results_ablation_full_ddp.csv \
+  > logs/ablation_full_ddp.out 2>&1 &
 ```
 
 ### 4) 效率模板
@@ -212,6 +269,33 @@ python run_benchmark.py \
   --seed 42 \
   --log_dir runs/efficiency \
   --export_csv results_efficiency.csv
+```
+
+双卡（torchrun）+ nohup 后台运行：
+
+```bash
+nohup torchrun --nproc_per_node=2 --master_port=29500 \
+  run_benchmark.py \
+  --ddp \
+  --methods lora adalora evorank \
+  --task_name sst2 \
+  --model_name roberta-base \
+  --target_rank 8 \
+  --batch_size 16 \
+  --max_train_steps 500 \
+  --lr 2e-5 \
+  --warmup_ratio 0.1 \
+  --T_es 200 \
+  --mini_val_k 8 \
+  --adalora_delta_t 200 \
+  --lambda_c 0.001 \
+  --complexity_mode rank_sum \
+  --lambda_pop 16 \
+  --population_strategy all \
+  --seed 42 \
+  --log_dir runs/efficiency_ddp \
+  --export_csv results_efficiency_ddp.csv \
+  > logs/efficiency_ddp.out 2>&1 &
 ```
 
 ---
