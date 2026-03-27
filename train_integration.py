@@ -1,3 +1,4 @@
+import random
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -113,6 +114,11 @@ def train_evo_lora_step(
     step: int,
     warmup_steps: int,
     T_es: int = 200,
+    lambda_c: float = 0.0,
+    complexity_mode: str = "rank_sum",
+    lambda_pop: Optional[int] = None,
+    population_strategy: str = "all",
+    random_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     双时间尺度训练模板：
@@ -149,6 +155,29 @@ def train_evo_lora_step(
             if ctrl.cooldowns[name].device != layer_device:
                 ctrl.cooldowns[name] = ctrl.cooldowns[name].to(layer_device)
 
+    def _compute_complexity(ctrl: RankEvolutionController, mode: str) -> float:
+        if mode == "rank_sum":
+            return float(sum(layer.get_active_rank() for layer in ctrl.layers.values()))
+        if mode == "size_aware":
+            return float(
+                sum((layer.in_features + layer.out_features) * layer.get_active_rank() for layer in ctrl.layers.values())
+            )
+        raise ValueError(f"未知 complexity_mode: {mode}")
+
+    def _select_population(
+        mutations: List[ModuleMutation],
+        pop_size: Optional[int],
+        strategy: str,
+    ) -> List[ModuleMutation]:
+        if pop_size is None or pop_size <= 0 or pop_size >= len(mutations):
+            return mutations
+        if strategy == "all":
+            return mutations[:pop_size]
+        if strategy == "random":
+            rng = random.Random(random_seed)
+            return rng.sample(mutations, k=pop_size)
+        raise ValueError(f"未知 population_strategy: {strategy}")
+
     model.train()
     _sync_controller_state_device(controller)
     inputs, targets = train_batch
@@ -179,6 +208,7 @@ def train_evo_lora_step(
         tau_grow, tau_prune = controller.compute_thresholds()
         controller.tick_evolution_state(tau_grow=tau_grow, tau_prune=tau_prune)
         mutations = controller.generate_mutations()
+        mutations = _select_population(mutations, lambda_pop, population_strategy)
 
         result["did_evolution"] = True
         result["num_mutations"] = len(mutations)
@@ -189,8 +219,21 @@ def train_evo_lora_step(
             was_training = model.training
             model.eval()
 
-            rewards: List[Tuple[float, ModuleMutation]] = []
+            rewards: List[Tuple[float, Optional[ModuleMutation]]] = []
             with torch.no_grad():
+                # no-op 候选：与论文 elitist 选择一致，当前结构也参与竞选
+                base_eval_losses: List[torch.Tensor] = []
+                for val_inputs, val_targets in val_batches:
+                    base_logits = model(val_inputs)
+                    base_eval_losses.append(loss_fn(base_logits, val_targets).detach())
+                base_eval_loss = torch.stack(base_eval_losses).mean()
+                if dist.is_available() and dist.is_initialized():
+                    reduced_base = base_eval_loss.clone()
+                    dist.all_reduce(reduced_base, op=dist.ReduceOp.SUM)
+                    base_eval_loss = reduced_base / dist.get_world_size()
+                base_reward = -float(base_eval_loss.item()) - lambda_c * _compute_complexity(controller, complexity_mode)
+                rewards.append((base_reward, None))
+
                 for mutation in mutations:
                     mutation.apply()
                     eval_losses: List[torch.Tensor] = []
@@ -206,8 +249,7 @@ def train_evo_lora_step(
                         dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
                         eval_loss = reduced / dist.get_world_size()
 
-                    # reward 越大越好，这里采用 reward = -eval_loss
-                    reward = -float(eval_loss.item())
+                    reward = -float(eval_loss.item()) - lambda_c * _compute_complexity(controller, complexity_mode)
                     rewards.append((reward, mutation))
                     mutation.undo()
 
@@ -216,9 +258,11 @@ def train_evo_lora_step(
 
             if rewards:
                 best_reward, best_mutation = max(rewards, key=lambda x: x[0])
-                controller.commit_mutation(best_mutation)
+                # 仅当变异优于 no-op 时才提交，严格遵循 elitist selection
+                if best_mutation is not None:
+                    controller.commit_mutation(best_mutation)
                 result["best_reward"] = best_reward
-                result["best_mutation"] = best_mutation.__class__.__name__
+                result["best_mutation"] = "noop" if best_mutation is None else best_mutation.__class__.__name__
 
     # 3) 参数更新始终发生在本步末尾，保证训练主干稳定推进。
     optimizer.step()

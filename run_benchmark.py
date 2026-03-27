@@ -1,5 +1,6 @@
 import argparse
 import copy
+import csv
 import os
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -206,6 +207,11 @@ def run_training_loop(
     log_dir: str = "runs/benchmark",
     use_wandb: bool = False,
     wandb_project: str = "evorank-benchmark",
+    lambda_c: float = 0.0,
+    complexity_mode: str = "rank_sum",
+    lambda_pop: Optional[int] = None,
+    population_strategy: str = "all",
+    random_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # 在同进程串行跑多方法时，先清空缓存可显著降低碎片化导致的 OOM 风险。
@@ -267,6 +273,11 @@ def run_training_loop(
                     step=global_step,
                     warmup_steps=warmup_steps,
                     T_es=T_es,
+                    lambda_c=lambda_c,
+                    complexity_mode=complexity_mode,
+                    lambda_pop=lambda_pop,
+                    population_strategy=population_strategy,
+                    random_seed=random_seed,
                 )
                 train_loss = float(out["train_loss"])
                 avg_active_rank = float(
@@ -381,57 +392,113 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_dir", type=str, default="runs/benchmark")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="evorank-benchmark")
+    parser.add_argument("--lambda_c", type=float, default=0.0)
+    parser.add_argument("--complexity_mode", type=str, default="rank_sum", choices=["rank_sum", "size_aware"])
+    parser.add_argument("--lambda_pop", type=int, default=None)
+    parser.add_argument("--population_strategy", type=str, default="all", choices=["all", "random"])
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--task_list", nargs="+", default=None, help="多任务实验协议，例如: sst2 qnli mnli")
+    parser.add_argument("--model_list", nargs="+", default=None, help="多骨干实验协议，例如: roberta-base")
+    parser.add_argument("--export_csv", type=str, default="benchmark_results.csv")
     return parser.parse_args()
+
+
+def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    """
+    论文协议批量运行骨架：
+    - 支持多任务 × 多骨干 × 多方法
+    - 导出 CSV 方便直接填表（主结果/效率/消融）
+    """
+    tasks = args.task_list if args.task_list else [args.task_name]
+    models = args.model_list if args.model_list else [args.model_name]
+    all_results: List[Dict[str, Any]] = []
+
+    for task_name in tasks:
+        for model_name in models:
+            train_loader, val_loader, base_model = setup_data_and_model(
+                task_name=task_name,
+                model_name=model_name,
+                batch_size=args.batch_size,
+                max_length=args.max_length,
+            )
+            planned_total_steps = (
+                args.max_train_steps if args.max_train_steps is not None else args.epochs * len(train_loader)
+            )
+            for method in args.methods:
+                method_model = copy.deepcopy(base_model)
+                method_model, controller, meta = peft_factory(
+                    model=method_model,
+                    method_name=method,
+                    target_rank=args.target_rank,
+                    total_steps=planned_total_steps,
+                    adalora_delta_t=args.adalora_delta_t,
+                )
+                res = run_training_loop(
+                    model=method_model,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    method_name=method,
+                    controller=controller,
+                    epochs=args.epochs,
+                    lr=args.lr,
+                    weight_decay=args.weight_decay,
+                    warmup_ratio=args.warmup_ratio,
+                    T_es=args.T_es,
+                    mini_val_k=args.mini_val_k,
+                    max_train_steps=args.max_train_steps,
+                    log_dir=args.log_dir,
+                    use_wandb=args.use_wandb,
+                    wandb_project=args.wandb_project,
+                    lambda_c=args.lambda_c,
+                    complexity_mode=args.complexity_mode,
+                    lambda_pop=args.lambda_pop,
+                    population_strategy=args.population_strategy,
+                    random_seed=args.seed,
+                )
+                res.update(
+                    {
+                        "task": task_name,
+                        "backbone": model_name,
+                        "trainable_params": meta["trainable_params"],
+                    }
+                )
+                all_results.append(res)
+
+    with open(args.export_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "task",
+                "backbone",
+                "method",
+                "trainable_params",
+                "best_val_accuracy",
+                "peak_memory_mb",
+                "avg_active_rank",
+                "total_train_time_sec",
+            ],
+        )
+        writer.writeheader()
+        for row in all_results:
+            writer.writerow(row)
+
+    return all_results
 
 
 if __name__ == "__main__":
     args = parse_args()
-    train_loader, val_loader, base_model = setup_data_and_model(
-        task_name=args.task_name,
-        model_name=args.model_name,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
-    )
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
-    results: List[Dict[str, Any]] = []
-    planned_total_steps = args.max_train_steps if args.max_train_steps is not None else args.epochs * len(train_loader)
-    for method in args.methods:
-        # 每个方法从同一个初始权重出发，保证公平对比。
-        method_model = copy.deepcopy(base_model)
-        method_model, controller, meta = peft_factory(
-            model=method_model,
-            method_name=method,
-            target_rank=args.target_rank,
-            total_steps=planned_total_steps,
-            adalora_delta_t=args.adalora_delta_t,
-        )
-        print(
-            f"[{method}] trainable_params={meta['trainable_params']:,} "
-            f"(预算参考: LoRA r={args.target_rank})"
-        )
-        res = run_training_loop(
-            model=method_model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            method_name=method,
-            controller=controller,
-            epochs=args.epochs,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            warmup_ratio=args.warmup_ratio,
-            T_es=args.T_es,
-            mini_val_k=args.mini_val_k,
-            max_train_steps=args.max_train_steps,
-            log_dir=args.log_dir,
-            use_wandb=args.use_wandb,
-            wandb_project=args.wandb_project,
-        )
-        results.append(res)
+    results = run_protocol_grid(args)
 
     print("\n=== Benchmark Summary ===")
-    print(f"{'method':<12} {'best_acc':<10} {'peak_mem_mb':<12} {'avg_rank':<12} {'time_sec':<12}")
+    print(f"{'task':<8} {'backbone':<16} {'method':<12} {'best_acc':<10} {'peak_mem_mb':<12} {'avg_rank':<12} {'time_sec':<12}")
     for r in results:
         print(
+            f"{r.get('task', args.task_name):<8} "
+            f"{r.get('backbone', args.model_name):<16} "
             f"{r['method']:<12} "
             f"{r['best_val_accuracy']:<10.4f} "
             f"{r['peak_memory_mb']:<12.2f} "
