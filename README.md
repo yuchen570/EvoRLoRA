@@ -51,17 +51,33 @@
 
 ---
 
-## 安装步骤
+## 安装步骤（中国网络/清华源 + 当前目录 conda 环境）
 
-### 1) 创建虚拟环境
+### 1) 在当前目录创建 conda 环境（不污染系统）
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+mkdir -p envs datasets models
+conda create -y -p ./envs/evorank python=3.10
+conda activate ./envs/evorank
 python -m pip install --upgrade pip
 ```
 
-### 2) 先安装 PyTorch（单独安装，避免 requirements 与 CUDA 轮子冲突）
+如需 conda 包也走清华镜像，可在当前用户配置（可选）：
+
+```bash
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/
+conda config --set show_channel_urls yes
+```
+
+### 2) 配置 pip 清华源（当前 shell 会话）
+
+```bash
+pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn
+```
+
+### 3) 安装 PyTorch（单独安装，避免 requirements 与 CUDA 轮子冲突）
 
 二选一（推荐先尝试 cu124）：
 
@@ -73,10 +89,21 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
-### 3) 安装其余依赖
+### 4) 安装其余依赖
 
 ```bash
 pip install -r requirements.txt
+```
+
+### 5) 缓存目录约定（已内置默认）
+
+- 数据默认缓存到 `./datasets`
+- 模型默认缓存到 `./models`
+
+如需显式指定：
+
+```bash
+python run_benchmark.py --dataset_cache_dir datasets --model_cache_dir models
 ```
 
 ---

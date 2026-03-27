@@ -78,15 +78,19 @@ def setup_data_and_model(
     task_type: str = "nlu",
     nlg_dataset_name: str = "cnn_dailymail",
     max_target_length: int = 64,
+    dataset_cache_dir: str = "datasets",
+    model_cache_dir: str = "models",
     ddp_enabled: bool = False,
     rank: int = 0,
     world_size: int = 1,
     seed: int = 42,
 ) -> Tuple[DataLoader, DataLoader, nn.Module, AutoTokenizer]:
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    os.makedirs(dataset_cache_dir, exist_ok=True)
+    os.makedirs(model_cache_dir, exist_ok=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=model_cache_dir)
 
     if task_type == "nlu":
-        dataset = load_dataset("glue", task_name)
+        dataset = load_dataset("glue", task_name, cache_dir=dataset_cache_dir)
 
         sentence_keys = {
             "sst2": ("sentence", None),
@@ -152,14 +156,18 @@ def setup_data_and_model(
             val_loader = DataLoader(tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator)
 
         num_labels = 2 if task_name == "sst2" else None
-        base_model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels)
+        base_model = AutoModelForSequenceClassification.from_pretrained(
+            model_name,
+            num_labels=num_labels,
+            cache_dir=model_cache_dir,
+        )
         return train_loader, val_loader, base_model, tokenizer
 
     if task_type == "nlg":
         if nlg_dataset_name != "cnn_dailymail":
             raise NotImplementedError("当前仅支持 nlg_dataset_name='cnn_dailymail'")
 
-        dataset = load_dataset(nlg_dataset_name, "3.0.0")
+        dataset = load_dataset(nlg_dataset_name, "3.0.0", cache_dir=dataset_cache_dir)
         text_key = "article"
         target_key = "highlights"
 
@@ -213,7 +221,7 @@ def setup_data_and_model(
             train_loader = DataLoader(tokenized["train"], batch_size=batch_size, shuffle=True, collate_fn=collator)
             val_loader = DataLoader(tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator)
 
-        base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, cache_dir=model_cache_dir)
         return train_loader, val_loader, base_model, tokenizer
 
     raise ValueError(f"未知 task_type: {task_type}")
@@ -627,6 +635,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_target_length", type=int, default=64, help="nlg 的摘要/目标序列最大长度")
     parser.add_argument("--generation_max_new_tokens", type=int, default=64, help="nlg 生成最大新 tokens")
     parser.add_argument("--nlg_eval_max_samples", type=int, default=200, help="nlg 验证集评测最大样本数（仅用于 ROUGE）")
+    parser.add_argument("--dataset_cache_dir", type=str, default="datasets", help="数据集缓存目录（建议仓库内相对路径）")
+    parser.add_argument("--model_cache_dir", type=str, default="models", help="模型缓存目录（建议仓库内相对路径）")
     parser.add_argument("--model_name", type=str, default="roberta-base")
     parser.add_argument("--methods", nargs="+", default=["lora", "adalora", "evorank"])
     parser.add_argument("--target_rank", type=int, default=8)
@@ -676,6 +686,8 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 task_type=args.task_type,
                 nlg_dataset_name=args.nlg_dataset_name,
                 max_target_length=args.max_target_length,
+                dataset_cache_dir=args.dataset_cache_dir,
+                model_cache_dir=args.model_cache_dir,
                 ddp_enabled=args.ddp_enabled,
                 rank=args.rank,
                 world_size=args.world_size,
@@ -756,6 +768,13 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
 if __name__ == "__main__":
     args = parse_args()
+    # 统一 HuggingFace 缓存到当前工程目录，避免默认写入用户主目录。
+    os.makedirs(args.dataset_cache_dir, exist_ok=True)
+    os.makedirs(args.model_cache_dir, exist_ok=True)
+    os.environ.setdefault("HF_HOME", os.path.abspath(args.model_cache_dir))
+    os.environ.setdefault("TRANSFORMERS_CACHE", os.path.abspath(args.model_cache_dir))
+    os.environ.setdefault("HF_DATASETS_CACHE", os.path.abspath(args.dataset_cache_dir))
+
     # 从 torchrun 环境变量读取分布式信息
     env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
     env_rank = int(os.environ.get("RANK", "0"))
