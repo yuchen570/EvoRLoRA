@@ -82,15 +82,7 @@ pip install -r requirements.txt
 ---
 
 ## 快速开始
-
-### 1) 单元测试
-
-```bash
-python test_evo_rank_lora.py
-python test_rank_evolution_controller.py
-```
-
-### 2) 冒烟测试（推荐先跑）
+### 1) 冒烟测试（推荐先跑）
 
 ```bash
 python run_benchmark.py \
@@ -108,7 +100,7 @@ python run_benchmark.py \
 如果你要和你当前终端里的命令保持一致（例如加入 `--use_wandb`），可以在上面基础上补充：
 `--use_wandb --wandb_project <your_project>`
 
-### 3) 主结果模板（多任务）
+### 2) 主结果模板（多任务）
 
 ```bash
 python run_benchmark.py \
@@ -132,7 +124,7 @@ python run_benchmark.py \
   --export_csv results_main.csv
 ```
 
-### 4) 消融模板（EvoRank）
+### 3) 消融模板（EvoRank）
 
 ```bash
 python run_benchmark.py \
@@ -153,7 +145,7 @@ python run_benchmark.py \
   --export_csv results_ablation_full.csv
 ```
 
-### 5) 效率模板
+### 4) 效率模板
 
 ```bash
 python run_benchmark.py \
