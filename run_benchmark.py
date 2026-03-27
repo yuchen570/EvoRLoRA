@@ -155,7 +155,12 @@ def setup_data_and_model(
             train_loader = DataLoader(tokenized["train"], batch_size=batch_size, shuffle=True, collate_fn=collator)
             val_loader = DataLoader(tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator)
 
-        num_labels = 2 if task_name == "sst2" else None
+        label_feature = dataset["train"].features.get("label", None)
+        if label_feature is not None and hasattr(label_feature, "num_classes") and label_feature.num_classes is not None:
+            num_labels = int(label_feature.num_classes)
+        else:
+            # 兜底：若不是标准 ClassLabel，就从训练集标签去重计数
+            num_labels = len(set(dataset["train"]["label"]))
         base_model = AutoModelForSequenceClassification.from_pretrained(
             model_name,
             num_labels=num_labels,
