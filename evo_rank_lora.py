@@ -28,7 +28,7 @@ class EvoRankLoRALayer(nn.Module):
         out_features: int,
         r_max: int,
         r_init: int,
-        lora_alpha: float = 1.0,
+        lora_alpha: float = 16.0,
         lora_dropout: float = 0.0,
         debug: bool = False,
     ):
