@@ -100,6 +100,24 @@ python run_benchmark.py \
 如果你要和你当前终端里的命令保持一致（例如加入 `--use_wandb`），可以在上面基础上补充：
 `--use_wandb --wandb_project <your_project>`
 
+### 1.1) DDP 多卡冒烟测试（torchrun）
+在 Linux 多卡环境下，建议先用极小步数验证结构演化与 reward 不分裂：
+
+```bash
+torchrun --nproc_per_node=2 --master_port=29500 \
+  run_benchmark.py \
+  --ddp \
+  --task_name sst2 \
+  --model_name roberta-base \
+  --methods lora adalora evorank \
+  --max_train_steps 20 \
+  --T_es 10 \
+  --warmup_ratio 0.1 \
+  --mini_val_k 4 \
+  --log_dir runs/ddp_smoke \
+  --export_csv results_ddp_smoke.csv
+```
+
 ### 2) 主结果模板（多任务）
 
 ```bash
@@ -181,6 +199,36 @@ python run_benchmark.py \
 - CSV 导出：
   - `--export_csv <file.csv>`
   - 默认字段：`task/backbone/method/trainable_params/best_val_accuracy/peak_memory_mb/avg_active_rank/total_train_time_sec`
+
+---
+
+## NLG（生成任务）示例：CNN/DailyMail + ROUGE-L
+脚本支持 `--task_type nlg`。当前默认使用 CNN/DailyMail，并在验证阶段按 `--nlg_eval_max_samples` 条样本计算 ROUGE-L。
+
+```bash
+python run_benchmark.py \
+  --task_type nlg \
+  --nlg_dataset_name cnn_dailymail \
+  --task_name cnn_dailymail \
+  --model_name t5-small \
+  --methods lora adalora evorank \
+  --target_rank 8 \
+  --epochs 1 \
+  --batch_size 4 \
+  --max_length 256 \
+  --max_target_length 64 \
+  --generation_max_new_tokens 64 \
+  --nlg_eval_max_samples 50 \
+  --max_train_steps 50 \
+  --T_es 20 \
+  --warmup_ratio 0.1 \
+  --lambda_c 0.0 \
+  --complexity_mode rank_sum \
+  --lambda_pop 16 \
+  --population_strategy all \
+  --log_dir runs/nlg_smoke \
+  --export_csv results_nlg_smoke.csv
+```
 
 ---
 

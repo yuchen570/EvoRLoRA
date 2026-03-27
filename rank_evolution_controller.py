@@ -118,7 +118,12 @@ class RankEvolutionController:
         r_max: int = 16,
         H_g: int = 2,
         H_p: int = 3,
-        cooldown_steps: int = 2
+        cooldown_steps: int = 2,
+        # ===== ES 候选限流（避免 Reallocate 组合爆炸）=====
+        max_expand_candidates: Optional[int] = None,
+        max_prune_candidates: Optional[int] = None,
+        max_reallocate_candidates: Optional[int] = None,
+        reallocate_strategy: str = "topk_cross",
     ):
         if not lora_layers:
             raise ValueError("lora_layers 不能为空字典")
@@ -147,6 +152,35 @@ class RankEvolutionController:
         
         # 是否完成了冷启动第一帧 (Step 0 全零陷阱的防御标志)
         self._is_initialized = False
+
+        self.max_expand_candidates = max_expand_candidates
+        self.max_prune_candidates = max_prune_candidates
+        self.max_reallocate_candidates = max_reallocate_candidates
+        self.reallocate_strategy = reallocate_strategy
+
+    def cleanup_uncommitted_mutations(
+        self,
+        mutations: List["ModuleMutation"],
+        committed: Optional["ModuleMutation"] = None,
+    ) -> None:
+        """
+        ES 每轮结束后，主动清理那些未被 commit 的 Mutation 缓存引用。
+
+        说明：当前实现中 mutation.undo() 一般会把 cached_* 置空，但外部 ES
+        有时会不小心持有 mutation 对象（例如写日志/历史记录），因此增加
+        显式 cleanup 可以进一步降低“落选动作缓存滞留导致 OOM”的工程风险。
+        """
+        if not mutations:
+            return
+
+        for m in mutations:
+            if committed is not None and m is committed:
+                continue
+            try:
+                m.clear_cache()
+            except Exception:
+                # cleanup 只做安全兜底，避免影响主流程
+                pass
 
     def update_statistics(self):
         """收集当前层的需求评分与重要性评分，并使用 EMA 平滑累加。"""
@@ -236,38 +270,69 @@ class RankEvolutionController:
         返回所有达标候选，让外层 ES 在验证集上决策赢家。
         """
         mutations: List[ModuleMutation] = []
-        expand_candidates: List[ExpandMutation] = []
-        prune_candidates: List[PruneMutation] = []
 
-        # 全量扩张候选：所有满足 count_g 达标且仍可扩张的层
+        # 1) 收集扩张候选（按 u_l 分数排序后再限流）
+        expand_candidates: List[Tuple[float, ExpandMutation]] = []
         for name, layer in self.layers.items():
             if self.count_g[name] < self.H_g:
                 continue
             inactive_indices = layer.get_inactive_indices()
-            if len(inactive_indices) == 0:
+            if not inactive_indices:
                 continue
             # 保持一个稳定策略：优先激活最小未激活索引
-            expand_candidates.append(ExpandMutation(name, layer, inactive_indices[0]))
+            e_mut = ExpandMutation(name, layer, inactive_indices[0])
+            expand_candidates.append((float(self.ema_u[name]), e_mut))
 
-        # 全量修剪候选：所有满足 count_p 达标的组件
+        expand_candidates.sort(key=lambda x: x[0], reverse=True)
+        if self.max_expand_candidates is not None:
+            expand_candidates = expand_candidates[: self.max_expand_candidates]
+
+        expand_muts: List[ExpandMutation] = [m for _, m in expand_candidates]
+
+        # 2) 收集修剪候选（按 s_{l,i} 从小到大排序后再限流）
+        prune_candidates: List[Tuple[float, PruneMutation]] = []
         for name, layer in self.layers.items():
             valid_p_mask = self.count_p[name] >= self.H_p
-            if valid_p_mask.any():
-                for idx in torch.where(valid_p_mask)[0].tolist():
-                    prune_candidates.append(PruneMutation(name, layer, idx))
+            if not valid_p_mask.any():
+                continue
+            valid_indices = torch.where(valid_p_mask)[0].tolist()
+            for idx in valid_indices:
+                p_score = float(self.ema_s[name][idx].item())
+                prune_candidates.append((p_score, PruneMutation(name, layer, idx)))
 
-        mutations.extend(expand_candidates)
-        mutations.extend(prune_candidates)
+        prune_candidates.sort(key=lambda x: x[0], reverse=False)
+        if self.max_prune_candidates is not None:
+            prune_candidates = prune_candidates[: self.max_prune_candidates]
 
-        # 可选组合候选：仅跨层重分配，避免同层互相打架
-        for e_mut in expand_candidates:
-            for p_mut in prune_candidates:
+        prune_muts: List[PruneMutation] = [m for _, m in prune_candidates]
+
+        # 3) 单操作候选
+        mutations.extend(expand_muts)
+        mutations.extend(prune_muts)
+
+        # 4) Reallocate 候选：避免组合爆炸
+        if not expand_muts or not prune_muts:
+            return mutations
+
+        reallocate_count = 0
+        for e_mut in expand_muts:
+            for p_mut in prune_muts:
                 if e_mut.layer_name == p_mut.layer_name:
                     continue
-                mutations.append(ReallocateMutation(
-                    PruneMutation(p_mut.layer_name, p_mut.layer, p_mut.index),
-                    ExpandMutation(e_mut.layer_name, e_mut.layer, e_mut.index)
-                ))
+
+                if self.reallocate_strategy not in {"topk_cross"}:
+                    raise ValueError(f"未知 reallocate_strategy: {self.reallocate_strategy}")
+
+                if self.max_reallocate_candidates is not None and reallocate_count >= self.max_reallocate_candidates:
+                    return mutations
+
+                mutations.append(
+                    ReallocateMutation(
+                        PruneMutation(p_mut.layer_name, p_mut.layer, p_mut.index),
+                        ExpandMutation(e_mut.layer_name, e_mut.layer, e_mut.index),
+                    )
+                )
+                reallocate_count += 1
 
         return mutations
 

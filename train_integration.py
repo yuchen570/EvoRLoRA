@@ -181,6 +181,7 @@ def train_evo_lora_step(
     model.train()
     _sync_controller_state_device(controller)
     inputs, targets = train_batch
+    model_device = next(model.parameters()).device
 
     optimizer.zero_grad(set_to_none=True)
     logits = model(inputs)
@@ -205,6 +206,15 @@ def train_evo_lora_step(
     if should_evolve:
         # 必须在 optimizer.step() 之前调用，保证 LoRA 梯度仍可用于评分。
         controller.update_statistics()
+        # DDP 下为避免统计量在各卡之间出现微小差异，进一步对 EMA 统计做全局一致化。
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            for name in controller.layers:
+                u = torch.tensor([controller.ema_u[name]], device=model_device, dtype=torch.float32)
+                dist.all_reduce(u, op=dist.ReduceOp.SUM)
+                controller.ema_u[name] = (u / world_size).item()
+                dist.all_reduce(controller.ema_s[name], op=dist.ReduceOp.SUM)
+                controller.ema_s[name] = controller.ema_s[name] / world_size
         tau_grow, tau_prune = controller.compute_thresholds()
         controller.tick_evolution_state(tau_grow=tau_grow, tau_prune=tau_prune)
         mutations = controller.generate_mutations()
@@ -224,8 +234,10 @@ def train_evo_lora_step(
                 # no-op 候选：与论文 elitist 选择一致，当前结构也参与竞选
                 base_eval_losses: List[torch.Tensor] = []
                 for val_inputs, val_targets in val_batches:
-                    base_logits = model(val_inputs)
-                    base_eval_losses.append(loss_fn(base_logits, val_targets).detach())
+                    val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
+                    val_targets_dev = val_targets.to(model_device)
+                    base_logits = model(val_inputs_dev)
+                    base_eval_losses.append(loss_fn(base_logits, val_targets_dev).detach())
                 base_eval_loss = torch.stack(base_eval_losses).mean()
                 if dist.is_available() and dist.is_initialized():
                     reduced_base = base_eval_loss.clone()
@@ -238,8 +250,10 @@ def train_evo_lora_step(
                     mutation.apply()
                     eval_losses: List[torch.Tensor] = []
                     for val_inputs, val_targets in val_batches:
-                        val_logits = model(val_inputs)
-                        batch_eval_loss = loss_fn(val_logits, val_targets)
+                        val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
+                        val_targets_dev = val_targets.to(model_device)
+                        val_logits = model(val_inputs_dev)
+                        batch_eval_loss = loss_fn(val_logits, val_targets_dev)
                         eval_losses.append(batch_eval_loss.detach())
 
                     eval_loss = torch.stack(eval_losses).mean()
@@ -261,6 +275,8 @@ def train_evo_lora_step(
                 # 仅当变异优于 no-op 时才提交，严格遵循 elitist selection
                 if best_mutation is not None:
                     controller.commit_mutation(best_mutation)
+                # ES 轮次结束后，主动回收未提交候选的缓存引用，降低潜在显存滞留风险。
+                controller.cleanup_uncommitted_mutations(mutations, committed=best_mutation)
                 result["best_reward"] = best_reward
                 result["best_mutation"] = "noop" if best_mutation is None else best_mutation.__class__.__name__
 
