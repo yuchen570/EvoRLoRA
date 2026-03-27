@@ -14,6 +14,7 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
+    get_linear_schedule_with_warmup,
 )
 
 from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
@@ -62,6 +63,10 @@ def setup_data_and_model(
 
     sentence_keys = {
         "sst2": ("sentence", None),
+        "mnli": ("premise", "hypothesis"),
+        "qnli": ("question", "sentence"),
+        "qqp": ("question1", "question2"),
+        "rte": ("sentence1", "sentence2"),
     }
     if task_name not in sentence_keys:
         raise ValueError(f"当前脚本只内置了 {list(sentence_keys.keys())} 的字段映射，请扩展后再用: {task_name}")
@@ -87,8 +92,9 @@ def setup_data_and_model(
     tokenized.set_format(type="torch")
 
     collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
+    val_split_name = "validation_matched" if task_name == "mnli" else "validation"
     train_loader = DataLoader(tokenized["train"], batch_size=batch_size, shuffle=True, collate_fn=collator)
-    val_loader = DataLoader(tokenized["validation"], batch_size=batch_size, shuffle=False, collate_fn=collator)
+    val_loader = DataLoader(tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator)
 
     num_labels = 2 if task_name == "sst2" else None
     base_model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels)
@@ -99,8 +105,18 @@ def peft_factory(
     model: nn.Module,
     method_name: str,
     target_rank: int = 8,
+    total_steps: Optional[int] = None,
+    adalora_delta_t: int = 200,
 ) -> Tuple[nn.Module, Optional[RankEvolutionController], Dict[str, Any]]:
-    target_modules = ["query", "value"]
+    model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
+    if "roberta" in model_type or "bert" in model_type:
+        target_modules = ["query", "value"]
+    elif "llama" in model_type or "mistral" in model_type:
+        target_modules = ["q_proj", "v_proj"]
+    else:
+        # 回退默认：优先兼容 BERT/RoBERTa 风格命名
+        target_modules = ["query", "value"]
+
     controller: Optional[RankEvolutionController] = None
 
     if method_name == "lora":
@@ -115,6 +131,10 @@ def peft_factory(
         model = get_peft_model(model, config)
 
     elif method_name == "adalora":
+        # AdaLoRA 时间超参与训练总步数对齐，避免动态预算未触发或过早结束。
+        planned_steps = max(int(total_steps or 1000), 1)
+        tinit = max(int(0.1 * planned_steps), 1)
+        tfinal = max(int(0.8 * planned_steps), tinit + 1)
         config = AdaLoraConfig(
             task_type=TaskType.SEQ_CLS,
             init_r=target_rank * 2,
@@ -122,6 +142,12 @@ def peft_factory(
             lora_alpha=2 * target_rank,
             lora_dropout=0.1,
             target_modules=target_modules,
+            beta1=0.85,
+            beta2=0.85,
+            total_step=planned_steps,
+            tinit=tinit,
+            tfinal=tfinal,
+            deltaT=adalora_delta_t,
         )
         model = get_peft_model(model, config)
 
@@ -132,6 +158,11 @@ def peft_factory(
             layer_kwargs={"r_max": 16, "r_init": target_rank, "lora_alpha": 2.0 * target_rank},
             controller_kwargs={"rho": 0.9, "p_g": 0.8, "p_p": 0.1, "H_g": 2, "H_p": 3, "cooldown_steps": 2},
         )
+        # EvoRank 手动注入后，需要显式解冻任务头（与 HF PEFT 在 SEQ_CLS 下的行为对齐）。
+        # RoBERTa/BERT 通常是 classifier.*，部分自回归模型为 score.*。
+        for name, param in model.named_parameters():
+            if "classifier" in name or "score" in name:
+                param.requires_grad = True
 
     elif method_name in {"lora-ga", "sora", "mtl-lora"}:
         raise NotImplementedError(
@@ -177,12 +208,21 @@ def run_training_loop(
     wandb_project: str = "evorank-benchmark",
 ) -> Dict[str, Any]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 在同进程串行跑多方法时，先清空缓存可显著降低碎片化导致的 OOM 风险。
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
     model = model.to(device)
     optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
     ce_loss = nn.CrossEntropyLoss()
 
-    total_train_steps = epochs * len(train_loader)
+    total_train_steps = max_train_steps if max_train_steps is not None else epochs * len(train_loader)
     warmup_steps = int(total_train_steps * warmup_ratio)
+    lr_scheduler = get_linear_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_train_steps,
+    )
     writer = SummaryWriter(log_dir=os.path.join(log_dir, method_name))
 
     wandb_run = None
@@ -193,9 +233,6 @@ def run_training_loop(
             wandb_run = wandb.init(project=wandb_project, name=method_name, config={"method": method_name})
         except Exception:
             wandb_run = None
-
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(device)
 
     mini_val_batches: List[Tuple[Dict[str, torch.Tensor], torch.Tensor]] = []
     for i, vb in enumerate(val_loader):
@@ -246,13 +283,25 @@ def run_training_loop(
                 train_loss = float(loss.detach().item())
                 avg_active_rank = float("nan")
 
+            # 无论哪条路径，optimizer.step() 都已在本步完成，此处统一推进学习率调度。
+            lr_scheduler.step()
+            current_lr = float(optimizer.param_groups[0]["lr"])
+
             train_loss_ema = train_loss if train_loss_ema is None else (ema_beta * train_loss_ema + (1 - ema_beta) * train_loss)
             writer.add_scalar("train/loss", train_loss, global_step)
             writer.add_scalar("train/loss_ema", train_loss_ema, global_step)
+            writer.add_scalar("train/lr", current_lr, global_step)
             if method_name == "evorank":
                 writer.add_scalar("train/active_rank_mean", avg_active_rank, global_step)
             if wandb_run is not None:
-                wandb_run.log({"train/loss": train_loss, "train/loss_ema": train_loss_ema, "step": global_step})
+                wandb_run.log(
+                    {
+                        "train/loss": train_loss,
+                        "train/loss_ema": train_loss_ema,
+                        "train/lr": current_lr,
+                        "step": global_step,
+                    }
+                )
 
             global_step += 1
             if max_train_steps is not None and global_step >= max_train_steps:
@@ -327,6 +376,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--T_es", type=int, default=200)
     parser.add_argument("--mini_val_k", type=int, default=8)
+    parser.add_argument("--adalora_delta_t", type=int, default=200)
     parser.add_argument("--max_train_steps", type=int, default=None)
     parser.add_argument("--log_dir", type=str, default="runs/benchmark")
     parser.add_argument("--use_wandb", action="store_true")
@@ -344,6 +394,7 @@ if __name__ == "__main__":
     )
 
     results: List[Dict[str, Any]] = []
+    planned_total_steps = args.max_train_steps if args.max_train_steps is not None else args.epochs * len(train_loader)
     for method in args.methods:
         # 每个方法从同一个初始权重出发，保证公平对比。
         method_model = copy.deepcopy(base_model)
@@ -351,6 +402,8 @@ if __name__ == "__main__":
             model=method_model,
             method_name=method,
             target_rank=args.target_rank,
+            total_steps=planned_total_steps,
+            adalora_delta_t=args.adalora_delta_t,
         )
         print(
             f"[{method}] trainable_params={meta['trainable_params']:,} "

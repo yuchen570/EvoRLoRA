@@ -60,6 +60,10 @@ def inject_evo_lora(
         raise ValueError("inject_evo_lora 需要 layer_kwargs 至少包含 r_max 与 r_init")
     controller_kwargs = dict(controller_kwargs or {})
 
+    # 先冻结整个基座模型，避免未注入模块在训练中被意外更新。
+    for p in model.parameters():
+        p.requires_grad = False
+
     # 先收集路径，避免边遍历边修改模型结构。
     to_inject: List[Tuple[str, nn.Linear]] = []
     for name, module in model.named_modules():
@@ -131,7 +135,22 @@ def train_evo_lora_step(
             return [batch_or_batches]
         return list(batch_or_batches)
 
+    def _sync_controller_state_device(ctrl: RankEvolutionController) -> None:
+        """
+        controller 在注入阶段可能构建在 CPU，但模型后续会被搬到 CUDA。
+        这里在每步前做一次轻量对齐，避免状态张量与 LoRA 参数跨设备导致 RuntimeError。
+        """
+        layer_device = next(iter(ctrl.layers.values())).lora_A.weight.device
+        for name in ctrl.layers:
+            if ctrl.ema_s[name].device != layer_device:
+                ctrl.ema_s[name] = ctrl.ema_s[name].to(layer_device)
+            if ctrl.count_p[name].device != layer_device:
+                ctrl.count_p[name] = ctrl.count_p[name].to(layer_device)
+            if ctrl.cooldowns[name].device != layer_device:
+                ctrl.cooldowns[name] = ctrl.cooldowns[name].to(layer_device)
+
     model.train()
+    _sync_controller_state_device(controller)
     inputs, targets = train_batch
 
     optimizer.zero_grad(set_to_none=True)
