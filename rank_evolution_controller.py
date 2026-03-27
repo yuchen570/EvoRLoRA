@@ -186,14 +186,14 @@ class RankEvolutionController:
         """收集当前层的需求评分与重要性评分，并使用 EMA 平滑累加。"""
         for name, layer in self.layers.items():
             # Demand Score u_l
-            curr_u = layer.compute_demand_score()
+            curr_u = layer.compute_demand_score(use_cached=True)
             if not self._is_initialized:
                 self.ema_u[name] = curr_u
             else:
                 self.ema_u[name] = self.rho * self.ema_u[name] + (1 - self.rho) * curr_u
                 
             # Importance Score s_{l,i}
-            curr_s = layer.compute_component_importance()
+            curr_s = layer.compute_component_importance(use_cached=True)
             # 只有活跃组件的评分才有效累加
             active = layer.active_mask
             if not self._is_initialized:

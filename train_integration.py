@@ -187,6 +187,9 @@ def train_evo_lora_step(
     logits = model(inputs)
     train_loss = loss_fn(logits, targets)
     train_loss.backward()
+    # 反向传播后立即缓存每层统计量，后续 controller 只读缓存避免重复计算。
+    for layer in controller.layers.values():
+        layer.cache_statistics_from_current_gradients()
 
     result: Dict[str, Any] = {
         "train_loss": float(train_loss.detach().item()),

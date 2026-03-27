@@ -60,6 +60,9 @@ class EvoRankLoRALayer(nn.Module):
 
         # 参数初始化
         self.reset_parameters()
+        # 反向传播后可缓存的统计量（避免同一步重复计算）
+        self._cached_demand_score: Optional[float] = None
+        self._cached_component_importance: Optional[torch.Tensor] = None
         
     def reset_parameters(self):
         """标准 LoRA 初始化：A Kaiming, B Zero"""
@@ -159,13 +162,35 @@ class EvoRankLoRALayer(nn.Module):
         return (~self.active_mask).nonzero(as_tuple=True)[0].tolist()
 
     # ------ 高效评价机制 (Trace Trick) ------
+    @torch.no_grad()
+    def clear_statistics_cache(self):
+        """清空当前步的缓存统计量。"""
+        self._cached_demand_score = None
+        self._cached_component_importance = None
 
     @torch.no_grad()
-    def compute_component_importance(self, alpha1: float = 1.0, alpha2: float = 0.1) -> torch.Tensor:
+    def cache_statistics_from_current_gradients(self, alpha1: float = 1.0, alpha2: float = 0.1):
+        """
+        在 backward 之后立即缓存本步统计量。
+        这样 controller 在结构步骤读取分数时无需重复计算。
+        """
+        self._cached_demand_score = self.compute_demand_score()
+        self._cached_component_importance = self.compute_component_importance(alpha1=alpha1, alpha2=alpha2)
+
+    @torch.no_grad()
+    def compute_component_importance(
+        self,
+        alpha1: float = 1.0,
+        alpha2: float = 0.1,
+        use_cached: bool = False,
+    ) -> torch.Tensor:
         """
         计算活跃组件的重要性评分 (Importance Score s_{l,i})
         完全避免实例化 G (d x k 大小的梯度矩阵)。
         """
+        if use_cached and self._cached_component_importance is not None:
+            return self._cached_component_importance
+
         # 鲁棒性检查
         if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
              raise ValueError("需要先调用 .backward() 计算出 lora_A 和 lora_B 的梯度")
@@ -193,11 +218,14 @@ class EvoRankLoRALayer(nn.Module):
         return scores
         
     @torch.no_grad()
-    def compute_demand_score(self) -> float:
+    def compute_demand_score(self, use_cached: bool = False) -> float:
         """
         计算当前层的容量需求分数代理 (Demand Score g_l)
         用 ||grad_A||_F + ||grad_B||_F 这个代理指标完美承担相对大小的比较任务。
         """
+        if use_cached and self._cached_demand_score is not None:
+            return self._cached_demand_score
+
         if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
              raise ValueError("需要先调用 .backward() 计算出 lora_A 和 lora_B 的梯度")
         if self.debug and not self.lora_A.weight.grad.any():
