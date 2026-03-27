@@ -356,15 +356,20 @@ def run_training_loop(
     population_strategy: str = "all",
     random_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if ddp_enabled and dist.is_available() and dist.is_initialized():
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP 目前仅支持 CUDA，但未检测到 CUDA")
+        # 关键：每个进程必须绑定到自己的 local GPU，避免 NCCL Duplicate GPU
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # 在同进程串行跑多方法时，先清空缓存可显著降低碎片化导致的 OOM 风险。
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
     model = model.to(device)
     if ddp_enabled and dist.is_available() and dist.is_initialized():
-        if device.type != "cuda":
-            raise RuntimeError("DDP 目前仅支持 CUDA device")
         model = DDP(
             model,
             device_ids=[local_rank],
@@ -786,29 +791,33 @@ if __name__ == "__main__":
     args.local_rank = env_local_rank if args.ddp_enabled else 0
     args.is_main_process = args.rank == 0
 
-    if args.ddp_enabled and not dist.is_initialized():
-        dist.init_process_group(backend=args.ddp_backend)
+    try:
+        if args.ddp_enabled and not dist.is_initialized():
+            dist.init_process_group(backend=args.ddp_backend)
 
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
 
-    results = run_protocol_grid(args)
+        results = run_protocol_grid(args)
 
-    if args.is_main_process:
-        print("\n=== Benchmark Summary ===")
-        print(f"{'task':<8} {'backbone':<16} {'method':<12} {'best_acc':<10} {'peak_mem_mb':<12} {'avg_rank':<12} {'time_sec':<12}")
-        for r in results:
-            print(
-                f"{r.get('task', args.task_name):<8} "
-                f"{r.get('backbone', args.model_name):<16} "
-                f"{r['method']:<12} "
-                f"{r['best_val_accuracy']:<10.4f} "
-                f"{r['peak_memory_mb']:<12.2f} "
-                f"{str(r['avg_active_rank']):<12} "
-                f"{r['total_train_time_sec']:<12.2f}"
-            )
-
-    if args.ddp_enabled and dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
+        if args.is_main_process:
+            print("\n=== Benchmark Summary ===")
+            print(f"{'task':<8} {'backbone':<16} {'method':<12} {'best_acc':<10} {'peak_mem_mb':<12} {'avg_rank':<12} {'time_sec':<12}")
+            for r in results:
+                print(
+                    f"{r.get('task', args.task_name):<8} "
+                    f"{r.get('backbone', args.model_name):<16} "
+                    f"{r['method']:<12} "
+                    f"{r['best_val_accuracy']:<10.4f} "
+                    f"{r['peak_memory_mb']:<12.2f} "
+                    f"{str(r['avg_active_rank']):<12} "
+                    f"{r['total_train_time_sec']:<12.2f}"
+                )
+    finally:
+        if args.ddp_enabled and dist.is_available() and dist.is_initialized():
+            try:
+                dist.barrier()
+            except Exception:
+                pass
+            dist.destroy_process_group()
