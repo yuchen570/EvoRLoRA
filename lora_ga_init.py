@@ -1,4 +1,4 @@
-﻿"""LoRA-GA style init for PEFT LoRA (gradient SVD). See https://arxiv.org/abs/2407.05000"""
+"""LoRA-GA style init for PEFT LoRA (gradient SVD). See https://arxiv.org/abs/2407.05000"""
 from __future__ import annotations
 import copy
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -17,7 +17,10 @@ def _collect_target_linears(model, target_modules):
 def _forward_loss_nlu(model, batch, loss_fn):
     labels = batch["labels"]
     feats = {k: v for k, v in batch.items() if k != "labels"}
-    return loss_fn(model(**feats).logits, labels)
+    logits = model(**feats).logits
+    if isinstance(loss_fn, nn.MSELoss):
+        return loss_fn(logits.squeeze(-1), labels.float())
+    return loss_fn(logits, labels)
 
 def _forward_loss_nlg(model, batch):
     out = model(**batch)
@@ -41,7 +44,8 @@ def estimate_lora_ga_init_tensors(model, data_loader, target_modules, lora_r, lo
     if task_type == "nlu":
         if loss_fn is None:
             loss_fn = nn.CrossEntropyLoss()
-        loss_fn = loss_fn.to(device)
+        if isinstance(loss_fn, nn.Module):
+            loss_fn = loss_fn.to(device)
     result = {}
     for full_name, linear in targets:
         for p in model.parameters():

@@ -32,14 +32,43 @@ from rank_evolution_controller import RankEvolutionController
 from sora_inject import inject_sora
 from train_integration import inject_evo_lora, train_evo_lora_step
 
+from glue_metrics import collect_nlu_predictions, compute_glue_primary_metric, glue_primary_metric_key
+
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+# HuggingFace `datasets` 中 `load_dataset("glue", <config>)` 的全集（sentence 字段与验证 split 约定）。
+# 参考：https://huggingface.co/datasets/glue
+GLUE_TASK_SENTENCE_KEYS: Dict[str, Tuple[str, Optional[str]]] = {
+    "ax": ("premise", "hypothesis"),
+    "cola": ("sentence", None),
+    "sst2": ("sentence", None),
+    "mrpc": ("sentence1", "sentence2"),
+    "qqp": ("question1", "question2"),
+    "stsb": ("sentence1", "sentence2"),
+    "mnli": ("premise", "hypothesis"),
+    "qnli": ("question", "sentence"),
+    "rte": ("sentence1", "sentence2"),
+    "wnli": ("sentence1", "sentence2"),
+}
+# STS-B 为回归标签；验证主指标为 (Pearson+Spearman)/2，见 glue_metrics.py。
+GLUE_REGRESSION_TASKS = frozenset({"stsb"})
+
+
+def glue_validation_split(task_name: str) -> str:
+    if task_name == "mnli":
+        return "validation_matched"
+    return "validation"
+
+
+def nlu_is_glue_regression(task_name: Optional[str]) -> bool:
+    return task_name is not None and task_name in GLUE_REGRESSION_TASKS
 
 
 class DictFeatureClassifier(nn.Module):
     """
     适配 train_evo_lora_step 的输入约定：
     - 输入是特征字典（input_ids/attention_mask/...）
-    - 输出是分类 logits
+    - 输出为分类 logits 或回归标量（STS-B 等为 shape (B,1) 的 logits）
     """
 
     def __init__(self, inner: nn.Module):
@@ -96,19 +125,12 @@ def setup_data_and_model(
     if task_type == "nlu":
         dataset = load_dataset("glue", task_name, cache_dir=dataset_cache_dir)
 
-        sentence_keys = {
-            "sst2": ("sentence", None),
-            "mnli": ("premise", "hypothesis"),
-            "qnli": ("question", "sentence"),
-            "qqp": ("question1", "question2"),
-            "rte": ("sentence1", "sentence2"),
-        }
-        if task_name not in sentence_keys:
+        if task_name not in GLUE_TASK_SENTENCE_KEYS:
             raise ValueError(
-                f"当前脚本只内置了 {list(sentence_keys.keys())} 的字段映射，请扩展后再用: {task_name}"
+                f"未知 GLUE 子集 task_name={task_name!r}。已支持: {sorted(GLUE_TASK_SENTENCE_KEYS.keys())}"
             )
 
-        sentence1_key, sentence2_key = sentence_keys[task_name]
+        sentence1_key, sentence2_key = GLUE_TASK_SENTENCE_KEYS[task_name]
 
         def tokenize_fn(examples: Dict[str, List[Any]]) -> Dict[str, Any]:
             if sentence2_key is None:
@@ -129,8 +151,9 @@ def setup_data_and_model(
         tokenized.set_format(type="torch")
 
         collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
-        val_split_name = "validation_matched" if task_name == "mnli" else "validation"
+        val_split_name = glue_validation_split(task_name)
 
+        val_loader_eval_full: Optional[DataLoader] = None
         if ddp_enabled and world_size > 1:
             train_sampler = DistributedSampler(
                 tokenized["train"],
@@ -155,22 +178,33 @@ def setup_data_and_model(
             val_loader = DataLoader(
                 tokenized[val_split_name], batch_size=batch_size, sampler=val_sampler, collate_fn=collator
             )
+            # GLUE 官方主指标（MCC/F1 等）需全验证集；与 NLG 一致，仅 rank0 用该 loader 做评估。
+            val_loader_eval_full = DataLoader(
+                tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator
+            )
         else:
             train_loader = DataLoader(tokenized["train"], batch_size=batch_size, shuffle=True, collate_fn=collator)
             val_loader = DataLoader(tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator)
 
-        label_feature = dataset["train"].features.get("label", None)
-        if label_feature is not None and hasattr(label_feature, "num_classes") and label_feature.num_classes is not None:
-            num_labels = int(label_feature.num_classes)
+        if task_name == "stsb":
+            base_model = AutoModelForSequenceClassification.from_pretrained(
+                model_name,
+                num_labels=1,
+                problem_type="regression",
+                cache_dir=model_cache_dir,
+            )
         else:
-            # 兜底：若不是标准 ClassLabel，就从训练集标签去重计数
-            num_labels = len(set(dataset["train"]["label"]))
-        base_model = AutoModelForSequenceClassification.from_pretrained(
-            model_name,
-            num_labels=num_labels,
-            cache_dir=model_cache_dir,
-        )
-        return train_loader, val_loader, None, base_model, tokenizer
+            label_feature = dataset["train"].features.get("label", None)
+            if label_feature is not None and hasattr(label_feature, "num_classes") and label_feature.num_classes is not None:
+                num_labels = int(label_feature.num_classes)
+            else:
+                num_labels = len(set(dataset["train"]["label"]))
+            base_model = AutoModelForSequenceClassification.from_pretrained(
+                model_name,
+                num_labels=num_labels,
+                cache_dir=model_cache_dir,
+            )
+        return train_loader, val_loader, val_loader_eval_full, base_model, tokenizer
 
     if task_type == "nlg":
         if nlg_dataset_name != "cnn_dailymail":
@@ -257,6 +291,7 @@ def peft_factory(
     adalora_tinit: Optional[int] = None,
     adalora_tfinal: Optional[int] = None,
     adalora_orth_reg_weight: float = 0.1,
+    nlu_regression: bool = False,
 ) -> Tuple[nn.Module, Optional[RankEvolutionController], Dict[str, Any]]:
     model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
     if "roberta" in model_type or "bert" in model_type:
@@ -354,6 +389,9 @@ def peft_factory(
         if train_loader is None:
             raise ValueError("method_name='lora-ga' 时必须传入 train_loader")
         ga_dev = lora_ga_device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        ga_loss_fn: Optional[nn.Module] = None
+        if task_type == "nlu" and nlu_regression:
+            ga_loss_fn = nn.MSELoss()
         init_by_key = run_lora_ga_init_pipeline(
             base_model=model,
             train_loader=train_loader,
@@ -364,7 +402,7 @@ def peft_factory(
             device=ga_dev,
             is_main_process=is_main_process,
             ddp_enabled=ddp_enabled,
-            loss_fn=None,
+            loss_fn=ga_loss_fn,
         )
         config = LoraConfig(
             task_type=peft_task_type,
@@ -477,6 +515,7 @@ def _run_verify_samples(
     tokenizer: Optional[Any],
     verify_n_samples: int,
     generation_max_new_tokens: int,
+    glue_task_name: Optional[str] = None,
 ) -> None:
     if verify_n_samples <= 0:
         return
@@ -487,12 +526,19 @@ def _run_verify_samples(
                 vb = batch_to_device(vb, device)
                 features, labels = extract_features_and_labels(vb, task_type=task_type)
                 logits = model(features)
-                preds = torch.argmax(logits, dim=-1)
                 n = min(verify_n_samples, int(labels.size(0)))
-                for i in range(n):
-                    g = int(labels[i].item())
-                    p = int(preds[i].item())
-                    print(f"[verify] sample {i} [Gold]={g} [Pred]={p}")
+                if nlu_is_glue_regression(glue_task_name):
+                    pred_scores = logits.squeeze(-1)
+                    for i in range(n):
+                        g = float(labels[i].item())
+                        p = float(pred_scores[i].item())
+                        print(f"[verify] sample {i} [Gold]={g:.4f} [Pred]={p:.4f}")
+                else:
+                    preds = torch.argmax(logits, dim=-1)
+                    for i in range(n):
+                        g = int(labels[i].item())
+                        p = int(preds[i].item())
+                        print(f"[verify] sample {i} [Gold]={g} [Pred]={p}")
                 break
         elif task_type == "nlg":
             if tokenizer is None:
@@ -577,7 +623,14 @@ def run_training_loop(
         )
     optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
     if task_type == "nlu":
-        loss_fn = nn.CrossEntropyLoss()
+        if nlu_is_glue_regression(task_name):
+
+            def nlu_reg_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+                return F.mse_loss(logits.squeeze(-1), labels.float())
+
+            loss_fn = nlu_reg_loss
+        else:
+            loss_fn = nn.CrossEntropyLoss()
     elif task_type == "nlg":
         # logits: (B, T, V), labels: (B, T) with padding masked as -100
         def loss_fn(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -730,35 +783,34 @@ def run_training_loop(
         model.eval()
 
         if task_type == "nlu":
-            correct = 0
-            total = 0
-            with torch.no_grad():
-                for vb in val_loader:
-                    vb = batch_to_device(vb, device)
-                    features, labels = extract_features_and_labels(vb, task_type=task_type)
-                    logits = model(features)
-                    preds = torch.argmax(logits, dim=-1)
-                    correct += (preds == labels).sum().item()
-                    total += labels.numel()
-            val_metric = correct / max(total, 1)
-            # DDP 下统计全局 accuracy：把 correct/total 做 all_reduce。
+            if task_name is None:
+                raise ValueError("NLU（GLUE）评估需要传入 task_name")
             if ddp_enabled and dist.is_available() and dist.is_initialized():
-                stats = torch.tensor([correct, total], device=device, dtype=torch.long)
-                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                correct = int(stats[0].item())
-                total = int(stats[1].item())
-                val_metric = correct / max(total, 1)
+                dist.barrier()
+            val_metric = 0.0
+            mkey = glue_primary_metric_key(task_name)
+            regression = nlu_is_glue_regression(task_name)
+            if is_main_process:
+                ev_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
+                y_pred, y_true = collect_nlu_predictions(model, ev_loader, device, regression=regression)
+                val_metric = compute_glue_primary_metric(task_name, y_pred, y_true)
+            if ddp_enabled and dist.is_available() and dist.is_initialized():
+                m_tensor = torch.tensor([val_metric], device=device, dtype=torch.float64)
+                dist.broadcast(m_tensor, src=0)
+                val_metric = float(m_tensor.item())
+                dist.barrier()
             best_val_acc = max(best_val_acc, val_metric)
-
             if is_main_process:
                 print(
                     f"[{method_name}] epoch={epoch + 1}/{epochs} "
-                    f"step={global_step} val_acc={val_metric:.4f} best={best_val_acc:.4f}"
+                    f"step={global_step} val_{mkey}={val_metric:.4f} best={best_val_acc:.4f}"
                 )
                 if writer is not None:
-                    writer.add_scalar("val/accuracy", val_metric, epoch)
+                    writer.add_scalar(f"val/{mkey}", val_metric, epoch)
                 if wandb_run is not None:
-                    wandb_run.log({"val/accuracy": val_metric, "epoch": epoch + 1, "step": global_step})
+                    wandb_run.log(
+                        {f"val/{mkey}": val_metric, "epoch": epoch + 1, "step": global_step}
+                    )
 
         else:
             if tokenizer is None:
@@ -838,13 +890,15 @@ def run_training_loop(
                 dist.barrier()
 
         if is_main_process and checkpoint_root:
-            rec = {
+            rec: Dict[str, Any] = {
                 "epoch": epoch + 1,
                 "global_step": global_step,
                 "val_metric": float(val_metric),
                 "best_val": float(best_val_acc),
                 "train_loss_ema": float(train_loss_ema) if train_loss_ema is not None else None,
             }
+            if task_type == "nlu" and task_name is not None:
+                rec["glue_metric"] = glue_primary_metric_key(task_name)
             with open(os.path.join(checkpoint_root, "metrics.jsonl"), "a", encoding="utf-8") as mf:
                 mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
             if save_every_epoch:
@@ -897,6 +951,7 @@ def run_training_loop(
             tokenizer,
             verify_n_samples,
             generation_max_new_tokens,
+            glue_task_name=task_name,
         )
 
     artifact_dir_str = checkpoint_root or ""
@@ -926,7 +981,13 @@ def run_training_loop(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="EvoRank-LoRA GLUE benchmark runner")
-    parser.add_argument("--task_name", type=str, default="sst2")
+    parser.add_argument(
+        "--task_name",
+        type=str,
+        default="sst2",
+        help="NLU：`load_dataset('glue', task_name)` 的子集，已支持 ax, cola, sst2, mrpc, qqp, stsb, mnli, qnli, rte, wnli；"
+        "验证集使用各任务 GLUE 官方主指标（见 glue_metrics / README）。NLG：占位/命名用。",
+    )
     parser.add_argument("--task_type", type=str, default="nlu", choices=["nlu", "nlg"], help="nlu=GLUE分类，nlg=文本生成")
     parser.add_argument("--nlg_dataset_name", type=str, default="cnn_dailymail", help="nlg 数据集名（如 cnn_dailymail）")
     parser.add_argument("--max_target_length", type=int, default=64, help="nlg 的摘要/目标序列最大长度")
@@ -1046,6 +1107,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     lora_ga_device=lora_ga_dev,
                     is_main_process=args.is_main_process,
                     ddp_enabled=args.ddp_enabled,
+                    nlu_regression=nlu_is_glue_regression(task_name),
                 )
                 checkpoint_root: Optional[str] = None
                 if not args.no_output_dir:

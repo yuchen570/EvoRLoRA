@@ -18,6 +18,31 @@
 | `sora` | 带 `gate` 的稀疏低秩旁路；训练时需在主损失上加 L1（脚本已用 `--sora_sparse_lambda`，可选 `--sora_lambda_warmup_steps`） |
 | `mtl-lora` | 未实现：需联合多任务与 task id，与当前 `--task_list` 串行协议不对齐 |
 
+### GLUE 子集（`--task_name`，`task_type=nlu`）
+
+脚本通过 `load_dataset("glue", task_name)` 加载数据，**已内置字段映射**的子集如下（与 [HuggingFace `glue`](https://huggingface.co/datasets/glue) 配置名一致）：
+
+| `task_name` | 说明 | 验证 split | 验证主指标（与 GLUE 常用约定一致，实现见 `glue_metrics.py`） |
+|-------------|------|------------|----------------------------------|
+| `cola` | 语言可接受性（单句） | `validation` | **Matthews 相关系数** |
+| `sst2` | 情感（单句） | `validation` | **Accuracy** |
+| `mrpc` | 释义等价（句对） | `validation` | **F1**（binary） |
+| `qqp` | 问句等价（问句对） | `validation` | **F1**（binary） |
+| `stsb` | 句对语义相似度（**回归**，标签为连续分数） | `validation` | **(Pearson + Spearman) / 2** |
+| `mnli` | 自然语言推理（前提–假设） | `validation_matched` | **Accuracy** |
+| `qnli` | 问答蕴含 | `validation` | **Accuracy** |
+| `rte` | 文本蕴含 | `validation` | **Accuracy** |
+| `wnli` | Winograd 式蕴含（极小集） | `validation` | **Accuracy** |
+| `ax` | 诊断集（MNLI 风格前提–假设） | `validation` | **Accuracy** |
+
+**注意：**
+
+- **`stsb`**：训练为 MSE 回归；验证在**完整 dev 集**上算 Pearson 与 Spearman，主标量为二者**算术平均**（与 GLUE 总分里该任务的常见合成方式一致）。
+- **DDP**：与 NLG 相同，验证指标仅在 **rank0** 上对**全量** dev 集计算，再 `broadcast` 到各卡，避免 `DistributedSampler` 子集偏差。
+- CSV 列名仍为 **`best_val_accuracy`**，语义为「该任务验证主指标」（不限于 accuracy）；TensorBoard 为 **`val/<指标名>`**（如 `val/matthews_corrcoef`、`val/f1`、`val/pearson_spearman_mean`）。`metrics.jsonl` 含字段 **`glue_metric`** 标明指标键名。
+- **`--task_list`** 可串行跑多子集；一次扫全部分类+回归子集时可写：  
+  `--task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli`（耗时与磁盘占用随任务数线性增长）。
+
 ---
 
 ## 近期更新（与论文实现一致性相关）
@@ -39,6 +64,7 @@
   - `--task_list`
   - `--model_list`
   - `--export_csv`
+- GLUE：各子集验证使用 **官方主指标**（CoLA→Matthews，MRPC/QQP→F1，STS-B→Pearson 与 Spearman 均值，其余分类任务→Accuracy），见 `glue_metrics.py`。
 - 训练产物与 checkpoint（与 `--log_dir` 分离）：
   - 默认 `--output_dir artifacts`，子目录形如 `artifacts/<task>_<backbone>_<method>/`
   - `metrics.jsonl`、可选 `--save_steps` / `--save_every_epoch`、结束 `final/`（PEFT 为 `save_pretrained`；`evorank`/`sora` 为 `model_state.pt`）
@@ -389,7 +415,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 - **训练产物目录**（与 TensorBoard 的 `--log_dir` 相互独立）：
   - `--output_dir`：默认 `artifacts`；每个 `task×backbone×method` 会在其下创建子目录，例如 `artifacts/sst2_roberta-base_lora/`。
   - `--no_output_dir`：关闭该目录下所有落盘（不写 `metrics.jsonl`、checkpoint、`final/`）。
-  - `metrics.jsonl`：每 epoch 一行 JSON（`epoch`、`global_step`、`val_metric`、`best_val`、`train_loss_ema`）。
+  - `metrics.jsonl`：每 epoch 一行 JSON（`epoch`、`global_step`、`val_metric`、`best_val`、`train_loss_ema`；NLU 另有 **`glue_metric`** 标明主指标键名）。
   - `--save_steps N`：`N>0` 时每 N 个训练 step 保存 `checkpoint_step_*.pt`（仅 rank0；内含 unwrap 后的 `inner` 权重与优化器/调度器，**不含** EvoRank Controller 的 EMA 等内部状态）。
   - `--save_every_epoch`：每个 epoch 末保存 `checkpoint_epoch_*.pt`。
   - `--no_save_final_model`：训练结束不写 `final/`（默认会写）。
@@ -465,4 +491,5 @@ python run_benchmark.py \
 - `evo_rank_lora.py`：可演化 LoRA 层
 - `rank_evolution_controller.py`：演化控制器与 Mutation 体系
 - `train_integration.py`：注入与双时间尺度训练
+- `glue_metrics.py`：GLUE 各子集验证主指标（Matthews / Acc / F1 / Pearson–Spearman 均值等）
 - `run_benchmark.py`：主实验入口
