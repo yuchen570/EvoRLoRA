@@ -9,6 +9,19 @@ from evo_rank_lora import EvoRankLoRALayer
 from rank_evolution_controller import ModuleMutation, RankEvolutionController
 
 
+class _PaddingTrialMutation(ModuleMutation):
+    """DDP 专用：无 apply/undo 语义，仅用于对齐各 rank 上 ES trial 的 all_reduce 次数。"""
+
+    def apply(self) -> None:
+        pass
+
+    def undo(self) -> None:
+        pass
+
+    def clear_cache(self) -> None:
+        pass
+
+
 class EvoRankLoRAWrapper(nn.Module):
     """
     将冻结的原线性层与可演化 LoRA 旁路组合在一起。
@@ -227,8 +240,21 @@ def train_evo_lora_step(
         result["num_mutations"] = len(mutations)
 
         # Trial 阶段：逐个 apply -> (mini-val-set 平均评估) -> undo，禁止污染训练图。
+        # DDP：各 rank 上 generate_mutations 得到的列表长度可能不一致（浮点/采样边界），
+        # 若仍用「if mutations and val_batches」整段跳过，则会出现部分 rank 少做 all_reduce，
+        # NCCL 集体次数不一致 -> watchdog 超时 / SIGABRT。此处用 MAX 对齐长度并用占位 mutation 补齐。
         val_batches = _iter_val_batches(val_batch)
-        if mutations and val_batches:
+        if val_batches:
+            n_local = len(mutations)
+            if dist.is_available() and dist.is_initialized():
+                n_tensor = torch.tensor([n_local], device=model_device, dtype=torch.long)
+                dist.all_reduce(n_tensor, op=dist.ReduceOp.MAX)
+                n_max = int(n_tensor.item())
+            else:
+                n_max = n_local
+            while len(mutations) < n_max:
+                mutations.append(_PaddingTrialMutation())
+
             was_training = model.training
             model.eval()
 
@@ -250,25 +276,30 @@ def train_evo_lora_step(
                 rewards.append((base_reward, None))
 
                 for mutation in mutations:
-                    mutation.apply()
-                    eval_losses: List[torch.Tensor] = []
-                    for val_inputs, val_targets in val_batches:
-                        val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
-                        val_targets_dev = val_targets.to(model_device)
-                        val_logits = model(val_inputs_dev)
-                        batch_eval_loss = loss_fn(val_logits, val_targets_dev)
-                        eval_losses.append(batch_eval_loss.detach())
+                    if isinstance(mutation, _PaddingTrialMutation):
+                        eval_loss = base_eval_loss.detach().clone()
+                        committed_candidate: Optional[ModuleMutation] = None
+                    else:
+                        mutation.apply()
+                        eval_losses: List[torch.Tensor] = []
+                        for val_inputs, val_targets in val_batches:
+                            val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
+                            val_targets_dev = val_targets.to(model_device)
+                            val_logits = model(val_inputs_dev)
+                            batch_eval_loss = loss_fn(val_logits, val_targets_dev)
+                            eval_losses.append(batch_eval_loss.detach())
 
-                    eval_loss = torch.stack(eval_losses).mean()
-                    # DDP 下必须对 reward 来源的 loss 做跨卡一致化，否则会出现不同卡提交不同 mutation。
+                        eval_loss = torch.stack(eval_losses).mean()
+                        committed_candidate = mutation
                     if dist.is_available() and dist.is_initialized():
                         reduced = eval_loss.clone()
                         dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
                         eval_loss = reduced / dist.get_world_size()
 
                     reward = -float(eval_loss.item()) - lambda_c * _compute_complexity(controller, complexity_mode)
-                    rewards.append((reward, mutation))
-                    mutation.undo()
+                    rewards.append((reward, committed_candidate))
+                    if not isinstance(mutation, _PaddingTrialMutation):
+                        mutation.undo()
 
             if was_training:
                 model.train()

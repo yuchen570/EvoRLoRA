@@ -233,6 +233,8 @@ torchrun --nproc_per_node=2 --master_port=29500 \
   --export_csv results_ddp_smoke.csv
 ```
 
+若出现 `ProcessGroupNCCL::WorkNCCL::checkTimeout` / `ncclCommWatchdog`：多为某 rank **少做了一次集体通信**（历史上 EvoRank 在 `mutations` 列表长度不一致时会触发）。当前版本已在 `train_integration.py` 中对齐 trial 的 `all_reduce` 次数；若仍超时，可尝试增大 `export NCCL_TIMEOUT=1800` 或检查集群 IB/GPU 拓扑。
+
 **对比全开（可选）**：将 `--methods` 改为 `lora adalora evorank lora-ga sora`，并追加例如 `--lora_ga_batches 2 --sora_sparse_lambda 1e-3`（DDP 下 LoRA-GA 仅在 rank0 用全数据 loader 的前若干个 batch 估计，他卡 barrier 等待）。产物与 checkpoint **仅 rank0 写盘**。
 
 ### 2) 主结果模板（多任务）
