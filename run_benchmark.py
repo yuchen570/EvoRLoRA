@@ -1,6 +1,7 @@
 import argparse
 import copy
 import csv
+import json
 import os
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -404,6 +405,119 @@ def _adalora_post_step_update(model: nn.Module, global_step: int) -> None:
     adalora_update_and_allocate(model, global_step)
 
 
+def _unwrap_training_module(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+
+def _unwrap_for_save(model: nn.Module) -> nn.Module:
+    """剥离 DDP 后取 DictFeatureClassifier.inner，避免 state_dict key 带 module. 前缀。"""
+    m = _unwrap_training_module(model)
+    return getattr(m, "inner", m)
+
+
+def _state_dict_cpu(module: nn.Module) -> Dict[str, torch.Tensor]:
+    return {k: v.detach().cpu() for k, v in module.state_dict().items()}
+
+
+def _save_checkpoint_pt(
+    path: str,
+    inner: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler,
+    global_step: int,
+    epoch: int,
+    best_val: float,
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {
+        "global_step": global_step,
+        "epoch": epoch,
+        "best_val_accuracy": best_val,
+        "model": _state_dict_cpu(inner),
+        "optimizer": optimizer.state_dict(),
+        "lr_scheduler": lr_scheduler.state_dict(),
+    }
+    torch.save(payload, path)
+
+
+def _save_final_artifact(
+    inner: nn.Module,
+    final_dir: str,
+    method_name: str,
+    task_type: str,
+    task_name: Optional[str],
+    tokenizer: Optional[Any],
+    best_val_accuracy: float,
+    global_step: int,
+) -> None:
+    os.makedirs(final_dir, exist_ok=True)
+    meta: Dict[str, Any] = {
+        "method": method_name,
+        "task_type": task_type,
+        "best_val_accuracy": float(best_val_accuracy),
+        "global_step": int(global_step),
+    }
+    if task_name is not None:
+        meta["task_name"] = task_name
+    with open(os.path.join(final_dir, "training_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    if hasattr(inner, "save_pretrained"):
+        inner.save_pretrained(final_dir)
+    else:
+        torch.save(_state_dict_cpu(inner), os.path.join(final_dir, "model_state.pt"))
+    if tokenizer is not None:
+        tokenizer.save_pretrained(final_dir)
+
+
+def _run_verify_samples(
+    model: nn.Module,
+    val_loader: DataLoader,
+    task_type: str,
+    device: torch.device,
+    tokenizer: Optional[Any],
+    verify_n_samples: int,
+    generation_max_new_tokens: int,
+) -> None:
+    if verify_n_samples <= 0:
+        return
+    model.eval()
+    with torch.no_grad():
+        if task_type == "nlu":
+            for vb in val_loader:
+                vb = batch_to_device(vb, device)
+                features, labels = extract_features_and_labels(vb, task_type=task_type)
+                logits = model(features)
+                preds = torch.argmax(logits, dim=-1)
+                n = min(verify_n_samples, int(labels.size(0)))
+                for i in range(n):
+                    g = int(labels[i].item())
+                    p = int(preds[i].item())
+                    print(f"[verify] sample {i} [Gold]={g} [Pred]={p}")
+                break
+        elif task_type == "nlg":
+            if tokenizer is None:
+                return
+            gen_model = _unwrap_for_save(model)
+            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+            for vb in val_loader:
+                vb = batch_to_device(vb, device)
+                input_ids = vb["input_ids"]
+                attention_mask = vb.get("attention_mask", None)
+                gen_kwargs: Dict[str, Any] = dict(input_ids=input_ids, max_new_tokens=generation_max_new_tokens)
+                if attention_mask is not None:
+                    gen_kwargs["attention_mask"] = attention_mask
+                gen_ids = gen_model.generate(**gen_kwargs)
+                pred = tokenizer.decode(gen_ids[0].cpu(), skip_special_tokens=True)
+                labels = vb["labels"][0].clone()
+                labels[labels == -100] = pad_id
+                gold = tokenizer.decode(labels.cpu(), skip_special_tokens=True)
+                print(f"[verify] [Gold] (trunc): {gold[:240]}")
+                print(f"[verify] [Pred] (trunc): {pred[:240]}")
+                break
+        else:
+            raise ValueError(f"未知 task_type: {task_type}")
+
+
 def run_training_loop(
     model: nn.Module,
     train_loader: DataLoader,
@@ -435,6 +549,12 @@ def run_training_loop(
     val_loader_eval_full: Optional[DataLoader] = None,
     sora_sparse_lambda: float = 1e-3,
     sora_lambda_warmup_steps: int = 0,
+    task_name: Optional[str] = None,
+    checkpoint_root: Optional[str] = None,
+    save_steps: int = 0,
+    save_every_epoch: bool = False,
+    save_final_model: bool = True,
+    verify_n_samples: int = 2,
 ) -> Dict[str, Any]:
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         if not torch.cuda.is_available():
@@ -479,6 +599,9 @@ def run_training_loop(
         num_training_steps=total_train_steps,
     )
     writer = SummaryWriter(log_dir=os.path.join(log_dir, method_name)) if is_main_process else None
+
+    if checkpoint_root and is_main_process:
+        os.makedirs(checkpoint_root, exist_ok=True)
 
     wandb_run = None
     if is_main_process and use_wandb:
@@ -584,6 +707,22 @@ def run_training_loop(
                 )
 
             global_step += 1
+            if (
+                is_main_process
+                and checkpoint_root
+                and save_steps > 0
+                and global_step % save_steps == 0
+            ):
+                inner_ckpt = _unwrap_for_save(model)
+                _save_checkpoint_pt(
+                    os.path.join(checkpoint_root, f"checkpoint_step_{global_step}.pt"),
+                    inner_ckpt,
+                    optimizer,
+                    lr_scheduler,
+                    global_step,
+                    epoch,
+                    best_val_acc,
+                )
             if max_train_steps is not None and global_step >= max_train_steps:
                 break
 
@@ -698,6 +837,28 @@ def run_training_loop(
             if ddp_enabled and dist.is_available() and dist.is_initialized():
                 dist.barrier()
 
+        if is_main_process and checkpoint_root:
+            rec = {
+                "epoch": epoch + 1,
+                "global_step": global_step,
+                "val_metric": float(val_metric),
+                "best_val": float(best_val_acc),
+                "train_loss_ema": float(train_loss_ema) if train_loss_ema is not None else None,
+            }
+            with open(os.path.join(checkpoint_root, "metrics.jsonl"), "a", encoding="utf-8") as mf:
+                mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if save_every_epoch:
+                inner_ep = _unwrap_for_save(model)
+                _save_checkpoint_pt(
+                    os.path.join(checkpoint_root, f"checkpoint_epoch_{epoch + 1}.pt"),
+                    inner_ep,
+                    optimizer,
+                    lr_scheduler,
+                    global_step,
+                    epoch,
+                    best_val_acc,
+                )
+
         if max_train_steps is not None and global_step >= max_train_steps:
             break
 
@@ -714,6 +875,36 @@ def run_training_loop(
     if wandb_run is not None:
         wandb_run.finish()
 
+    model.eval()
+    if is_main_process and checkpoint_root and save_final_model:
+        final_dir = os.path.join(checkpoint_root, "final")
+        _save_final_artifact(
+            _unwrap_for_save(model),
+            final_dir,
+            method_name,
+            task_type,
+            task_name,
+            tokenizer,
+            best_val_acc,
+            global_step,
+        )
+    if is_main_process and verify_n_samples > 0:
+        _run_verify_samples(
+            model,
+            val_loader,
+            task_type,
+            device,
+            tokenizer,
+            verify_n_samples,
+            generation_max_new_tokens,
+        )
+
+    artifact_dir_str = checkpoint_root or ""
+    final_dir_str = (
+        os.path.join(checkpoint_root, "final")
+        if (checkpoint_root and save_final_model)
+        else ""
+    )
     result = {
         "method": method_name,
         "best_val_accuracy": best_val_acc,
@@ -727,6 +918,8 @@ def run_training_loop(
             if method_name == "evorank" and controller is not None
             else "N/A"
         ),
+        "artifact_dir": artifact_dir_str,
+        "final_dir": final_dir_str,
     }
     return result
 
@@ -779,6 +972,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora_ga_batches", type=int, default=8, help="LoRA-GA 梯度估计用的训练 batch 数（仅前若干个 batch）")
     parser.add_argument("--sora_sparse_lambda", type=float, default=1e-3, help="SoRA：gate L1 惩罚系数")
     parser.add_argument("--sora_lambda_warmup_steps", type=int, default=0, help="SoRA：前若干步将 sparse_lambda 从 0 线性升到设定值；0 表示关闭")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="artifacts",
+        help="每个 task×backbone×method 在此目录下建子目录，写入 metrics.jsonl、可选 checkpoint、final/",
+    )
+    parser.add_argument("--no_output_dir", action="store_true", help="关闭 output_dir 下所有落盘（metrics/checkpoint/final）")
+    parser.add_argument("--save_steps", type=int, default=0, help="每 N 个训练 step 保存 checkpoint_step_*.pt；0 表示不按步保存")
+    parser.add_argument("--save_every_epoch", action="store_true", help="每个 epoch 结束保存 checkpoint_epoch_*.pt")
+    parser.add_argument("--no_save_final_model", action="store_true", help="训练结束不写入 final/（adapter 或 model_state.pt + tokenizer 等）")
+    parser.add_argument(
+        "--verify_n_samples",
+        type=int,
+        default=2,
+        help="训练结束后主进程从验证集打印前 K 条 [Gold] vs [Pred]（NLU）或一条生成摘要片段（NLG）；0 关闭",
+    )
     return parser.parse_args()
 
 
@@ -791,6 +1000,9 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
     tasks = args.task_list if args.task_list else [args.task_name]
     models = args.model_list if args.model_list else [args.model_name]
     all_results: List[Dict[str, Any]] = []
+
+    if args.is_main_process and not args.no_output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
 
     for task_name in tasks:
         for model_name in models:
@@ -835,6 +1047,10 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     is_main_process=args.is_main_process,
                     ddp_enabled=args.ddp_enabled,
                 )
+                checkpoint_root: Optional[str] = None
+                if not args.no_output_dir:
+                    safe_model_name = model_name.replace("/", "_").replace("\\", "_")
+                    checkpoint_root = os.path.join(args.output_dir, f"{task_name}_{safe_model_name}_{method}")
                 res = run_training_loop(
                     model=method_model,
                     train_loader=train_loader,
@@ -866,6 +1082,12 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     val_loader_eval_full=val_loader_eval_full,
                     sora_sparse_lambda=args.sora_sparse_lambda,
                     sora_lambda_warmup_steps=args.sora_lambda_warmup_steps,
+                    task_name=task_name,
+                    checkpoint_root=checkpoint_root,
+                    save_steps=args.save_steps,
+                    save_every_epoch=args.save_every_epoch,
+                    save_final_model=not args.no_save_final_model,
+                    verify_n_samples=args.verify_n_samples,
                 )
                 res.update(
                     {
@@ -890,6 +1112,8 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "peak_memory_mb",
                     "avg_active_rank",
                     "total_train_time_sec",
+                    "artifact_dir",
+                    "final_dir",
                 ],
             )
             writer.writeheader()

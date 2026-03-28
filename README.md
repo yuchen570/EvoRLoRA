@@ -5,7 +5,7 @@
 - `EvoRankLoRALayer`：最大秩超空间 + 掩码激活 + 在线扩张/修剪
 - `RankEvolutionController`：EMA 统计、动态阈值、计数器与冷却、Mutation 生成与提交
 - `train_integration.py`：模型注入（`inject_evo_lora`）与双时间尺度训练步（`train_evo_lora_step`）
-- `run_benchmark.py`：GLUE/NLG 基准脚本，支持 LoRA、AdaLoRA、EvoRank、**LoRA-GA**、**SoRA**（及 MTL-LoRA 占位说明），支持日志与 CSV 导出
+- `run_benchmark.py`：GLUE/NLG 基准脚本，支持 LoRA、AdaLoRA、EvoRank、**LoRA-GA**、**SoRA**（及 MTL-LoRA 占位说明）；支持 TensorBoard / W&B、**CSV 导出**，以及 **`--output_dir` 下按实验写入 `metrics.jsonl`、可选中间 checkpoint、训练结束 `final/`（权重 + tokenizer）与 `--verify_n_samples` 冒烟打印**
 
 ### 对比方法（`--methods`）
 
@@ -39,6 +39,12 @@
   - `--task_list`
   - `--model_list`
   - `--export_csv`
+- 训练产物与 checkpoint（与 `--log_dir` 分离）：
+  - 默认 `--output_dir artifacts`，子目录形如 `artifacts/<task>_<backbone>_<method>/`
+  - `metrics.jsonl`、可选 `--save_steps` / `--save_every_epoch`、结束 `final/`（PEFT 为 `save_pretrained`；`evorank`/`sora` 为 `model_state.pt`）
+  - `final/` 内同时保存 **tokenizer**，便于离线 `AutoTokenizer.from_pretrained(<final_dir>)`
+  - 中间 `.pt` **仅含** unwrap 后的模型与优化器/调度器；**不含** EvoRank Controller 的 EMA 等（V1 取舍，见下文「日志与结果」）
+  - `--verify_n_samples`：训练后主进程打印少量验证样本对照（默认 `2`）
 
 ---
 
@@ -120,7 +126,12 @@ python run_benchmark.py --dataset_cache_dir datasets --model_cache_dir models
 ---
 
 ## 快速开始
-### 1) 冒烟测试（推荐先跑）
+
+**产物目录**：默认 **`--output_dir artifacts`**（与 TensorBoard 的 `--log_dir` 无关）。每个 `task×backbone×method` 会生成独立子目录，内含 `metrics.jsonl`、训练结束后的 **`final/`**（权重 + tokenizer）及控制台 **`[verify]`** 样本（默认 `--verify_n_samples 2`）。若只测速度、不写盘，可加 **`--no_output_dir`**；关闭样本打印用 **`--verify_n_samples 0`**。更多选项见「日志与结果」。
+
+### 1) 冒烟测试（单卡，推荐先跑）
+
+**A. 最小三法（最快）**：验证数据加载、PEFT LoRA/AdaLoRA、EvoRank 双时间尺度与 CSV。AdaLoRA 需显式正交系数（与训练循环一致）；步数很少时把 `--adalora_delta_t` 调小，避免整段训练不做预算更新。
 
 ```bash
 python run_benchmark.py \
@@ -130,22 +141,50 @@ python run_benchmark.py \
   --max_train_steps 50 \
   --T_es 20 \
   --warmup_ratio 0.1 \
+  --adalora_delta_t 50 \
+  --adalora_orth_reg_weight 0.1 \
   --seed 42 \
   --log_dir runs/smoke \
+  --output_dir artifacts \
   --export_csv results_smoke.csv
 ```
 
-如果你要和你当前终端里的命令保持一致（例如加入 `--use_wandb`），可以在上面基础上补充：
-`--use_wandb --wandb_project <your_project>`
+**B. 对比方法全开（较慢）**：在 A 的基础上加入 LoRA-GA（rank0 上取少量 batch 做梯度 SVD 初始化）与 SoRA（gate + L1）。
 
-提示：使用 nohup 前建议先创建日志目录：
+```bash
+python run_benchmark.py \
+  --methods lora adalora evorank lora-ga sora \
+  --task_name sst2 \
+  --model_name roberta-base \
+  --max_train_steps 50 \
+  --T_es 20 \
+  --warmup_ratio 0.1 \
+  --adalora_delta_t 50 \
+  --adalora_orth_reg_weight 0.1 \
+  --lora_ga_batches 4 \
+  --sora_sparse_lambda 1e-3 \
+  --sora_lambda_warmup_steps 0 \
+  --seed 42 \
+  --log_dir runs/smoke_full \
+  --output_dir artifacts \
+  --export_csv results_smoke_full.csv
+```
+
+若使用 W&B，在以上命令末尾追加：`--use_wandb --wandb_project <your_project>`。
+
+冒烟结束后可检查例如 `artifacts/sst2_roberta-base_lora/final/` 与 `metrics.jsonl`，并查看终端 **`[verify]`** 行是否与标签一致。
+
+使用 nohup / 后台跑 torchrun 前建议：
 
 ```bash
 mkdir -p logs
 ```
 
 ### 1.1) DDP 多卡冒烟测试（torchrun）
-在 Linux 多卡环境下，建议先用极小步数验证结构演化与 reward 不分裂：
+
+在 Linux 多卡上先用极小步数验证：各卡 loss/同步、EvoRank trial、LoRA-GA 的 barrier/broadcast（若包含 `lora-ga`）。
+
+**最小三法：**
 
 ```bash
 torchrun --nproc_per_node=2 --master_port=29500 \
@@ -157,16 +196,24 @@ torchrun --nproc_per_node=2 --master_port=29500 \
   --max_train_steps 20 \
   --T_es 10 \
   --warmup_ratio 0.1 \
+  --adalora_delta_t 10 \
+  --adalora_orth_reg_weight 0.1 \
   --mini_val_k 4 \
+  --seed 42 \
   --log_dir runs/ddp_smoke \
+  --output_dir artifacts \
   --export_csv results_ddp_smoke.csv
 ```
 
+**对比全开（可选）**：将 `--methods` 改为 `lora adalora evorank lora-ga sora`，并追加例如 `--lora_ga_batches 2 --sora_sparse_lambda 1e-3`（DDP 下 LoRA-GA 仅在 rank0 用全数据 loader 的前若干个 batch 估计，他卡 barrier 等待）。产物与 checkpoint **仅 rank0 写盘**。
+
 ### 2) 主结果模板（多任务）
+
+全对比时包含 LoRA-GA / SoRA；若只想跑基线，可将 `--methods` 改为 `lora adalora evorank` 并去掉 `--lora_ga_batches` / `--sora_*`。
 
 ```bash
 python run_benchmark.py \
-  --methods lora adalora evorank \
+  --methods lora adalora evorank lora-ga sora \
   --task_list sst2 qnli rte mnli \
   --model_list roberta-base \
   --target_rank 8 \
@@ -178,11 +225,15 @@ python run_benchmark.py \
   --T_es 200 \
   --mini_val_k 8 \
   --adalora_delta_t 200 \
+  --adalora_orth_reg_weight 0.1 \
+  --lora_ga_batches 8 \
+  --sora_sparse_lambda 1e-3 \
   --lambda_c 0.0 \
   --complexity_mode rank_sum \
   --population_strategy all \
   --seed 42 \
   --log_dir runs/main_results \
+  --output_dir artifacts \
   --export_csv results_main.csv
 ```
 
@@ -192,7 +243,7 @@ python run_benchmark.py \
 nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
-  --methods lora adalora evorank \
+  --methods lora adalora evorank lora-ga sora \
   --task_list sst2 qnli rte mnli \
   --model_list roberta-base \
   --target_rank 8 \
@@ -204,11 +255,15 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --T_es 200 \
   --mini_val_k 8 \
   --adalora_delta_t 200 \
+  --adalora_orth_reg_weight 0.1 \
+  --lora_ga_batches 8 \
+  --sora_sparse_lambda 1e-3 \
   --lambda_c 0.0 \
   --complexity_mode rank_sum \
   --population_strategy all \
   --seed 42 \
   --log_dir runs/main_results_ddp \
+  --output_dir artifacts \
   --export_csv results_main_ddp.csv \
   > logs/main_results_ddp.out 2>&1 &
 ```
@@ -231,6 +286,7 @@ python run_benchmark.py \
   --population_strategy all \
   --seed 42 \
   --log_dir runs/ablation/full \
+  --output_dir artifacts \
   --export_csv results_ablation_full.csv
 ```
 
@@ -254,6 +310,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --population_strategy all \
   --seed 42 \
   --log_dir runs/ablation_full_ddp \
+  --output_dir artifacts \
   --export_csv results_ablation_full_ddp.csv \
   > logs/ablation_full_ddp.out 2>&1 &
 ```
@@ -262,7 +319,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 
 ```bash
 python run_benchmark.py \
-  --methods lora adalora evorank \
+  --methods lora adalora evorank lora-ga sora \
   --task_name sst2 \
   --model_name roberta-base \
   --target_rank 8 \
@@ -273,12 +330,16 @@ python run_benchmark.py \
   --T_es 200 \
   --mini_val_k 8 \
   --adalora_delta_t 200 \
+  --adalora_orth_reg_weight 0.1 \
+  --lora_ga_batches 8 \
+  --sora_sparse_lambda 1e-3 \
   --lambda_c 0.001 \
   --complexity_mode rank_sum \
   --lambda_pop 16 \
   --population_strategy all \
   --seed 42 \
   --log_dir runs/efficiency \
+  --output_dir artifacts \
   --export_csv results_efficiency.csv
 ```
 
@@ -288,7 +349,7 @@ python run_benchmark.py \
 nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
-  --methods lora adalora evorank \
+  --methods lora adalora evorank lora-ga sora \
   --task_name sst2 \
   --model_name roberta-base \
   --target_rank 8 \
@@ -299,12 +360,16 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --T_es 200 \
   --mini_val_k 8 \
   --adalora_delta_t 200 \
+  --adalora_orth_reg_weight 0.1 \
+  --lora_ga_batches 8 \
+  --sora_sparse_lambda 1e-3 \
   --lambda_c 0.001 \
   --complexity_mode rank_sum \
   --lambda_pop 16 \
   --population_strategy all \
   --seed 42 \
   --log_dir runs/efficiency_ddp \
+  --output_dir artifacts \
   --export_csv results_efficiency_ddp.csv \
   > logs/efficiency_ddp.out 2>&1 &
 ```
@@ -320,12 +385,21 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   - 命令增加 `--use_wandb --wandb_project <project_name>`
 - CSV 导出：
   - `--export_csv <file.csv>`
-  - 默认字段：`task/backbone/method/trainable_params/best_val_accuracy/peak_memory_mb/avg_active_rank/total_train_time_sec`
+  - 默认字段：`task/backbone/method/trainable_params/best_val_accuracy/peak_memory_mb/avg_active_rank/total_train_time_sec/artifact_dir/final_dir`
+- **训练产物目录**（与 TensorBoard 的 `--log_dir` 相互独立）：
+  - `--output_dir`：默认 `artifacts`；每个 `task×backbone×method` 会在其下创建子目录，例如 `artifacts/sst2_roberta-base_lora/`。
+  - `--no_output_dir`：关闭该目录下所有落盘（不写 `metrics.jsonl`、checkpoint、`final/`）。
+  - `metrics.jsonl`：每 epoch 一行 JSON（`epoch`、`global_step`、`val_metric`、`best_val`、`train_loss_ema`）。
+  - `--save_steps N`：`N>0` 时每 N 个训练 step 保存 `checkpoint_step_*.pt`（仅 rank0；内含 unwrap 后的 `inner` 权重与优化器/调度器，**不含** EvoRank Controller 的 EMA 等内部状态）。
+  - `--save_every_epoch`：每个 epoch 末保存 `checkpoint_epoch_*.pt`。
+  - `--no_save_final_model`：训练结束不写 `final/`（默认会写）。
+  - `final/`：**自包含推理资产** — PEFT 方法调用 `save_pretrained`（含 `adapter_config.json`）；`evorank`/`sora` 等手写注入保存 `model_state.pt`；并写入 `training_meta.json` 与 **`tokenizer` 文件**（便于 `AutoTokenizer.from_pretrained(<final_dir>)` 离线加载）。
+  - `--verify_n_samples K`：训练结束后主进程打印验证集前 K 条分类 `[Gold]` vs `[Pred]`，或 NLG 一条摘要片段；`K=0` 关闭（默认 `2`）。
 
 ---
 
 ## NLG（生成任务）示例：CNN/DailyMail + ROUGE-L
-脚本支持 `--task_type nlg`。当前默认使用 CNN/DailyMail，并在验证阶段按 `--nlg_eval_max_samples` 条样本计算 ROUGE-L。
+脚本支持 `--task_type nlg`。当前默认使用 CNN/DailyMail；验证阶段在单卡或 DDP 下 rank0 上对**完整验证集**（或 `--nlg_eval_max_samples` 截断）算 ROUGE-L，他卡 `barrier` 同步。
 
 ```bash
 python run_benchmark.py \
@@ -333,7 +407,7 @@ python run_benchmark.py \
   --nlg_dataset_name cnn_dailymail \
   --task_name cnn_dailymail \
   --model_name t5-small \
-  --methods lora adalora evorank \
+  --methods lora adalora evorank lora-ga sora \
   --target_rank 8 \
   --epochs 1 \
   --batch_size 4 \
@@ -344,13 +418,21 @@ python run_benchmark.py \
   --max_train_steps 50 \
   --T_es 20 \
   --warmup_ratio 0.1 \
+  --adalora_delta_t 50 \
+  --adalora_orth_reg_weight 0.1 \
+  --lora_ga_batches 4 \
+  --sora_sparse_lambda 1e-3 \
   --lambda_c 0.0 \
   --complexity_mode rank_sum \
   --lambda_pop 16 \
   --population_strategy all \
+  --seed 42 \
   --log_dir runs/nlg_smoke \
+  --output_dir artifacts \
   --export_csv results_nlg_smoke.csv
 ```
+
+仅跑轻量基线时可改为 `--methods lora adalora evorank` 并去掉 `--lora_ga_batches`、`--sora_sparse_lambda`。
 
 ---
 
@@ -367,6 +449,14 @@ python run_benchmark.py \
 ### 3) 报设备不一致（CPU/CUDA）
 
 典型报错：`Expected all tensors to be on the same device`。本仓库在 `train_evo_lora_step` 中已加入 controller 状态张量对齐。
+
+### 4) 如何从 `final/` 加载 PEFT 适配器
+
+`final/` 里是 **adapter**（及 tokenizer），推理时仍需原始 **`AutoModel*.from_pretrained(<base_model>)`**，再 **`PeftModel.from_pretrained(base_model, <final_dir>)`**（或与 `AutoModelForSequenceClassification` 等组合，按 HF PEFT 文档）。`evorank`/`sora` 的 `model_state.pt` 对应手写注入后的 `inner` 权重，加载方式与训练时构图一致，需自行 `load_state_dict`。
+
+### 5) 中间 checkpoint 能否完美续训 EvoRank
+
+当前 `.pt` **不保存** `RankEvolutionController` 的 EMA/计数器等；续训仅保证优化器与 `inner` 权重一致，ES 演化轨迹可能与「从头连续跑」不同。以推理与打表为主时通常足够；若需 bit 级续训一致，需在后续版本为 Controller 增加 `state_dict` 并写入同一 checkpoint。
 
 ---
 
