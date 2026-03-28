@@ -1,0 +1,106 @@
+# =============================================================================
+# 仅忽略：下载的数据与模型缓存、虚拟环境、训练/评测产物与权重。
+# 源代码与仓库内配置应保留纳入版本控制（勿再使用全局 *.json / .* 等过宽规则）。
+# =============================================================================
+
+# --- HuggingFace / 数据集 / 本地模型缓存（README 默认 datasets、models）---
+datasets/
+models/
+hf_home/
+hub/
+
+# --- 实验输出：TensorBoard、artifact 目录、导出结果、日志 ---
+runs/
+artifacts/
+outputs/
+logs/
+*.out
+results_*.csv
+benchmark_results.csv
+*_results*.csv
+metrics.jsonl
+
+# --- 权重与 checkpoint（含 PEFT / torch.save）---
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+pretrained_checkpoints/
+trained_models/
+
+# --- 虚拟环境 / 本地 Conda（README 中 ./envs/ 约定）---
+.env
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+envs/
+NLG_env/
+
+# --- 临时与草稿 ---
+**/SCRATCH*
+*~
+.DS_Store
+toy_*.py
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- 测试与类型检查 ---
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+
+# --- 工具与 IDE ---
+.idea/
+.vscode/
+.spyderproject
+.spyproject
+.ropeproject
+
+# --- Jupyter / IPython ---
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# --- 其他 ---
+.python-version
+/site
+wandb/

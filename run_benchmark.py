@@ -960,6 +960,15 @@ def run_training_loop(
         if (checkpoint_root and save_final_model)
         else ""
     )
+    val_metric_key_str = ""
+    if task_type == "nlu" and task_name is not None:
+        try:
+            val_metric_key_str = glue_primary_metric_key(task_name)
+        except ValueError:
+            val_metric_key_str = ""
+    elif task_type == "nlg":
+        val_metric_key_str = "rougeL"
+
     result = {
         "method": method_name,
         "best_val_accuracy": best_val_acc,
@@ -975,6 +984,7 @@ def run_training_loop(
         ),
         "artifact_dir": artifact_dir_str,
         "final_dir": final_dir_str,
+        "val_metric_key": val_metric_key_str,
     }
     return result
 
@@ -1169,6 +1179,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "task",
                     "backbone",
                     "method",
+                    "val_metric_key",
                     "trainable_params",
                     "best_val_accuracy",
                     "peak_memory_mb",
@@ -1216,17 +1227,28 @@ if __name__ == "__main__":
         results = run_protocol_grid(args)
 
         if args.is_main_process:
+            if results:
+                mk = (results[0].get("val_metric_key") or "").strip()
+                if mk:
+                    print(
+                        f"[summary] 验证主指标日志键为 val_{mk}；CSV 列名仍为 best_val_accuracy（存同一数值）。"
+                    )
             print("\n=== Benchmark Summary ===")
-            print(f"{'task':<8} {'backbone':<16} {'method':<12} {'best_acc':<10} {'peak_mem_mb':<12} {'avg_rank':<12} {'time_sec':<12}")
+            print(
+                f"{'task':<8} {'backbone':<16} {'method':<12} {'best_metric':<12} "
+                f"{'peak_mem_mb':<12} {'avg_rank':<10} {'time_sec':<10}"
+            )
             for r in results:
+                ar = r["avg_active_rank"]
+                ar_fmt = f"{float(ar):.4f}" if isinstance(ar, float) else str(ar)
                 print(
                     f"{r.get('task', args.task_name):<8} "
                     f"{r.get('backbone', args.model_name):<16} "
                     f"{r['method']:<12} "
-                    f"{r['best_val_accuracy']:<10.4f} "
+                    f"{r['best_val_accuracy']:<12.4f} "
                     f"{r['peak_memory_mb']:<12.2f} "
-                    f"{str(r['avg_active_rank']):<12} "
-                    f"{r['total_train_time_sec']:<12.2f}"
+                    f"{ar_fmt:<10} "
+                    f"{r['total_train_time_sec']:<10.2f}"
                 )
     finally:
         if args.ddp_enabled and dist.is_available() and dist.is_initialized():

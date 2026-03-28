@@ -196,6 +196,8 @@ python run_benchmark.py \
   --export_csv results_smoke_full.csv
 ```
 
+**冒烟预期（健康检查）**：`--max_train_steps 50` 仅覆盖约一个 epoch 的一小段，**SST-2 上 `val_accuracy` 接近 0.5（随机基线）是正常现象**；多种方法数值相同或极接近也常见。应确认：无 Python 异常、各方法均打印 `val_*` 行、**`[verify]`** 有输出、`artifacts/.../final/` 与 CSV 落盘。加载 `roberta-base` 时若出现 classifier 权重「新初始化」的提示，属在下游头随机初始化上的预期行为。
+
 若使用 W&B，在以上命令末尾追加：`--use_wandb --wandb_project <your_project>`。
 
 冒烟结束后可检查例如 `artifacts/sst2_roberta-base_lora/final/` 与 `metrics.jsonl`，并查看终端 **`[verify]`** 行是否与标签一致。
@@ -411,7 +413,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   - 命令增加 `--use_wandb --wandb_project <project_name>`
 - CSV 导出：
   - `--export_csv <file.csv>`
-  - 默认字段：`task/backbone/method/trainable_params/best_val_accuracy/peak_memory_mb/avg_active_rank/total_train_time_sec/artifact_dir/final_dir`
+  - 默认字段：`task/backbone/method/val_metric_key/trainable_params/best_val_accuracy/peak_memory_mb/avg_active_rank/total_train_time_sec/artifact_dir/final_dir`（`val_metric_key` 标明 `best_val_accuracy` 对应何种主指标，如 `accuracy`、`f1`、`matthews_corrcoef`）
 - **训练产物目录**（与 TensorBoard 的 `--log_dir` 相互独立）：
   - `--output_dir`：默认 `artifacts`；每个 `task×backbone×method` 会在其下创建子目录，例如 `artifacts/sst2_roberta-base_lora/`。
   - `--no_output_dir`：关闭该目录下所有落盘（不写 `metrics.jsonl`、checkpoint、`final/`）。
