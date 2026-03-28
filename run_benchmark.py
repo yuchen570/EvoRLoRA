@@ -25,6 +25,7 @@ from transformers import (
 
 from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
 
+from adalora_utils import adalora_update_and_allocate, compute_adalora_orthogonal_loss, get_adalora_orth_reg_weight, unwrap_inner_from_training_model
 from lora_ga_init import apply_lora_ga_init_to_peft, run_lora_ga_init_pipeline
 from rank_evolution_controller import RankEvolutionController
 from sora_inject import inject_sora
@@ -251,6 +252,10 @@ def peft_factory(
     lora_ga_device: Optional[torch.device] = None,
     is_main_process: bool = True,
     ddp_enabled: bool = False,
+    adalora_init_r: Optional[int] = None,
+    adalora_tinit: Optional[int] = None,
+    adalora_tfinal: Optional[int] = None,
+    adalora_orth_reg_weight: float = 0.1,
 ) -> Tuple[nn.Module, Optional[RankEvolutionController], Dict[str, Any]]:
     model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
     if "roberta" in model_type or "bert" in model_type:
@@ -286,17 +291,33 @@ def peft_factory(
         model = get_peft_model(model, config)
 
     elif method_name == "adalora":
-        # AdaLoRA 时间超参与训练总步数对齐，避免动态预算未触发或过早结束。
+        # AdaLoRA：预算调度 + RankAllocator（步后 update_and_allocate）+ 正交正则（本脚本在 loss 上显式加入，见 run_training_loop）。
         planned_steps = max(int(total_steps or 1000), 1)
-        tinit = max(int(0.1 * planned_steps), 1)
-        tfinal = max(int(0.8 * planned_steps), tinit + 1)
-        config = AdaLoraConfig(
+        if adalora_tinit is None:
+            tinit = max(int(0.1 * planned_steps), 1)
+        else:
+            tinit = max(int(adalora_tinit), 1)
+        if adalora_tfinal is None:
+            tfinal = max(int(0.8 * planned_steps), tinit + 1)
+        else:
+            tfinal = max(int(adalora_tfinal), tinit + 1)
+        if tinit >= planned_steps - tfinal:
+            raise ValueError(
+                f"AdaLoRA 调度无效：需满足 tinit < total_step - tfinal，当前 total_step={planned_steps}, "
+                f"tinit={tinit}, tfinal={tfinal}。请减小 --adalora_tinit/--adalora_tfinal 或增大训练步数。"
+            )
+        init_r_val = int(adalora_init_r) if adalora_init_r is not None else target_rank * 2
+        if init_r_val < target_rank:
+            raise ValueError("adalora_init_r 应 >= target_rank（target_r）")
+
+        adalora_kw: Dict[str, Any] = dict(
             task_type=peft_task_type,
-            init_r=target_rank * 2,
+            init_r=init_r_val,
             target_r=target_rank,
             lora_alpha=2 * target_rank,
             lora_dropout=0.1,
             target_modules=target_modules,
+            bias="none",
             beta1=0.85,
             beta2=0.85,
             total_step=planned_steps,
@@ -304,6 +325,15 @@ def peft_factory(
             tfinal=tfinal,
             deltaT=adalora_delta_t,
         )
+        try:
+            from dataclasses import fields
+
+            _adalora_field_names = {f.name for f in fields(AdaLoraConfig)}
+        except Exception:
+            _adalora_field_names = set()
+        if "orth_reg_weight" in _adalora_field_names:
+            adalora_kw["orth_reg_weight"] = float(adalora_orth_reg_weight)
+        config = AdaLoraConfig(**adalora_kw)
         model = get_peft_model(model, config)
 
     elif method_name == "evorank":
@@ -370,15 +400,8 @@ def peft_factory(
 
 
 def _adalora_post_step_update(model: nn.Module, global_step: int) -> None:
-    """
-    兼容不同 PEFT 版本下 AdaLoRA 的步后预算更新入口。
-    """
-    if hasattr(model, "update_and_allocate"):
-        model.update_and_allocate(global_step)
-        return
-    base_model = getattr(model, "base_model", None)
-    if base_model is not None and hasattr(base_model, "update_and_allocate"):
-        base_model.update_and_allocate(global_step)
+    """PEFT AdaLora 步后 RankAllocator / mask 更新（兼容 DDP + DictFeatureClassifier）。"""
+    adalora_update_and_allocate(model, global_step)
 
 
 def run_training_loop(
@@ -519,6 +542,11 @@ def run_training_loop(
                 optimizer.zero_grad(set_to_none=True)
                 logits = model(features)
                 loss = loss_fn(logits, labels)
+                if method_name == "adalora":
+                    inner = unwrap_inner_from_training_model(model)
+                    ow = get_adalora_orth_reg_weight(inner)
+                    if ow > 0:
+                        loss = loss + ow * compute_adalora_orthogonal_loss(inner)
                 if method_name == "sora":
                     lam = float(sora_sparse_lambda)
                     if sora_lambda_warmup_steps > 0:
@@ -725,6 +753,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--T_es", type=int, default=200)
     parser.add_argument("--mini_val_k", type=int, default=8)
     parser.add_argument("--adalora_delta_t", type=int, default=200)
+    parser.add_argument("--adalora_init_r", type=int, default=None, help="AdaLoRA init_r，默认 2*target_rank")
+    parser.add_argument("--adalora_tinit", type=int, default=None, help="AdaLoRA 初始满秩阶段步数 tinit，默认 floor(0.1*total_step)")
+    parser.add_argument("--adalora_tfinal", type=int, default=None, help="AdaLoRA 末尾不调秩阶段步数 tfinal，默认 floor(0.8*total_step)")
+    parser.add_argument(
+        "--adalora_orth_reg_weight",
+        type=float,
+        default=0.1,
+        help="AdaLoRA 正交正则（与 PEFT/论文一致；本脚本因只取 logits 需显式加项）",
+    )
     parser.add_argument("--max_train_steps", type=int, default=None)
     parser.add_argument("--log_dir", type=str, default="runs/benchmark")
     parser.add_argument("--use_wandb", action="store_true")
@@ -787,6 +824,10 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     target_rank=args.target_rank,
                     total_steps=planned_total_steps,
                     adalora_delta_t=args.adalora_delta_t,
+                    adalora_init_r=args.adalora_init_r,
+                    adalora_tinit=args.adalora_tinit,
+                    adalora_tfinal=args.adalora_tfinal,
+                    adalora_orth_reg_weight=args.adalora_orth_reg_weight,
                     train_loader=train_loader,
                     lora_ga_batches=args.lora_ga_batches,
                     task_type=args.task_type,
