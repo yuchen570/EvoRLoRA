@@ -519,13 +519,14 @@ def _run_verify_samples(
 ) -> None:
     if verify_n_samples <= 0:
         return
-    model.eval()
+    infer_model = _unwrap_training_module(model)
+    infer_model.eval()
     with torch.no_grad():
         if task_type == "nlu":
             for vb in val_loader:
                 vb = batch_to_device(vb, device)
                 features, labels = extract_features_and_labels(vb, task_type=task_type)
-                logits = model(features)
+                logits = infer_model(features)
                 n = min(verify_n_samples, int(labels.size(0)))
                 if nlu_is_glue_regression(glue_task_name):
                     pred_scores = logits.squeeze(-1)
@@ -792,7 +793,8 @@ def run_training_loop(
             regression = nlu_is_glue_regression(task_name)
             if is_main_process:
                 ev_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
-                y_pred, y_true = collect_nlu_predictions(model, ev_loader, device, regression=regression)
+                eval_model = _unwrap_training_module(model)
+                y_pred, y_true = collect_nlu_predictions(eval_model, ev_loader, device, regression=regression)
                 val_metric = compute_glue_primary_metric(task_name, y_pred, y_true)
             if ddp_enabled and dist.is_available() and dist.is_initialized():
                 m_tensor = torch.tensor([val_metric], device=device, dtype=torch.float64)
@@ -953,6 +955,9 @@ def run_training_loop(
             generation_max_new_tokens,
             glue_task_name=task_name,
         )
+
+    if ddp_enabled and dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
     artifact_dir_str = checkpoint_root or ""
     final_dir_str = (
