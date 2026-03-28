@@ -5,7 +5,18 @@
 - `EvoRankLoRALayer`：最大秩超空间 + 掩码激活 + 在线扩张/修剪
 - `RankEvolutionController`：EMA 统计、动态阈值、计数器与冷却、Mutation 生成与提交
 - `train_integration.py`：模型注入（`inject_evo_lora`）与双时间尺度训练步（`train_evo_lora_step`）
-- `run_benchmark.py`：GLUE 基准脚本（LoRA/AdaLoRA/EvoRank），支持日志与 CSV 导出
+- `run_benchmark.py`：GLUE/NLG 基准脚本，支持 LoRA、AdaLoRA、EvoRank、**LoRA-GA**、**SoRA**（及 MTL-LoRA 占位说明），支持日志与 CSV 导出
+
+### 对比方法（`--methods`）
+
+| 方法 | 说明 |
+|------|------|
+| `lora` | 标准 HuggingFace PEFT LoRA |
+| `adalora` | HuggingFace PEFT AdaLoRA |
+| `evorank` | 本仓库 EvoRank-LoRA |
+| `lora-ga` | 梯度 SVD 初始化 + 标准 PEFT LoRA；DDP 下仅 rank0 用无分布式 Sampler 的 loader 取前 `--lora_ga_batches` 个 batch，再 `broadcast_object_list` 同步 |
+| `sora` | 带 `gate` 的稀疏低秩旁路；训练时需在主损失上加 L1（脚本已用 `--sora_sparse_lambda`，可选 `--sora_lambda_warmup_steps`） |
+| `mtl-lora` | 未实现：需联合多任务与 task id，与当前 `--task_list` 串行协议不对齐 |
 
 ---
 

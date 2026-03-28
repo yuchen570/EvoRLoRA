@@ -25,7 +25,9 @@ from transformers import (
 
 from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
 
+from lora_ga_init import apply_lora_ga_init_to_peft, run_lora_ga_init_pipeline
 from rank_evolution_controller import RankEvolutionController
+from sora_inject import inject_sora
 from train_integration import inject_evo_lora, train_evo_lora_step
 
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -243,6 +245,12 @@ def peft_factory(
     target_rank: int = 8,
     total_steps: Optional[int] = None,
     adalora_delta_t: int = 200,
+    train_loader: Optional[DataLoader] = None,
+    lora_ga_batches: int = 8,
+    task_type: str = "nlu",
+    lora_ga_device: Optional[torch.device] = None,
+    is_main_process: bool = True,
+    ddp_enabled: bool = False,
 ) -> Tuple[nn.Module, Optional[RankEvolutionController], Dict[str, Any]]:
     model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
     if "roberta" in model_type or "bert" in model_type:
@@ -311,10 +319,46 @@ def peft_factory(
             if "classifier" in name or "score" in name or "lm_head" in name or name == "shared":
                 param.requires_grad = True
 
-    elif method_name in {"lora-ga", "sora", "mtl-lora"}:
+    elif method_name == "lora-ga":
+        if train_loader is None:
+            raise ValueError("method_name='lora-ga' 时必须传入 train_loader")
+        ga_dev = lora_ga_device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        init_by_key = run_lora_ga_init_pipeline(
+            base_model=model,
+            train_loader=train_loader,
+            target_modules=target_modules,
+            lora_r=target_rank,
+            lora_ga_batches=lora_ga_batches,
+            task_type=task_type,
+            device=ga_dev,
+            is_main_process=is_main_process,
+            ddp_enabled=ddp_enabled,
+            loss_fn=None,
+        )
+        config = LoraConfig(
+            task_type=peft_task_type,
+            r=target_rank,
+            lora_alpha=2 * target_rank,
+            lora_dropout=0.1,
+            target_modules=target_modules,
+            bias="none",
+        )
+        model = get_peft_model(model, config)
+        tgt = next(model.parameters()).device
+        apply_lora_ga_init_to_peft(model, init_by_key, target_device=tgt)
+
+    elif method_name == "sora":
+        inject_sora(
+            model=model,
+            target_modules=target_modules,
+            r=target_rank,
+            lora_alpha=float(2 * target_rank),
+            lora_dropout=0.1,
+        )
+
+    elif method_name == "mtl-lora":
         raise NotImplementedError(
-            f"{method_name} 尚未接入。\n"
-            "TODO: 从对应官方仓库导入构造函数，并保证统一接口 (model, target_rank) -> peft_model。"
+            "mtl-lora 需联合多任务数据与 task id；当前 --task_list 为逐任务串行。见 README / MTL-LoRA 官方仓库。"
         )
     else:
         raise ValueError(f"未知 method_name: {method_name}")
@@ -366,6 +410,8 @@ def run_training_loop(
     population_strategy: str = "all",
     random_seed: Optional[int] = None,
     val_loader_eval_full: Optional[DataLoader] = None,
+    sora_sparse_lambda: float = 1e-3,
+    sora_lambda_warmup_steps: int = 0,
 ) -> Dict[str, Any]:
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         if not torch.cuda.is_available():
@@ -473,6 +519,14 @@ def run_training_loop(
                 optimizer.zero_grad(set_to_none=True)
                 logits = model(features)
                 loss = loss_fn(logits, labels)
+                if method_name == "sora":
+                    lam = float(sora_sparse_lambda)
+                    if sora_lambda_warmup_steps > 0:
+                        lam *= min(1.0, float(global_step + 1) / float(sora_lambda_warmup_steps))
+                    l1_penalty = sum(
+                        p.abs().sum() for n, p in model.named_parameters() if n.endswith(".gate")
+                    )
+                    loss = loss + lam * l1_penalty
                 loss.backward()
                 optimizer.step()
                 if method_name == "adalora":
@@ -685,6 +739,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export_csv", type=str, default="benchmark_results.csv")
     parser.add_argument("--ddp", action="store_true", help="是否启用 torchrun/DistributedDataParallel")
     parser.add_argument("--ddp_backend", type=str, default="nccl", help="DDP backend，通常是 nccl")
+    parser.add_argument("--lora_ga_batches", type=int, default=8, help="LoRA-GA 梯度估计用的训练 batch 数（仅前若干个 batch）")
+    parser.add_argument("--sora_sparse_lambda", type=float, default=1e-3, help="SoRA：gate L1 惩罚系数")
+    parser.add_argument("--sora_lambda_warmup_steps", type=int, default=0, help="SoRA：前若干步将 sparse_lambda 从 0 线性升到设定值；0 表示关闭")
     return parser.parse_args()
 
 
@@ -720,12 +777,22 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
             )
             for method in args.methods:
                 method_model = copy.deepcopy(base_model)
+                if args.ddp_enabled and torch.cuda.is_available():
+                    lora_ga_dev = torch.device(f"cuda:{args.local_rank}")
+                else:
+                    lora_ga_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 method_model, controller, meta = peft_factory(
                     model=method_model,
                     method_name=method,
                     target_rank=args.target_rank,
                     total_steps=planned_total_steps,
                     adalora_delta_t=args.adalora_delta_t,
+                    train_loader=train_loader,
+                    lora_ga_batches=args.lora_ga_batches,
+                    task_type=args.task_type,
+                    lora_ga_device=lora_ga_dev,
+                    is_main_process=args.is_main_process,
+                    ddp_enabled=args.ddp_enabled,
                 )
                 res = run_training_loop(
                     model=method_model,
@@ -756,6 +823,8 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     population_strategy=args.population_strategy,
                     random_seed=args.seed,
                     val_loader_eval_full=val_loader_eval_full,
+                    sora_sparse_lambda=args.sora_sparse_lambda,
+                    sora_lambda_warmup_steps=args.sora_lambda_warmup_steps,
                 )
                 res.update(
                     {
