@@ -84,7 +84,7 @@ def setup_data_and_model(
     rank: int = 0,
     world_size: int = 1,
     seed: int = 42,
-) -> Tuple[DataLoader, DataLoader, nn.Module, AutoTokenizer]:
+) -> Tuple[DataLoader, DataLoader, Optional[DataLoader], nn.Module, AutoTokenizer]:
     os.makedirs(dataset_cache_dir, exist_ok=True)
     os.makedirs(model_cache_dir, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=model_cache_dir)
@@ -166,7 +166,7 @@ def setup_data_and_model(
             num_labels=num_labels,
             cache_dir=model_cache_dir,
         )
-        return train_loader, val_loader, base_model, tokenizer
+        return train_loader, val_loader, None, base_model, tokenizer
 
     if task_type == "nlg":
         if nlg_dataset_name != "cnn_dailymail":
@@ -222,12 +222,17 @@ def setup_data_and_model(
             val_loader = DataLoader(
                 tokenized[val_split_name], batch_size=batch_size, sampler=val_sampler, collate_fn=collator
             )
+            # DDP 下验证集被切分；ROUGE 需在 rank0 上对完整验证集评估（他卡 barrier 等待）。
+            val_loader_eval_full = DataLoader(
+                tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator
+            )
         else:
             train_loader = DataLoader(tokenized["train"], batch_size=batch_size, shuffle=True, collate_fn=collator)
             val_loader = DataLoader(tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator)
+            val_loader_eval_full = None
 
         base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, cache_dir=model_cache_dir)
-        return train_loader, val_loader, base_model, tokenizer
+        return train_loader, val_loader, val_loader_eval_full, base_model, tokenizer
 
     raise ValueError(f"未知 task_type: {task_type}")
 
@@ -360,6 +365,7 @@ def run_training_loop(
     lambda_pop: Optional[int] = None,
     population_strategy: str = "all",
     random_seed: Optional[int] = None,
+    val_loader_eval_full: Optional[DataLoader] = None,
 ) -> Dict[str, Any]:
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         if not torch.cuda.is_available():
@@ -536,10 +542,12 @@ def run_training_loop(
         else:
             if tokenizer is None:
                 raise ValueError("task_type='nlg' 时必须传入 tokenizer")
-            if not is_main_process:
-                # 非主进程只跑训练，不做生成评估
-                val_metric = 0.0
-            else:
+            # DDP 下用 barrier 对齐：rank0 在完整验证集上算 ROUGE，避免 DistributedSampler 子集有偏。
+            if ddp_enabled and dist.is_available() and dist.is_initialized():
+                dist.barrier()
+
+            val_metric = 0.0
+            if is_main_process:
                 try:
                     import evaluate  # type: ignore
 
@@ -556,12 +564,14 @@ def run_training_loop(
 
                 pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
+                eval_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
+
                 preds_text: List[str] = []
                 refs_text: List[str] = []
                 sample_count = 0
 
                 with torch.no_grad():
-                    for vb in val_loader:
+                    for vb in eval_loader:
                         vb = batch_to_device(vb, device)
                         input_ids = vb["input_ids"]
                         attention_mask = vb.get("attention_mask", None)
@@ -594,15 +604,17 @@ def run_training_loop(
                     val_metric = float(scores.get("rougeL", scores.get("rougeLsum", 0.0)))
 
                 best_val_acc = max(best_val_acc, val_metric)
-                if is_main_process:
-                    print(
-                        f"[{method_name}] epoch={epoch + 1}/{epochs} "
-                        f"step={global_step} val_rougeL={val_metric:.4f} best={best_val_acc:.4f}"
-                    )
-                    if writer is not None:
-                        writer.add_scalar("val/rougeL", val_metric, epoch)
-                    if wandb_run is not None:
-                        wandb_run.log({"val/rougeL": val_metric, "epoch": epoch + 1, "step": global_step})
+                print(
+                    f"[{method_name}] epoch={epoch + 1}/{epochs} "
+                    f"step={global_step} val_rougeL={val_metric:.4f} best={best_val_acc:.4f}"
+                )
+                if writer is not None:
+                    writer.add_scalar("val/rougeL", val_metric, epoch)
+                if wandb_run is not None:
+                    wandb_run.log({"val/rougeL": val_metric, "epoch": epoch + 1, "step": global_step})
+
+            if ddp_enabled and dist.is_available() and dist.is_initialized():
+                dist.barrier()
 
         if max_train_steps is not None and global_step >= max_train_steps:
             break
@@ -688,7 +700,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
     for task_name in tasks:
         for model_name in models:
-            train_loader, val_loader, base_model, tokenizer = setup_data_and_model(
+            train_loader, val_loader, val_loader_eval_full, base_model, tokenizer = setup_data_and_model(
                 task_name=task_name,
                 model_name=model_name,
                 batch_size=args.batch_size,
@@ -743,6 +755,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     lambda_pop=args.lambda_pop,
                     population_strategy=args.population_strategy,
                     random_seed=args.seed,
+                    val_loader_eval_full=val_loader_eval_full,
                 )
                 res.update(
                     {
