@@ -40,8 +40,8 @@
 - **`stsb`**：训练为 MSE 回归；验证在**完整 dev 集**上算 Pearson 与 Spearman，主标量为二者**算术平均**（与 GLUE 总分里该任务的常见合成方式一致）。
 - **DDP**：与 NLG 相同，验证指标仅在 **rank0** 上对**全量** dev 集计算，再 `broadcast` 到各卡，避免 `DistributedSampler` 子集偏差。
 - CSV 列名仍为 **`best_val_accuracy`**，语义为「该任务验证主指标」（不限于 accuracy）；TensorBoard 为 **`val/<指标名>`**（如 `val/matthews_corrcoef`、`val/f1`、`val/pearson_spearman_mean`）。`metrics.jsonl` 含字段 **`glue_metric`** 标明指标键名。
-- **`--task_list`** 可串行跑多个 `task_name`；一次扫**全部 10 个 GLUE 任务**（含诊断集 `ax` 与回归 `stsb`）时可写：  
-  `--task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli`（顺序可任意；耗时与磁盘占用随任务数线性增长）。
+- **`--task_list`** 可串行跑多个 `task_name`；一次扫**全部 9 个 GLUE 任务**（含回归 `stsb`）时可写：  
+  `--task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli`（顺序可任意；耗时与磁盘占用随任务数线性增长）。
 
 ---
 
