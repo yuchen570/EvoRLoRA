@@ -207,12 +207,16 @@ def setup_data_and_model(
         return train_loader, val_loader, val_loader_eval_full, base_model, tokenizer
 
     if task_type == "nlg":
-        if nlg_dataset_name != "cnn_dailymail":
-            raise NotImplementedError("当前仅支持 nlg_dataset_name='cnn_dailymail'")
-
-        dataset = load_dataset(nlg_dataset_name, "3.0.0", cache_dir=dataset_cache_dir)
-        text_key = "article"
-        target_key = "highlights"
+        if nlg_dataset_name == "cnn_dailymail":
+            dataset = load_dataset("cnn_dailymail", "3.0.0", cache_dir=dataset_cache_dir)
+            text_key = "article"
+            target_key = "highlights"
+        elif nlg_dataset_name == "xsum":
+            dataset = load_dataset("xsum", cache_dir=dataset_cache_dir)
+            text_key = "document"
+            target_key = "summary"
+        else:
+            raise NotImplementedError(f"不支持的 nlg_dataset_name: {nlg_dataset_name!r}。已支持: cnn_dailymail, xsum")
 
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -292,18 +296,31 @@ def peft_factory(
     adalora_tfinal: Optional[int] = None,
     adalora_orth_reg_weight: float = 0.1,
     nlu_regression: bool = False,
+    lora_alpha: Optional[float] = None,
+    target_modules_override: Optional[str] = None,
+    lora_ga_use_rslora: bool = False,
+    lora_ga_stable_gamma: Optional[float] = None,
 ) -> Tuple[nn.Module, Optional[RankEvolutionController], Dict[str, Any]]:
-    model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
-    if "roberta" in model_type or "bert" in model_type:
-        target_modules = ["query", "value"]
-    elif "llama" in model_type or "mistral" in model_type:
-        target_modules = ["q_proj", "v_proj"]
-    elif "t5" in model_type:
-        # T5Attention 里常见的投影矩阵名为 q / k / v
-        target_modules = ["q", "v"]
+    # --target_modules 优先；否则按模型类型自动推断
+    if target_modules_override:
+        target_modules = [m.strip() for m in target_modules_override.split(",") if m.strip()]
     else:
-        # 回退默认：优先兼容 BERT/RoBERTa 风格命名
-        target_modules = ["query", "value"]
+        model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
+        if "deberta" in model_type:
+            target_modules = ["query_proj", "key_proj", "value_proj"]
+        elif "roberta" in model_type or "bert" in model_type:
+            target_modules = ["query", "value"]
+        elif "llama" in model_type or "mistral" in model_type:
+            target_modules = ["q_proj", "v_proj"]
+        elif "t5" in model_type:
+            target_modules = ["q", "v"]
+        else:
+            target_modules = ["query", "value"]
+
+    # --lora_alpha 优先；否则回退到 2 * target_rank
+    effective_alpha = float(lora_alpha) if lora_alpha is not None else float(2 * target_rank)
+
+    model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
 
     # PEFT 的 task_type 需要与 backbone 类型匹配，避免 seq2seq/causal 分支内部逻辑错误。
     if "t5" in model_type:
@@ -319,7 +336,7 @@ def peft_factory(
         config = LoraConfig(
             task_type=peft_task_type,
             r=target_rank,
-            lora_alpha=2 * target_rank,
+            lora_alpha=effective_alpha,
             lora_dropout=0.1,
             target_modules=target_modules,
             bias="none",
@@ -350,7 +367,7 @@ def peft_factory(
             task_type=peft_task_type,
             init_r=init_r_val,
             target_r=target_rank,
-            lora_alpha=2 * target_rank,
+            lora_alpha=effective_alpha,
             lora_dropout=0.1,
             target_modules=target_modules,
             bias="none",
@@ -376,7 +393,7 @@ def peft_factory(
         controller = inject_evo_lora(
             model=model,
             target_modules=target_modules,
-            layer_kwargs={"r_max": 16, "r_init": target_rank, "lora_alpha": 2.0 * target_rank},
+            layer_kwargs={"r_max": 16, "r_init": target_rank, "lora_alpha": effective_alpha},
             controller_kwargs={"rho": 0.9, "p_g": 0.8, "p_p": 0.1, "H_g": 2, "H_p": 3, "cooldown_steps": 2},
         )
         # EvoRank 手动注入后，需要显式解冻任务头（与 HF PEFT 在 SEQ_CLS 下的行为对齐）。
@@ -403,14 +420,16 @@ def peft_factory(
             is_main_process=is_main_process,
             ddp_enabled=ddp_enabled,
             loss_fn=ga_loss_fn,
+            stable_gamma=lora_ga_stable_gamma,
         )
         config = LoraConfig(
             task_type=peft_task_type,
             r=target_rank,
-            lora_alpha=2 * target_rank,
+            lora_alpha=effective_alpha,
             lora_dropout=0.1,
             target_modules=target_modules,
             bias="none",
+            use_rslora=lora_ga_use_rslora,
         )
         model = get_peft_model(model, config)
         tgt = next(model.parameters()).device
@@ -421,7 +440,7 @@ def peft_factory(
             model=model,
             target_modules=target_modules,
             r=target_rank,
-            lora_alpha=float(2 * target_rank),
+            lora_alpha=effective_alpha,
             lora_dropout=0.1,
         )
 
@@ -597,12 +616,16 @@ def run_training_loop(
     sora_sparse_lambda: float = 1e-3,
     sora_sparse_lambda_2: float = 1e-3,
     sora_lambda_warmup_steps: int = 0,
+    sora_lambda_schedule: Optional[str] = None,
+    sora_max_lambda: float = 10.0,
+    sora_lambda_num: int = 5,
     task_name: Optional[str] = None,
     checkpoint_root: Optional[str] = None,
     save_steps: int = 0,
     save_every_epoch: bool = False,
     save_final_model: bool = True,
     verify_n_samples: int = 2,
+    max_grad_norm: Optional[float] = None,
 ) -> Dict[str, Any]:
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         if not torch.cuda.is_available():
@@ -699,6 +722,8 @@ def run_training_loop(
     best_val_acc = 0.0
     train_loss_ema = None
     ema_beta = 0.95
+    rouge1_val: float = 0.0
+    rouge2_val: float = 0.0
 
     for epoch in range(epochs):
         model.train()
@@ -727,6 +752,7 @@ def run_training_loop(
                     lambda_pop=lambda_pop,
                     population_strategy=population_strategy,
                     random_seed=random_seed,
+                    max_grad_norm=max_grad_norm,
                 )
                 train_loss = float(out["train_loss"])
                 avg_active_rank = float(
@@ -745,7 +771,12 @@ def run_training_loop(
                         loss = loss + ow * compute_adalora_orthogonal_loss(inner)
                 if method_name == "sora":
                     lam = float(sora_sparse_lambda)
-                    if sora_lambda_warmup_steps > 0:
+                    if sora_lambda_schedule is not None:
+                        # schedule-dense 变体：按 schedule 动态调整 sparse_lambda
+                        if sora_lambda_schedule == "linear":
+                            num_steps = max(int(sora_lambda_num), 1)
+                            lam = float(sora_max_lambda) * min(1.0, float(global_step + 1) / float(num_steps))
+                    elif sora_lambda_warmup_steps > 0:
                         lam *= min(1.0, float(global_step + 1) / float(sora_lambda_warmup_steps))
                     # 官方 SoRA：L1 Loss 除以 gate 总元素数做归一化
                     l1_penalty = sum(
@@ -756,6 +787,10 @@ def run_training_loop(
                     )
                     loss = loss + lam * l1_penalty / max(gate_numel, 1)
                 loss.backward()
+                if max_grad_norm is not None and max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad], max_grad_norm
+                    )
                 optimizer.step()
                 if sparse_optimizer is not None:
                     sparse_optimizer.step()
@@ -900,20 +935,31 @@ def run_training_loop(
 
                 if rouge_metric is None:
                     val_metric = 0.0
+                    rouge1_val = rouge2_val = 0.0
                 else:
                     scores = rouge_metric.compute(predictions=preds_text, references=refs_text)
-                    # evaluate 的 key 可能是 rougeL / rougeLsum，取存在的那个
+                    rouge1_val = float(scores.get("rouge1", 0.0))
+                    rouge2_val = float(scores.get("rouge2", 0.0))
                     val_metric = float(scores.get("rougeL", scores.get("rougeLsum", 0.0)))
 
                 best_val_acc = max(best_val_acc, val_metric)
                 print(
                     f"[{method_name}] epoch={epoch + 1}/{epochs} "
-                    f"step={global_step} val_rougeL={val_metric:.4f} best={best_val_acc:.4f}"
+                    f"step={global_step} val_rouge1={rouge1_val:.4f} val_rouge2={rouge2_val:.4f} "
+                    f"val_rougeL={val_metric:.4f} best={best_val_acc:.4f}"
                 )
                 if writer is not None:
+                    writer.add_scalar("val/rouge1", rouge1_val, epoch)
+                    writer.add_scalar("val/rouge2", rouge2_val, epoch)
                     writer.add_scalar("val/rougeL", val_metric, epoch)
                 if wandb_run is not None:
-                    wandb_run.log({"val/rougeL": val_metric, "epoch": epoch + 1, "step": global_step})
+                    wandb_run.log({
+                        "val/rouge1": rouge1_val,
+                        "val/rouge2": rouge2_val,
+                        "val/rougeL": val_metric,
+                        "epoch": epoch + 1,
+                        "step": global_step,
+                    })
 
             if ddp_enabled and dist.is_available() and dist.is_initialized():
                 dist.barrier()
@@ -928,6 +974,10 @@ def run_training_loop(
             }
             if task_type == "nlu" and task_name is not None:
                 rec["glue_metric"] = glue_primary_metric_key(task_name)
+            if task_type == "nlg":
+                rec["rouge1"] = rouge1_val
+                rec["rouge2"] = rouge2_val
+                rec["rougeL"] = float(val_metric)
             with open(os.path.join(checkpoint_root, "metrics.jsonl"), "a", encoding="utf-8") as mf:
                 mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
             if save_every_epoch:
@@ -1004,6 +1054,8 @@ def run_training_loop(
     result = {
         "method": method_name,
         "best_val_accuracy": best_val_acc,
+        "rouge1": rouge1_val if task_type == "nlg" else "N/A",
+        "rouge2": rouge2_val if task_type == "nlg" else "N/A",
         "total_train_time_sec": total_time,
         "peak_memory_mb": peak_mem_mb,
         "avg_active_rank": (
@@ -1040,6 +1092,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_name", type=str, default="roberta-base")
     parser.add_argument("--methods", nargs="+", default=["lora", "adalora", "evorank"])
     parser.add_argument("--target_rank", type=int, default=8)
+    parser.add_argument(
+        "--lora_alpha",
+        type=float,
+        default=None,
+        help="LoRA alpha 缩放系数。None 时默认 2*target_rank。"
+             "NLU 对齐 AdaLoRA/SoRA 论文设为 16；NLG（BART+XSum/CNN-DM）对齐 AdaLoRA 论文设为 32。",
+    )
+    parser.add_argument(
+        "--target_modules",
+        type=str,
+        default=None,
+        help="逗号分隔的注入模块后缀列表，如 'query,key,value,intermediate'。"
+             "未指定时按模型类型自动推断（DeBERTa→query_proj/key_proj/value_proj，RoBERTa/BERT→query/value，T5→q/v）。",
+    )
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=128)
@@ -1067,15 +1133,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_pop", type=int, default=None)
     parser.add_argument("--population_strategy", type=str, default="all", choices=["all", "random"])
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed_list",
+        nargs="+",
+        type=int,
+        default=None,
+        help="多种子列表，如 --seed_list 0 21 42 81 100。指定后覆盖 --seed，对每个种子串行运行完整实验。"
+             "SoRA 论文使用 5 个种子：0 21 42 81 100。",
+    )
     parser.add_argument("--task_list", nargs="+", default=None, help="多任务实验协议，例如: sst2 qnli mnli")
     parser.add_argument("--model_list", nargs="+", default=None, help="多骨干实验协议，例如: roberta-base")
     parser.add_argument("--export_csv", type=str, default="benchmark_results.csv")
     parser.add_argument("--ddp", action="store_true", help="是否启用 torchrun/DistributedDataParallel")
     parser.add_argument("--ddp_backend", type=str, default="nccl", help="DDP backend，通常是 nccl")
     parser.add_argument("--lora_ga_batches", type=int, default=8, help="LoRA-GA 梯度估计用的训练 batch 数（仅前若干个 batch）")
+    parser.add_argument("--lora_ga_use_rslora", action="store_true", help="LoRA-GA：启用 rsLoRA 缩放（lora_alpha/sqrt(r)），对标官方 reproduce 配置")
+    parser.add_argument("--lora_ga_stable_gamma", type=float, default=None, help="LoRA-GA：stable init gamma 值（官方默认 64）；指定后在 SVD 初始化时对奇异值做 gamma 归一化")
     parser.add_argument("--sora_sparse_lambda", type=float, default=1e-3, help="SoRA：gate L1 惩罚系数")
     parser.add_argument("--sora_lambda_warmup_steps", type=int, default=0, help="SoRA：前若干步将 sparse_lambda 从 0 线性升到设定值；0 表示关闭")
     parser.add_argument("--sora_sparse_lambda_2", type=float, default=1e-3, help="SoRA：gate 近端梯度硬裁剪阈值（Proximal Gradient / Soft-Thresholding），对标官方 SparseAdamW")
+    parser.add_argument(
+        "--sora_lambda_schedule",
+        type=str,
+        default=None,
+        help="SoRA lambda 调度策略（如 'linear'）。None 表示固定值（no-schedule 主线）。",
+    )
+    parser.add_argument("--sora_max_lambda", type=float, default=10.0, help="SoRA lambda_schedule 的最大 lambda 值")
+    parser.add_argument("--sora_lambda_num", type=int, default=5, help="SoRA lambda_schedule 的步数（线性升至 max_lambda 所需步数）")
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=None,
+        help="梯度裁剪阈值（如 0.1）。None 表示不裁剪。SoRA 论文使用 0.1。",
+    )
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -1098,11 +1188,14 @@ def parse_args() -> argparse.Namespace:
 def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
     """
     论文协议批量运行骨架：
-    - 支持多任务 × 多骨干 × 多方法
+    - 支持多任务 × 多骨干 × 多方法 × 多种子
     - 导出 CSV 方便直接填表（主结果/效率/消融）
     """
+    import statistics
+
     tasks = args.task_list if args.task_list else [args.task_name]
     models = args.model_list if args.model_list else [args.model_name]
+    seeds = args.seed_list if args.seed_list else [args.seed]
     all_results: List[Dict[str, Any]] = []
 
     if args.is_main_process and not args.no_output_dir:
@@ -1110,6 +1203,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
     for task_name in tasks:
         for model_name in models:
+            # 数据加载在种子循环外（数据集与种子无关，避免重复下载/tokenize）
             train_loader, val_loader, val_loader_eval_full, base_model, tokenizer = setup_data_and_model(
                 task_name=task_name,
                 model_name=model_name,
@@ -1123,87 +1217,148 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 ddp_enabled=args.ddp_enabled,
                 rank=args.rank,
                 world_size=args.world_size,
-                seed=args.seed,
+                seed=seeds[0],
             )
             planned_total_steps = (
                 args.max_train_steps if args.max_train_steps is not None else args.epochs * len(train_loader)
             )
             for method in args.methods:
-                method_model = copy.deepcopy(base_model)
-                if args.ddp_enabled and torch.cuda.is_available():
-                    lora_ga_dev = torch.device(f"cuda:{args.local_rank}")
-                else:
-                    lora_ga_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                method_model, controller, meta = peft_factory(
-                    model=method_model,
-                    method_name=method,
-                    target_rank=args.target_rank,
-                    total_steps=planned_total_steps,
-                    adalora_delta_t=args.adalora_delta_t,
-                    adalora_init_r=args.adalora_init_r,
-                    adalora_tinit=args.adalora_tinit,
-                    adalora_tfinal=args.adalora_tfinal,
-                    adalora_orth_reg_weight=args.adalora_orth_reg_weight,
-                    train_loader=train_loader,
-                    lora_ga_batches=args.lora_ga_batches,
-                    task_type=args.task_type,
-                    lora_ga_device=lora_ga_dev,
-                    is_main_process=args.is_main_process,
-                    ddp_enabled=args.ddp_enabled,
-                    nlu_regression=nlu_is_glue_regression(task_name),
-                )
-                checkpoint_root: Optional[str] = None
-                if not args.no_output_dir:
-                    safe_model_name = model_name.replace("/", "_").replace("\\", "_")
-                    checkpoint_root = os.path.join(args.output_dir, f"{task_name}_{safe_model_name}_{method}")
-                res = run_training_loop(
-                    model=method_model,
-                    train_loader=train_loader,
-                    val_loader=val_loader,
-                    method_name=method,
-                    controller=controller,
-                    task_type=args.task_type,
-                    tokenizer=tokenizer,
-                    generation_max_new_tokens=args.generation_max_new_tokens,
-                    nlg_eval_max_samples=args.nlg_eval_max_samples,
-                    epochs=args.epochs,
-                    lr=args.lr,
-                    weight_decay=args.weight_decay,
-                    warmup_ratio=args.warmup_ratio,
-                    T_es=args.T_es,
-                    mini_val_k=args.mini_val_k,
-                    max_train_steps=args.max_train_steps,
-                    log_dir=args.log_dir,
-                    use_wandb=args.use_wandb,
-                    wandb_project=args.wandb_project,
-                    is_main_process=args.is_main_process,
-                    ddp_enabled=args.ddp_enabled,
-                    local_rank=args.local_rank,
-                    lambda_c=args.lambda_c,
-                    complexity_mode=args.complexity_mode,
-                    lambda_pop=args.lambda_pop,
-                    population_strategy=args.population_strategy,
-                    random_seed=args.seed,
-                    val_loader_eval_full=val_loader_eval_full,
-                    sora_sparse_lambda=args.sora_sparse_lambda,
-                    sora_sparse_lambda_2=args.sora_sparse_lambda_2,
-                    sora_lambda_warmup_steps=args.sora_lambda_warmup_steps,
-                    task_name=task_name,
-                    checkpoint_root=checkpoint_root,
-                    save_steps=args.save_steps,
-                    save_every_epoch=args.save_every_epoch,
-                    save_final_model=not args.no_save_final_model,
-                    verify_n_samples=args.verify_n_samples,
-                )
-                res.update(
-                    {
-                        "task": task_name,
-                        "backbone": model_name,
-                        "trainable_params": meta["trainable_params"],
-                    }
-                )
-                if args.is_main_process:
-                    all_results.append(res)
+                seed_results: List[Dict[str, Any]] = []
+                for seed in seeds:
+                    torch.manual_seed(seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(seed)
+
+                    method_model = copy.deepcopy(base_model)
+                    if args.ddp_enabled and torch.cuda.is_available():
+                        lora_ga_dev = torch.device(f"cuda:{args.local_rank}")
+                    else:
+                        lora_ga_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    method_model, controller, meta = peft_factory(
+                        model=method_model,
+                        method_name=method,
+                        target_rank=args.target_rank,
+                        total_steps=planned_total_steps,
+                        adalora_delta_t=args.adalora_delta_t,
+                        adalora_init_r=args.adalora_init_r,
+                        adalora_tinit=args.adalora_tinit,
+                        adalora_tfinal=args.adalora_tfinal,
+                        adalora_orth_reg_weight=args.adalora_orth_reg_weight,
+                        train_loader=train_loader,
+                        lora_ga_batches=args.lora_ga_batches,
+                        task_type=args.task_type,
+                        lora_ga_device=lora_ga_dev,
+                        is_main_process=args.is_main_process,
+                        ddp_enabled=args.ddp_enabled,
+                        nlu_regression=nlu_is_glue_regression(task_name),
+                        lora_alpha=args.lora_alpha,
+                        target_modules_override=args.target_modules,
+                        lora_ga_use_rslora=args.lora_ga_use_rslora,
+                        lora_ga_stable_gamma=args.lora_ga_stable_gamma,
+                    )
+                    checkpoint_root: Optional[str] = None
+                    if not args.no_output_dir:
+                        safe_model_name = model_name.replace("/", "_").replace("\\", "_")
+                        seed_suffix = f"_seed{seed}" if len(seeds) > 1 else ""
+                        checkpoint_root = os.path.join(
+                            args.output_dir, f"{task_name}_{safe_model_name}_{method}{seed_suffix}"
+                        )
+                    res = run_training_loop(
+                        model=method_model,
+                        train_loader=train_loader,
+                        val_loader=val_loader,
+                        method_name=method,
+                        controller=controller,
+                        task_type=args.task_type,
+                        tokenizer=tokenizer,
+                        generation_max_new_tokens=args.generation_max_new_tokens,
+                        nlg_eval_max_samples=args.nlg_eval_max_samples,
+                        epochs=args.epochs,
+                        lr=args.lr,
+                        weight_decay=args.weight_decay,
+                        warmup_ratio=args.warmup_ratio,
+                        T_es=args.T_es,
+                        mini_val_k=args.mini_val_k,
+                        max_train_steps=args.max_train_steps,
+                        log_dir=args.log_dir,
+                        use_wandb=args.use_wandb,
+                        wandb_project=args.wandb_project,
+                        is_main_process=args.is_main_process,
+                        ddp_enabled=args.ddp_enabled,
+                        local_rank=args.local_rank,
+                        lambda_c=args.lambda_c,
+                        complexity_mode=args.complexity_mode,
+                        lambda_pop=args.lambda_pop,
+                        population_strategy=args.population_strategy,
+                        random_seed=seed,
+                        val_loader_eval_full=val_loader_eval_full,
+                        sora_sparse_lambda=args.sora_sparse_lambda,
+                        sora_sparse_lambda_2=args.sora_sparse_lambda_2,
+                        sora_lambda_warmup_steps=args.sora_lambda_warmup_steps,
+                        sora_lambda_schedule=args.sora_lambda_schedule,
+                        sora_max_lambda=args.sora_max_lambda,
+                        sora_lambda_num=args.sora_lambda_num,
+                        task_name=task_name,
+                        checkpoint_root=checkpoint_root,
+                        save_steps=args.save_steps,
+                        save_every_epoch=args.save_every_epoch,
+                        save_final_model=not args.no_save_final_model,
+                        verify_n_samples=args.verify_n_samples,
+                        max_grad_norm=args.max_grad_norm,
+                    )
+                    res.update(
+                        {
+                            "task": task_name,
+                            "backbone": model_name,
+                            "trainable_params": meta["trainable_params"],
+                            "seed": seed,
+                        }
+                    )
+                    if args.is_main_process:
+                        all_results.append(res)
+                        seed_results.append(res)
+
+                # 多种子聚合：追加均值/标准差汇总行
+                if args.is_main_process and len(seed_results) > 1:
+                    metric_vals = [
+                        r["best_val_accuracy"]
+                        for r in seed_results
+                        if isinstance(r["best_val_accuracy"], float)
+                    ]
+                    rouge1_vals: List[float] = []
+                    rouge2_vals: List[float] = []
+                    if args.task_type == "nlg":
+                        rouge1_vals = [
+                            float(r["rouge1"])
+                            for r in seed_results
+                            if isinstance(r.get("rouge1"), (int, float))
+                        ]
+                        rouge2_vals = [
+                            float(r["rouge2"])
+                            for r in seed_results
+                            if isinstance(r.get("rouge2"), (int, float))
+                        ]
+                    if metric_vals:
+                        mean_row = dict(seed_results[0])
+                        mean_row["seed"] = "mean"
+                        mean_row["best_val_accuracy"] = statistics.mean(metric_vals)
+                        std_row = dict(seed_results[0])
+                        std_row["seed"] = "std"
+                        std_row["best_val_accuracy"] = statistics.stdev(metric_vals) if len(metric_vals) > 1 else 0.0
+                        if args.task_type == "nlg" and rouge1_vals:
+                            mean_row["rouge1"] = statistics.mean(rouge1_vals)
+                            std_row["rouge1"] = statistics.stdev(rouge1_vals) if len(rouge1_vals) > 1 else 0.0
+                        if args.task_type == "nlg" and rouge2_vals:
+                            mean_row["rouge2"] = statistics.mean(rouge2_vals)
+                            std_row["rouge2"] = statistics.stdev(rouge2_vals) if len(rouge2_vals) > 1 else 0.0
+                        # 清空不适合聚合的字段
+                        for row in (mean_row, std_row):
+                            row["artifact_dir"] = ""
+                            row["final_dir"] = ""
+                            row["peak_memory_mb"] = ""
+                            row["total_train_time_sec"] = ""
+                            row["avg_active_rank"] = ""
+                        all_results.extend([mean_row, std_row])
 
     if args.is_main_process:
         with open(args.export_csv, "w", newline="", encoding="utf-8") as f:
@@ -1213,15 +1368,19 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "task",
                     "backbone",
                     "method",
+                    "seed",
                     "val_metric_key",
                     "trainable_params",
                     "best_val_accuracy",
+                    "rouge1",
+                    "rouge2",
                     "peak_memory_mb",
                     "avg_active_rank",
                     "total_train_time_sec",
                     "artifact_dir",
                     "final_dir",
                 ],
+                extrasaction="ignore",
             )
             writer.writeheader()
             for row in all_results:

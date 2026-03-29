@@ -1,6 +1,7 @@
 """LoRA-GA style init for PEFT LoRA (gradient SVD). See https://arxiv.org/abs/2407.05000"""
 from __future__ import annotations
 import copy
+import math
 from typing import Dict, Iterator, List, Optional, Tuple
 import torch
 import torch.distributed as dist
@@ -34,7 +35,7 @@ def _iter_limited_batches(loader, max_batches):
             break
         yield batch
 
-def estimate_lora_ga_init_tensors(model, data_loader, target_modules, lora_r, lora_ga_batches, task_type, device, loss_fn=None):
+def estimate_lora_ga_init_tensors(model, data_loader, target_modules, lora_r, lora_ga_batches, task_type, device, loss_fn=None, stable_gamma=None):
     if lora_ga_batches < 1:
         raise ValueError("lora_ga_batches >= 1")
     targets = _collect_target_linears(model, target_modules)
@@ -78,8 +79,17 @@ def estimate_lora_ga_init_tensors(model, data_loader, target_modules, lora_r, lo
         if r < 1:
             raise RuntimeError("LoRA-GA: r < 1")
         sqrt_s = torch.sqrt(torch.clamp(S[:r], min=0.0))
-        lora_B = (U[:, :r] * sqrt_s.unsqueeze(0)).to(dtype=w.dtype)
-        lora_A = (sqrt_s.unsqueeze(1) * Vh[:r, :]).to(dtype=w.dtype)
+        if stable_gamma is not None:
+            # stable init: scale A/B so that ||B @ A||_F ≈ gamma * ||W||_F / sqrt(r)
+            # Following LoRA-GA official: lora_B = U[:, :r], lora_A = Vh[:r, :] * (gamma / sqrt(r))
+            gamma = float(stable_gamma)
+            w_norm = torch.linalg.norm(linear.weight.detach().cpu().float())
+            scale = gamma * w_norm / (math.sqrt(r) * max(float(S[0]), 1e-8))
+            lora_B = (U[:, :r] * scale).to(dtype=w.dtype)
+            lora_A = Vh[:r, :].to(dtype=w.dtype)
+        else:
+            lora_B = (U[:, :r] * sqrt_s.unsqueeze(0)).to(dtype=w.dtype)
+            lora_A = (sqrt_s.unsqueeze(1) * Vh[:r, :]).to(dtype=w.dtype)
         result[full_name] = (lora_A.contiguous(), lora_B.contiguous())
     model.zero_grad(set_to_none=True)
     return result
@@ -133,14 +143,14 @@ def build_train_loader_no_sampler(train_loader):
         pin_memory=getattr(train_loader, "pin_memory", False), drop_last=False,
     )
 
-def run_lora_ga_init_pipeline(base_model, train_loader, target_modules, lora_r, lora_ga_batches, task_type, device, is_main_process, ddp_enabled, loss_fn=None):
+def run_lora_ga_init_pipeline(base_model, train_loader, target_modules, lora_r, lora_ga_batches, task_type, device, is_main_process, ddp_enabled, loss_fn=None, stable_gamma=None):
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         dist.barrier()
     payload = None
     if is_main_process:
         dl = build_train_loader_no_sampler(train_loader)
         est_model = copy.deepcopy(base_model)
-        payload = estimate_lora_ga_init_tensors(est_model, dl, target_modules, lora_r, lora_ga_batches, task_type, device, loss_fn)
+        payload = estimate_lora_ga_init_tensors(est_model, dl, target_modules, lora_r, lora_ga_batches, task_type, device, loss_fn, stable_gamma=stable_gamma)
         del est_model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

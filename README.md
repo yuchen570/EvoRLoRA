@@ -14,8 +14,8 @@
 | `lora` | 标准 HuggingFace PEFT LoRA |
 | `adalora` | HuggingFace PEFT AdaLoRA（含 RankAllocator 步后 `update_and_allocate`；正交正则因本脚本只取 logits 在外部 CE 上显式加入，系数 `--adalora_orth_reg_weight`，默认 0.1 与论文脚本 `reg_orth_coef` 常见设置一致；可调 `--adalora_init_r` / `--adalora_tinit` / `--adalora_tfinal` / `--adalora_delta_t`） |
 | `evorank` | 本仓库 EvoRank-LoRA |
-| `lora-ga` | 梯度 SVD 初始化 + 标准 PEFT LoRA；DDP 下仅 rank0 用无分布式 Sampler 的 loader 取前 `--lora_ga_batches` 个 batch，再 `broadcast_object_list` 同步 |
-| `sora` | 带 `gate` 的稀疏低秩旁路；训练时需在主损失上加 L1（脚本已用 `--sora_sparse_lambda`，可选 `--sora_lambda_warmup_steps`） |
+| `lora-ga` | 梯度 SVD 初始化 + 标准 PEFT LoRA；DDP 下仅 rank0 用无分布式 Sampler 的 loader 取前 `--lora_ga_batches` 个 batch，再 `broadcast_object_list` 同步；支持 `--lora_ga_use_rslora`（rsLoRA 缩放）与 `--lora_ga_stable_gamma`（stable init） |
+| `sora` | 带 `gate` 的稀疏低秩旁路；训练时需在主损失上加 L1（脚本已用 `--sora_sparse_lambda`，可选 `--sora_lambda_warmup_steps` / `--sora_lambda_schedule`） |
 | `mtl-lora` | 未实现：需联合多任务与 task id，与当前 `--task_list` 串行协议不对齐 |
 
 ### GLUE 全任务（`--task_name`，`task_type=nlu`）
@@ -40,8 +40,8 @@
 - **`stsb`**：训练为 MSE 回归；验证在**完整 dev 集**上算 Pearson 与 Spearman，主标量为二者**算术平均**（与 GLUE 总分里该任务的常见合成方式一致）。
 - **DDP**：与 NLG 相同，验证指标仅在 **rank0** 上对**全量** dev 集计算，再 `broadcast` 到各卡，避免 `DistributedSampler` 子集偏差。
 - CSV 列名仍为 **`best_val_accuracy`**，语义为「该任务验证主指标」（不限于 accuracy）；TensorBoard 为 **`val/<指标名>`**（如 `val/matthews_corrcoef`、`val/f1`、`val/pearson_spearman_mean`）。`metrics.jsonl` 含字段 **`glue_metric`** 标明指标键名。
-- **`--task_list`** 可串行跑多个 `task_name`；一次扫**全部 9 个 GLUE 任务**（含回归 `stsb`）时可写：  
-  `--task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli`（顺序可任意；耗时与磁盘占用随任务数线性增长）。
+- **`--task_list`** 可串行跑多个 `task_name`；与上文 **10 个配置**一致、一次扫全时写（顺序可任意）：  
+  `--task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli`（`wnli` 极小；`ax` 为诊断集。若你只做 9 项「常见打表」、刻意跳过 `ax`，可从列表中去掉 `ax` 并自行注明。）
 
 ---
 
@@ -54,23 +54,34 @@
 - Rolling Candidacy（落选候选计数保留）
 - DDP Trial 奖励同步（`all_reduce`）
 - no-op 候选参与 elitist 选择
-- Reward 复杂度正则：`-lambda_c * C(z)`，支持：
-  - `rank_sum`
-  - `size_aware`
-- ES population 子采样：
-  - `--lambda_pop`
-  - `--population_strategy all|random`
-- 学术协议批量运行：
-  - `--task_list`
-  - `--model_list`
-  - `--export_csv`
-- GLUE：**10 个任务**验证均使用 **官方主指标**（CoLA→Matthews，MRPC/QQP→F1，STS-B→Pearson 与 Spearman 均值，其余分类任务→Accuracy），见 `glue_metrics.py`。
-- 训练产物与 checkpoint（与 `--log_dir` 分离）：
-  - 默认 `--output_dir artifacts`，子目录形如 `artifacts/<task>_<backbone>_<method>/`
-  - `metrics.jsonl`、可选 `--save_steps` / `--save_every_epoch`、结束 `final/`（PEFT 为 `save_pretrained`；`evorank`/`sora` 为 `model_state.pt`）
-  - `final/` 内同时保存 **tokenizer**，便于离线 `AutoTokenizer.from_pretrained(<final_dir>)`
-  - 中间 `.pt` **仅含** unwrap 后的模型与优化器/调度器；**不含** EvoRank Controller 的 EMA 等（V1 取舍，见下文「日志与结果」）
-  - `--verify_n_samples`：训练后主进程打印少量验证样本对照（默认 `2`）
+- Reward 复杂度正则：`-lambda_c * C(z)`，支持 `rank_sum` / `size_aware`
+- ES population 子采样：`--lambda_pop` / `--population_strategy all|random`
+- 学术协议批量运行：`--task_list` / `--model_list` / `--export_csv`
+- GLUE：**10 个任务**验证均使用 **官方主指标**（CoLA→Matthews，MRPC/QQP→F1，STS-B→Pearson 与 Spearman 均值，其余分类任务→Accuracy），见 `glue_metrics.py`
+- 训练产物与 checkpoint（与 `--log_dir` 分离）：`--output_dir artifacts`，子目录 `artifacts/<task>_<backbone>_<method>/`，含 `metrics.jsonl`、可选 checkpoint、`final/`（PEFT `save_pretrained` 或 `model_state.pt` + tokenizer）
+
+**论文对齐新增参数（实验对齐 spec 已全部落地）：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--lora_alpha` | `None`（→ `2*r`） | 独立设置 LoRA alpha；NLU 论文对齐设 `16`，NLG/BART 设 `32` |
+| `--target_modules` | `None`（自动推断） | 逗号分隔的注入模块后缀，如 `query_proj,key_proj,value_proj,intermediate.dense,output.dense` |
+| `--max_grad_norm` | `None`（不裁剪） | 梯度裁剪阈值；SoRA 论文使用 `0.1` |
+| `--seed_list` | `None` | 多种子串行运行，如 `--seed_list 0 21 42 81 100`；CSV 自动追加均值/标准差汇总行 |
+| `--lora_ga_use_rslora` | `False` | LoRA-GA 启用 rsLoRA 缩放（`lora_alpha/sqrt(r)`），对标官方 reproduce 配置 |
+| `--lora_ga_stable_gamma` | `None` | LoRA-GA stable init gamma（官方默认 64）；指定后 SVD 初始化按 `gamma * ‖W‖_F / (sqrt(r) * S[0])` 缩放 |
+| `--sora_lambda_schedule` | `None` | SoRA lambda 调度策略（如 `linear`）；`None` 为 no-schedule 主线 |
+| `--sora_max_lambda` | `10.0` | SoRA schedule 最大 lambda |
+| `--sora_lambda_num` | `5` | SoRA schedule 步数 |
+
+**各 backbone 自动推断 target_modules：**
+
+| backbone | 自动推断默认值 | 论文 6 类模块（`--target_modules` 显式传入） |
+|---|---|---|
+| DeBERTa-v3-base | `query_proj,key_proj,value_proj` | `query_proj,key_proj,value_proj,intermediate.dense,output.dense` |
+| RoBERTa/BERT | `query,value` | `query,key,value,intermediate,output` |
+| BART (NLG) | `q_proj,v_proj` | `q_proj,k_proj,v_proj,out_proj,fc1,fc2` |
+| T5 | `q,v` | — |
 
 ---
 
@@ -239,12 +250,14 @@ torchrun --nproc_per_node=2 --master_port=29500 \
 
 ### 2) 主结果模板（多任务）
 
-全对比时包含 LoRA-GA / SoRA；若只想跑基线，可将 `--methods` 改为 `lora adalora evorank` 并去掉 `--lora_ga_batches` / `--sora_*`。
+**说明：** 下列命令用于 **RoBERTa-base + 常见微调超参**（`lr=2e-5`、`epochs=3`、`weight_decay=0.01`）下的 **方法同台对比**，**不是** AdaLoRA / SoRA 等论文原文的表格数字复现。论文级协议见下文 **「AdaLoRA / SoRA 论文复现（DeBERTa-v3-base，GLUE NLU）」** 等专节。
+
+全对比时包含 LoRA-GA / SoRA；若只想跑基线，可将 `--methods` 改为 `lora adalora evorank` 并去掉 `--lora_ga_batches` / `--sora_*`。若与 **SoRA 论文**对齐，请在同一命令中追加例如 `--max_grad_norm 0.1`，并按该节调整 `batch_size` / `lr` / `epochs` / `weight_decay` / `--sora_sparse_lambda*`。
 
 ```bash
 python run_benchmark.py \
   --methods lora adalora evorank lora-ga sora \
-  --task_list sst2 qnli rte mnli \
+  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
   --model_list roberta-base \
   --target_rank 8 \
   --epochs 3 \
@@ -274,7 +287,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
   --methods lora adalora evorank lora-ga sora \
-  --task_list sst2 qnli rte mnli \
+  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
   --model_list roberta-base \
   --target_rank 8 \
   --epochs 3 \
@@ -350,8 +363,8 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 ```bash
 python run_benchmark.py \
   --methods lora adalora evorank lora-ga sora \
-  --task_name sst2 \
-  --model_name roberta-base \
+  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --model_list roberta-base \
   --target_rank 8 \
   --batch_size 16 \
   --max_train_steps 500 \
@@ -380,8 +393,8 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
   --methods lora adalora evorank lora-ga sora \
-  --task_name sst2 \
-  --model_name roberta-base \
+  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --model_list roberta-base \
   --target_rank 8 \
   --batch_size 16 \
   --max_train_steps 500 \
@@ -415,7 +428,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   - 命令增加 `--use_wandb --wandb_project <project_name>`
 - CSV 导出：
   - `--export_csv <file.csv>`
-  - 默认字段：`task/backbone/method/val_metric_key/trainable_params/best_val_accuracy/peak_memory_mb/avg_active_rank/total_train_time_sec/artifact_dir/final_dir`（`val_metric_key` 标明 `best_val_accuracy` 对应何种主指标，如 `accuracy`、`f1`、`matthews_corrcoef`）
+  - 默认字段：`task/backbone/method/seed/val_metric_key/trainable_params/best_val_accuracy/rouge1/rouge2/peak_memory_mb/avg_active_rank/total_train_time_sec/artifact_dir/final_dir`（`val_metric_key` 标明主指标；NLU 的 `rouge*` 常为 `N/A`；`--seed_list` 多种子时追加 `mean`/`std` 行，NLG 下 `rouge1`/`rouge2` 一并聚合）
 - **训练产物目录**（与 TensorBoard 的 `--log_dir` 相互独立）：
   - `--output_dir`：默认 `artifacts`；每个 `task×backbone×method` 会在其下创建子目录，例如 `artifacts/sst2_roberta-base_lora/`。
   - `--no_output_dir`：关闭该目录下所有落盘（不写 `metrics.jsonl`、checkpoint、`final/`）。
@@ -428,8 +441,18 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 
 ---
 
-## NLG（生成任务）示例：CNN/DailyMail + ROUGE-L
-脚本支持 `--task_type nlg`。当前默认使用 CNN/DailyMail；验证阶段在单卡或 DDP 下 rank0 上对**完整验证集**（或 `--nlg_eval_max_samples` 截断）算 ROUGE-L，他卡 `barrier` 同步。
+## NLG（生成任务）示例：CNN/DailyMail / XSum + ROUGE-1/2/L
+
+脚本支持 `--task_type nlg`，验证阶段同时计算并记录 **ROUGE-1、ROUGE-2、ROUGE-L** 三项指标（TensorBoard `val/rouge1`、`val/rouge2`、`val/rougeL`；CSV 含 `rouge1`、`rouge2` 列，`best_val_accuracy` 存 `rougeL`）。
+
+支持数据集：
+
+| `--nlg_dataset_name` | 文本字段 | 目标字段 | 对应论文 |
+|---|---|---|---|
+| `cnn_dailymail` | `article` | `highlights` | AdaLoRA Table 2 |
+| `xsum` | `document` | `summary` | AdaLoRA Table 3 |
+
+**CNN/DailyMail 冒烟：**
 
 ```bash
 python run_benchmark.py \
@@ -452,14 +475,99 @@ python run_benchmark.py \
   --adalora_orth_reg_weight 0.1 \
   --lora_ga_batches 4 \
   --sora_sparse_lambda 1e-3 \
-  --lambda_c 0.0 \
-  --complexity_mode rank_sum \
-  --lambda_pop 16 \
-  --population_strategy all \
   --seed 42 \
   --log_dir runs/nlg_smoke \
   --output_dir artifacts \
   --export_csv results_nlg_smoke.csv
+```
+
+双卡（torchrun）+ nohup 后台运行：
+
+```bash
+nohup torchrun --nproc_per_node=2 --master_port=29500 \
+  run_benchmark.py \
+  --ddp \
+  --task_type nlg \
+  --nlg_dataset_name cnn_dailymail \
+  --task_name cnn_dailymail \
+  --model_name t5-small \
+  --methods lora adalora evorank lora-ga sora \
+  --target_rank 8 \
+  --epochs 1 \
+  --batch_size 4 \
+  --max_length 256 \
+  --max_target_length 64 \
+  --generation_max_new_tokens 64 \
+  --nlg_eval_max_samples 50 \
+  --max_train_steps 50 \
+  --T_es 20 \
+  --warmup_ratio 0.1 \
+  --adalora_delta_t 50 \
+  --adalora_orth_reg_weight 0.1 \
+  --lora_ga_batches 4 \
+  --sora_sparse_lambda 1e-3 \
+  --seed 42 \
+  --log_dir runs/nlg_smoke_ddp \
+  --output_dir artifacts \
+  --export_csv results_nlg_smoke_ddp.csv \
+  > logs/nlg_smoke_ddp.out 2>&1 &
+```
+
+**XSum 论文级复现（AdaLoRA Table 3，BART-large）：**
+
+```bash
+python run_benchmark.py \
+  --task_type nlg \
+  --nlg_dataset_name xsum \
+  --task_name xsum \
+  --model_name facebook/bart-large \
+  --methods lora adalora evorank \
+  --target_rank 8 \
+  --lora_alpha 32 \
+  --target_modules q_proj,k_proj,v_proj,out_proj,fc1,fc2 \
+  --epochs 15 \
+  --batch_size 32 \
+  --max_length 768 \
+  --max_target_length 64 \
+  --generation_max_new_tokens 64 \
+  --lr 5e-4 \
+  --weight_decay 0.01 \
+  --warmup_ratio 0.06 \
+  --max_grad_norm 0.1 \
+  --seed 42 \
+  --log_dir runs/xsum \
+  --output_dir artifacts \
+  --export_csv results_xsum.csv
+```
+
+双卡（torchrun）+ nohup 后台运行：
+
+```bash
+nohup torchrun --nproc_per_node=2 --master_port=29500 \
+  run_benchmark.py \
+  --ddp \
+  --task_type nlg \
+  --nlg_dataset_name xsum \
+  --task_name xsum \
+  --model_name facebook/bart-large \
+  --methods lora adalora evorank \
+  --target_rank 8 \
+  --lora_alpha 32 \
+  --target_modules q_proj,k_proj,v_proj,out_proj,fc1,fc2 \
+  --epochs 15 \
+  --batch_size 32 \
+  --max_length 768 \
+  --max_target_length 64 \
+  --generation_max_new_tokens 64 \
+  --lr 5e-4 \
+  --weight_decay 0.01 \
+  --warmup_ratio 0.06 \
+  --max_grad_norm 0.1 \
+  --seed 42 \
+  --log_dir runs/xsum_ddp \
+  --output_dir artifacts \
+  --export_csv results_xsum_ddp.csv \
+  > logs/xsum_ddp.out 2>&1 &
 ```
 
 仅跑轻量基线时可改为 `--methods lora adalora evorank` 并去掉 `--lora_ga_batches`、`--sora_sparse_lambda`。
@@ -490,10 +598,146 @@ python run_benchmark.py \
 
 ---
 
+## 论文对齐实验模板
+
+### AdaLoRA / SoRA 论文复现（DeBERTa-v3-base，GLUE NLU）
+
+```bash
+python run_benchmark.py \
+  --methods lora adalora sora evorank \
+  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --model_list microsoft/deberta-v3-base \
+  --target_rank 8 \
+  --lora_alpha 16 \
+  --target_modules query_proj,key_proj,value_proj \
+  --epochs 24 \
+  --batch_size 32 \
+  --lr 5e-4 \
+  --weight_decay 0.1 \
+  --warmup_ratio 0.06 \
+  --max_grad_norm 0.1 \
+  --sora_sparse_lambda 10 \
+  --sora_sparse_lambda_2 3e-4 \
+  --seed_list 0 21 42 81 100 \
+  --log_dir runs/deberta_glue \
+  --output_dir artifacts \
+  --export_csv results_deberta_glue.csv
+```
+
+双卡（torchrun）+ nohup 后台运行：
+
+```bash
+nohup torchrun --nproc_per_node=2 --master_port=29500 \
+  run_benchmark.py \
+  --ddp \
+  --methods lora adalora sora evorank \
+  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --model_list microsoft/deberta-v3-base \
+  --target_rank 8 \
+  --lora_alpha 16 \
+  --target_modules query_proj,key_proj,value_proj \
+  --epochs 24 \
+  --batch_size 32 \
+  --lr 5e-4 \
+  --weight_decay 0.1 \
+  --warmup_ratio 0.06 \
+  --max_grad_norm 0.1 \
+  --sora_sparse_lambda 10 \
+  --sora_sparse_lambda_2 3e-4 \
+  --seed_list 0 21 42 81 100 \
+  --log_dir runs/deberta_glue_ddp \
+  --output_dir artifacts \
+  --export_csv results_deberta_glue_ddp.csv \
+  > logs/deberta_glue_ddp.out 2>&1 &
+```
+
+CSV 会自动追加每个 `task×backbone×method` 的 **一对**汇总行（`seed` 为 `mean` / `std`）：主指标列 `best_val_accuracy` 取各种子均值/标准差；**NLG** 时同一对行内同时写入 `rouge1`、`rouge2` 的均值与标准差（主指标仍为 `rougeL`，存在 `best_val_accuracy`）。
+
+### 论文级实验完成度（操作清单）
+| 步骤 | 内容 | 参考 |
+|------|------|------|
+| 1 | DeBERTa-v3-base + GLUE **10 任务** + 多种子 + SoRA/AdaLoRA 向超参 | 本节 **AdaLoRA / SoRA 论文复现** 命令（已含 `--task_list ax cola … wnli` 与 `--seed_list 0 21 42 81 100`） |
+| 2 | 如需 **6 类模块** 等与 AdaLoRA 原文完全一致 | 按 [requirements US-2](.kiro/specs/experiment-alignment/requirements.md) 调整 `--target_modules`（如 `query_proj,key_proj,value_proj,intermediate.dense,output.dense`） |
+| 3 | XSum（AdaLoRA Table 3） | 下文 **NLG** 节 **XSum 论文级复现** |
+| 4 | 填表与论文数字对照 | 导出 CSV + `metrics.jsonl` / TensorBoard，人工整理主结果表 |
+
+### LoRA-GA 官方 reproduce 配置
+
+```bash
+python run_benchmark.py \
+  --methods lora-ga \
+  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --model_list roberta-base \
+  --target_rank 8 \
+  --lora_alpha 16 \
+  --lora_ga_batches 8 \
+  --lora_ga_use_rslora \
+  --lora_ga_stable_gamma 64 \
+  --epochs 3 \
+  --batch_size 16 \
+  --lr 2e-5 \
+  --seed 42 \
+  --log_dir runs/lora_ga_reproduce \
+  --output_dir artifacts \
+  --export_csv results_lora_ga.csv
+```
+
+双卡（torchrun）+ nohup 后台运行：
+
+```bash
+nohup torchrun --nproc_per_node=2 --master_port=29500 \
+  run_benchmark.py \
+  --ddp \
+  --methods lora-ga \
+  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --model_list roberta-base \
+  --target_rank 8 \
+  --lora_alpha 16 \
+  --lora_ga_batches 8 \
+  --lora_ga_use_rslora \
+  --lora_ga_stable_gamma 64 \
+  --epochs 3 \
+  --batch_size 16 \
+  --lr 2e-5 \
+  --seed 42 \
+  --log_dir runs/lora_ga_reproduce_ddp \
+  --output_dir artifacts \
+  --export_csv results_lora_ga_ddp.csv \
+  > logs/lora_ga_reproduce_ddp.out 2>&1 &
+```
+
+---
+
+## 单元测试
+
+`tests/` 目录包含三组正确性验证测试，均可在 **CPU 上独立运行**，无需 GPU：
+
+```bash
+pytest tests/ -v
+```
+
+| 测试文件 | 验证内容 |
+|---|---|
+| `tests/test_importance_score.py` | EvoRank Trace Trick 两种计算路径等价（误差 < 1e-5） |
+| `tests/test_rank_compensation.py` | `activate_component` / `deactivate_component` 前后 ΔW 幅值不变（误差 < 1e-5） |
+| `tests/test_sparse_adamw.py` | SparseAdamW soft-thresholding 行为与预期一致（对标 SoRA 官方实现） |
+
+单独运行某一组：
+
+```bash
+pytest tests/test_sparse_adamw.py -v
+pytest tests/test_importance_score.py -v
+pytest tests/test_rank_compensation.py -v
+```
+
+---
+
 ## 主要脚本
 
 - `evo_rank_lora.py`：可演化 LoRA 层
 - `rank_evolution_controller.py`：演化控制器与 Mutation 体系
 - `train_integration.py`：注入与双时间尺度训练
+- `lora_ga_init.py`：LoRA-GA 梯度 SVD 初始化（含 `stable_gamma` 支持）
 - `glue_metrics.py`：GLUE 全 10 任务验证主指标（Matthews / Acc / F1 / Pearson–Spearman 均值等）
 - `run_benchmark.py`：主实验入口
+- `tests/`：正确性单元测试（`pytest tests/ -v`，CPU 可运行）

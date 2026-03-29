@@ -132,6 +132,7 @@ def train_evo_lora_step(
     lambda_pop: Optional[int] = None,
     population_strategy: str = "all",
     random_seed: Optional[int] = None,
+    max_grad_norm: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     双时间尺度训练模板：
@@ -203,6 +204,12 @@ def train_evo_lora_step(
     # 反向传播后立即缓存每层统计量，后续 controller 只读缓存避免重复计算。
     for layer in controller.layers.values():
         layer.cache_statistics_from_current_gradients()
+
+    # 梯度裁剪（在 optimizer.step 之前）
+    if max_grad_norm is not None and max_grad_norm > 0:
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.requires_grad], max_grad_norm
+        )
 
     result: Dict[str, Any] = {
         "train_loss": float(train_loss.detach().item()),
