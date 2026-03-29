@@ -61,6 +61,11 @@
 - GLUE：Hub 上 **10 个配置**均可加载；**有监督验证**为 **9 项**（不含 `ax`），均使用 **官方主指标**（CoLA→Matthews，MRPC/QQP→F1，STS-B→Pearson 与 Spearman 均值，其余分类→Accuracy），见 `glue_metrics.py`
 - 训练产物与 checkpoint（与 `--log_dir` 分离）：`--output_dir artifacts`，子目录 `artifacts/<task>_<backbone>_<method>/`，含 `metrics.jsonl`、可选 checkpoint、`final/`（PEFT `save_pretrained` 或 `model_state.pt` + tokenizer）
 
+**最新基准测试修复与优化 (2025/3)：**
+- **分类头特征隔离学习率 (`--head_lr`)**：彻底修复由于 `lr=2e-5` 在 CoLA / MRPC 上导致随机初始化的分类头无法收敛的问题。默认强制将 classifier/score 头推升至 `max(lr, 5e-4)` 从而正常获取非随机准确率，不再需要为头专门改总 `lr` 或者改 loss_func。
+- **AdaLoRA 预算调度充分化 (`tfinal`)**：由于 PEFT 参数设计的含糊性，先前代码将 `0.8*total_steps` 用于锁死预算期（导致前 20% 只草草分配）。已修改默认值为 `0.1*total_steps`，让 AdaLoRA 有前 90% 的生命周期进行动态调整。
+- **SoRA 近端梯度平滑 (`sora_sparse_lambda_2`)**：默认参数下调至对齐原论文主线稳定性的 `3e-4` 级别（原 `1e-3`，经常在训练中后期激进裁剪导致表达能力崩溃）。
+
 **论文对齐新增参数（实验对齐 spec 已全部落地）：**
 
 | 参数 | 默认值 | 说明 |
@@ -312,8 +317,8 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
   --model_list roberta-base \
   --target_rank 8 \
-  --epochs 3 \
-  --batch_size 16 \
+  --epochs 5 \
+  --batch_size 32 \
   --lr 2e-5 \
   --weight_decay 0.01 \
   --warmup_ratio 0.1 \
@@ -639,7 +644,6 @@ python run_benchmark.py \
   --warmup_ratio 0.06 \
   --max_grad_norm 0.1 \
   --sora_sparse_lambda 10 \
-  --sora_sparse_lambda_2 3e-4 \
   --seed_list 0 21 42 81 100 \
   --log_dir runs/deberta_glue \
   --output_dir artifacts \
@@ -665,7 +669,6 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --warmup_ratio 0.06 \
   --max_grad_norm 0.1 \
   --sora_sparse_lambda 10 \
-  --sora_sparse_lambda_2 3e-4 \
   --seed_list 0 21 42 81 100 \
   --log_dir runs/deberta_glue_ddp \
   --output_dir artifacts \

@@ -391,7 +391,7 @@ def peft_factory(
         else:
             tinit = max(int(adalora_tinit), 1)
         if adalora_tfinal is None:
-            tfinal = max(int(0.8 * planned_steps), tinit + 1)
+            tfinal = max(int(0.1 * planned_steps), tinit + 1)
         else:
             tfinal = max(int(adalora_tfinal), tinit + 1)
         if tinit >= planned_steps - tfinal:
@@ -500,6 +500,127 @@ def peft_factory(
 def _adalora_post_step_update(model: nn.Module, global_step: int) -> None:
     """PEFT AdaLora 步后 RankAllocator / mask 更新（兼容 DDP + DictFeatureClassifier）。"""
     adalora_update_and_allocate(model, global_step)
+
+
+def _collect_rank_distribution(
+    model: nn.Module,
+    method_name: str,
+    controller: Optional["RankEvolutionController"] = None,
+    target_rank: int = 8,
+) -> Dict[str, Dict[str, int]]:
+    """
+    收集每一层 LoRA 注入层的有效秩信息。
+
+    返回:
+        {
+            "per_layer": {layer_name: effective_rank, ...},
+            "summary": {"avg_rank": float, "total_active": int, "total_capacity": int},
+        }
+    """
+    per_layer: Dict[str, int] = {}
+    inner = _unwrap_for_save(model)
+
+    if method_name == "evorank" and controller is not None:
+        for name, layer in controller.layers.items():
+            per_layer[name] = layer.get_active_rank()
+        total_capacity = sum(layer.r_max for layer in controller.layers.values())
+
+    elif method_name == "adalora":
+        extra_info = ""
+        try:
+            for mod in inner.modules():
+                if hasattr(mod, "rankallocator"):
+                    rank_alloc = mod.rankallocator
+                    # _current_threshold 存在于 rankallocator 中 (根据 peft 源码)
+                    if hasattr(rank_alloc, "threshold"):
+                        extra_info = f"threshold={rank_alloc.threshold:.4f}"
+                    break
+        except Exception:
+            pass
+
+        # AdaLoRA: lora_E 中非零奇异值个数 = 有效秩
+        for n, p in inner.named_parameters():
+            if "lora_E" in n and p.numel() > 0:
+                eff_r = int((p.data.abs() > 1e-9).sum().item())
+                # 从参数名提取层路径（去掉 .lora_E.default.weight 等后缀）
+                layer_key = n.replace(".lora_E.default.weight", "").replace(".lora_E.weight", "").replace(".lora_E", "")
+                per_layer[layer_key] = eff_r
+        total_capacity = sum(
+            p.numel() for n, p in inner.named_parameters() if "lora_E" in n
+        )
+
+    elif method_name == "sora":
+        # SoRA: gate 中非零元素个数 = 有效秩
+        # 获取 optimizer 中正在使用的 lambda_2 阈值，如果能拿到的话
+        extra_info = ""
+        # 简化处理：这只是一个提示，我们没有直接传递当前 lambda，只能查参数
+        for n, p in inner.named_parameters():
+            if n.endswith(".gate"):
+                active_gates = int((p.data.abs() > 1e-9).sum().item())
+                layer_key = n.replace(".gate", "")
+                per_layer[layer_key] = active_gates
+        total_capacity = sum(
+            p.numel() for n, p in inner.named_parameters() if n.endswith(".gate")
+        )
+
+    else:
+        # LoRA / LoRA-GA: 固定秩
+        for n, p in inner.named_parameters():
+            if "lora_A" in n and p.numel() > 0:
+                layer_key = n.replace(".lora_A.default.weight", "").replace(".lora_A.weight", "").replace(".lora_A", "")
+                per_layer[layer_key] = target_rank
+        total_capacity = len(per_layer) * target_rank
+
+    total_active = sum(per_layer.values())
+    n_layers = max(len(per_layer), 1)
+    avg_rank = total_active / n_layers
+
+    summary = {
+        "avg_rank": round(avg_rank, 4),
+        "total_active": total_active,
+        "total_capacity": total_capacity,
+    }
+    if 'extra_info' in locals() and extra_info:
+        summary["extra_string"] = extra_info
+
+    return {
+        "per_layer": per_layer,
+        "summary": summary,
+    }
+
+
+def _print_rank_distribution(
+    rank_info: Dict[str, Any],
+    method_name: str,
+    epoch: int,
+    epochs: int,
+) -> None:
+    """格式化打印逐层秩分布。"""
+    per_layer = rank_info["per_layer"]
+    summary = rank_info["summary"]
+    
+    extra_str = f" [{summary['extra_string']}]" if "extra_string" in summary else ""
+    print(f"[{method_name}] === Rank Distribution (epoch={epoch}/{epochs}){extra_str} ===")
+    
+    for layer_name, eff_r in per_layer.items():
+        # 简化层名：只保留 layer.X.xxx.yyy 部分
+        short_name = layer_name
+        parts = layer_name.split(".")
+        # 尝试从 'layer' 关键字开始截取
+        for i, part in enumerate(parts):
+            if part == "layer":
+                short_name = ".".join(parts[i:])
+                break
+        label = "r" if method_name in ("lora", "lora-ga") else (
+            "eff_r" if method_name == "adalora" else (
+                "gates" if method_name == "sora" else "r"
+            )
+        )
+        print(f"  {short_name}: {label}={eff_r}")
+    print(
+        f"  avg_rank={summary['avg_rank']:.2f}  "
+        f"total_active={summary['total_active']}/{summary['total_capacity']}"
+    )
 
 
 def _unwrap_training_module(model: nn.Module) -> nn.Module:
@@ -636,6 +757,7 @@ def run_training_loop(
     nlg_eval_max_samples: int = 200,
     epochs: int = 3,
     lr: float = 2e-5,
+    head_lr: Optional[float] = None,
     weight_decay: float = 0.01,
     warmup_ratio: float = 0.1,
     T_es: int = 200,
@@ -686,14 +808,27 @@ def run_training_loop(
             device_ids=[local_rank],
             output_device=local_rank,
         )
+    head_lr_val = head_lr if head_lr is not None else max(lr, 5e-4)
+
     if method_name == "sora":
         # 官方 SoRA：gate 参数使用独立的 SparseAdamW（近端梯度），其余参数使用标准 AdamW。
-        _non_gate = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate")]
+        _non_gate_peft = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate") and not any(k in n for k in ["classifier", "score", "lm_head", "shared"])]
+        _non_gate_head = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate") and any(k in n for k in ["classifier", "score", "lm_head", "shared"])]
         _gate = [p for n, p in model.named_parameters() if p.requires_grad and n.endswith(".gate")]
-        optimizer = AdamW(_non_gate, lr=lr, weight_decay=weight_decay)
+        
+        optimizer = AdamW([
+            {"params": _non_gate_peft, "lr": lr},
+            {"params": _non_gate_head, "lr": head_lr_val}
+        ], weight_decay=weight_decay)
         sparse_optimizer = SparseAdamW(_gate, lr=lr, sparse_lambda=sora_sparse_lambda_2, weight_decay=0.0)
     else:
-        optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
+        _peft_params = [p for n, p in model.named_parameters() if p.requires_grad and not any(k in n for k in ["classifier", "score", "lm_head", "shared"])]
+        _head_params = [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in ["classifier", "score", "lm_head", "shared"])]
+        
+        optimizer = AdamW([
+            {"params": _peft_params, "lr": lr},
+            {"params": _head_params, "lr": head_lr_val}
+        ], weight_decay=weight_decay)
         sparse_optimizer = None
     if task_type == "nlu":
         if nlu_is_glue_regression(task_name):
@@ -909,12 +1044,24 @@ def run_training_loop(
                     f"[{method_name}] epoch={epoch + 1}/{epochs} "
                     f"step={global_step} val_{mkey}={val_metric:.4f} best={best_val_acc:.4f}"
                 )
+                # === 逐层秩分布日志 ===
+                rank_info = _collect_rank_distribution(
+                    model, method_name, controller=controller,
+                    target_rank=int(next(
+                        (p.size(0) for n, p in _unwrap_for_save(model).named_parameters()
+                         if "lora_A" in n and p.numel() > 0), 8
+                    )) if method_name in ("lora", "lora-ga") else 8,
+                )
+                _print_rank_distribution(rank_info, method_name, epoch + 1, epochs)
                 if writer is not None:
                     writer.add_scalar(f"val/{mkey}", val_metric, epoch)
+                    for lname, lr_val in rank_info["per_layer"].items():
+                        writer.add_scalar(f"rank/{lname}", lr_val, epoch)
+                    writer.add_scalar("rank/avg", rank_info["summary"]["avg_rank"], epoch)
                 if wandb_run is not None:
-                    wandb_run.log(
-                        {f"val/{mkey}": val_metric, "epoch": epoch + 1, "step": global_step}
-                    )
+                    wandb_log_dict = {f"val/{mkey}": val_metric, "epoch": epoch + 1, "step": global_step}
+                    wandb_log_dict["rank/avg"] = rank_info["summary"]["avg_rank"]
+                    wandb_run.log(wandb_log_dict)
 
         else:
             if tokenizer is None:
@@ -988,29 +1135,50 @@ def run_training_loop(
                     f"step={global_step} val_rouge1={rouge1_val:.4f} val_rouge2={rouge2_val:.4f} "
                     f"val_rougeL={val_metric:.4f} best={best_val_acc:.4f}"
                 )
+                # === 逐层秩分布日志 (NLG) ===
+                rank_info = _collect_rank_distribution(
+                    model, method_name, controller=controller,
+                    target_rank=int(next(
+                        (p.size(0) for n, p in _unwrap_for_save(model).named_parameters()
+                         if "lora_A" in n and p.numel() > 0), 8
+                    )) if method_name in ("lora", "lora-ga") else 8,
+                )
+                _print_rank_distribution(rank_info, method_name, epoch + 1, epochs)
                 if writer is not None:
                     writer.add_scalar("val/rouge1", rouge1_val, epoch)
                     writer.add_scalar("val/rouge2", rouge2_val, epoch)
                     writer.add_scalar("val/rougeL", val_metric, epoch)
+                    for lname, lr_val in rank_info["per_layer"].items():
+                        writer.add_scalar(f"rank/{lname}", lr_val, epoch)
+                    writer.add_scalar("rank/avg", rank_info["summary"]["avg_rank"], epoch)
                 if wandb_run is not None:
-                    wandb_run.log({
+                    wandb_log_dict = {
                         "val/rouge1": rouge1_val,
                         "val/rouge2": rouge2_val,
                         "val/rougeL": val_metric,
                         "epoch": epoch + 1,
                         "step": global_step,
-                    })
+                    }
+                    wandb_log_dict["rank/avg"] = rank_info["summary"]["avg_rank"]
+                    wandb_run.log(wandb_log_dict)
 
             if ddp_enabled and dist.is_available() and dist.is_initialized():
                 dist.barrier()
 
         if is_main_process and checkpoint_root:
+            # 秩分布信息（若上方 eval 尚未计算则此处补算）
+            try:
+                _rank_info = rank_info  # type: ignore[possibly-undefined]
+            except NameError:
+                _rank_info = _collect_rank_distribution(model, method_name, controller=controller)
             rec: Dict[str, Any] = {
                 "epoch": epoch + 1,
                 "global_step": global_step,
                 "val_metric": float(val_metric),
                 "best_val": float(best_val_acc),
                 "train_loss_ema": float(train_loss_ema) if train_loss_ema is not None else None,
+                "rank_distribution": _rank_info["per_layer"],
+                "rank_summary": _rank_info["summary"],
             }
             if task_type == "nlu" and task_name is not None:
                 rec["glue_metric"] = glue_primary_metric_key(task_name)
@@ -1150,6 +1318,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--head_lr", type=float, default=None, help="分类头或额外可训练参数的学习率。None时默认 max(lr, 5e-4) 以解决 CE 任务不收敛问题")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--T_es", type=int, default=200)
@@ -1191,7 +1360,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora_ga_stable_gamma", type=float, default=None, help="LoRA-GA：stable init gamma 值（官方默认 64）；指定后在 SVD 初始化时对奇异值做 gamma 归一化")
     parser.add_argument("--sora_sparse_lambda", type=float, default=1e-3, help="SoRA：gate L1 惩罚系数")
     parser.add_argument("--sora_lambda_warmup_steps", type=int, default=0, help="SoRA：前若干步将 sparse_lambda 从 0 线性升到设定值；0 表示关闭")
-    parser.add_argument("--sora_sparse_lambda_2", type=float, default=1e-3, help="SoRA：gate 近端梯度硬裁剪阈值（Proximal Gradient / Soft-Thresholding），对标官方 SparseAdamW")
+    parser.add_argument("--sora_sparse_lambda_2", type=float, default=3e-4, help="SoRA：gate 近端梯度硬裁剪阈值（Proximal Gradient / Soft-Thresholding），对标官方 SparseAdamW")
     parser.add_argument(
         "--sora_lambda_schedule",
         type=str,
@@ -1315,6 +1484,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         nlg_eval_max_samples=args.nlg_eval_max_samples,
                         epochs=args.epochs,
                         lr=args.lr,
+                        head_lr=args.head_lr,
                         weight_decay=args.weight_decay,
                         warmup_ratio=args.warmup_ratio,
                         T_es=args.T_es,
