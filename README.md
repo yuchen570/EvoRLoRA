@@ -33,16 +33,16 @@
 | `qnli` | 问答蕴含 | `validation` | **Accuracy** |
 | `rte` | 文本蕴含 | `validation` | **Accuracy** |
 | `wnli` | Winograd 式蕴含（极小集） | `validation` | **Accuracy** |
-| `ax` | 诊断集（MNLI 风格前提–假设） | 见下 **`ax` 说明** | **Accuracy** |
+| `ax` | 诊断集（MNLI 风格；见下 **HF 无金标**） | — | **Accuracy**（需自带金标数据源） |
 
 **注意：**
 
-- **`ax`（HuggingFace `glue`）**：该配置**仅有 `test` split**（无 `train`/`validation`）。脚本将 **训练与验证均映射到 `test`**，以便跑通基准与指标；与 GLUE 官方「在 MNLI 上训练、在 AX 上提交/评估」的协议不同，**打表对比论文时请改用 MNLI 训练后再在 `ax` 上评估**（需自行扩展流程或分两步跑）。
+- **`ax`（HuggingFace `datasets` 的 `glue`/`ax`）**：`test` **标签全部为 `-1`（不公开金标）**，无法用本脚本的交叉熵训练或计算验证主指标；若指定 `--task_name ax` 或把 `ax` 写入 `--task_list`，`setup_data_and_model` 会 **显式报错**。GLUE「10 个配置」在 Hub 上均可 `load_dataset`，但 **有监督跑法仅适用于其余 9 项**；一键多任务命令里请使用 **`cola sst2 mrpc qqp stsb mnli qnli rte wnli`**（不要含 `ax`），除非自行提供带金标的 AX 数据管线。
 - **`stsb`**：训练为 MSE 回归；验证在**完整 dev 集**上算 Pearson 与 Spearman，主标量为二者**算术平均**（与 GLUE 总分里该任务的常见合成方式一致）。
 - **DDP**：与 NLG 相同，验证指标仅在 **rank0** 上对**全量** dev 集计算，再 `broadcast` 到各卡，避免 `DistributedSampler` 子集偏差。
 - CSV 列名仍为 **`best_val_accuracy`**，语义为「该任务验证主指标」（不限于 accuracy）；TensorBoard 为 **`val/<指标名>`**（如 `val/matthews_corrcoef`、`val/f1`、`val/pearson_spearman_mean`）。`metrics.jsonl` 含字段 **`glue_metric`** 标明指标键名。
-- **`--task_list`** 可串行跑多个 `task_name`；与上文 **10 个配置**一致、一次扫全时写（顺序可任意）：  
-  `--task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli`（`wnli` 极小；`ax` 为诊断集。若你只做 9 项「常见打表」、刻意跳过 `ax`，可从列表中去掉 `ax` 并自行注明。）
+- **`--task_list`** 可串行跑多个 `task_name`。**有监督训练/验证**请使用 **9 项**（勿含 `ax`，原因见上表 `ax` 说明）：  
+  `--task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli`（顺序可任意）。`ax` 仍列在表中仅表示 Hub 配置存在，与本脚本可跑任务集合不同。
 
 ---
 
@@ -58,7 +58,7 @@
 - Reward 复杂度正则：`-lambda_c * C(z)`，支持 `rank_sum` / `size_aware`
 - ES population 子采样：`--lambda_pop` / `--population_strategy all|random`
 - 学术协议批量运行：`--task_list` / `--model_list` / `--export_csv`
-- GLUE：**10 个任务**验证均使用 **官方主指标**（CoLA→Matthews，MRPC/QQP→F1，STS-B→Pearson 与 Spearman 均值，其余分类任务→Accuracy），见 `glue_metrics.py`
+- GLUE：Hub 上 **10 个配置**均可加载；**有监督验证**为 **9 项**（不含 `ax`），均使用 **官方主指标**（CoLA→Matthews，MRPC/QQP→F1，STS-B→Pearson 与 Spearman 均值，其余分类→Accuracy），见 `glue_metrics.py`
 - 训练产物与 checkpoint（与 `--log_dir` 分离）：`--output_dir artifacts`，子目录 `artifacts/<task>_<backbone>_<method>/`，含 `metrics.jsonl`、可选 checkpoint、`final/`（PEFT `save_pretrained` 或 `model_state.pt` + tokenizer）
 
 **论文对齐新增参数（实验对齐 spec 已全部落地）：**
@@ -258,7 +258,7 @@ torchrun --nproc_per_node=2 --master_port=29500 \
 ```bash
 python run_benchmark.py \
   --methods lora adalora evorank lora-ga sora \
-  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
   --model_list roberta-base \
   --target_rank 8 \
   --epochs 3 \
@@ -288,7 +288,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
   --methods lora adalora evorank lora-ga sora \
-  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
   --model_list roberta-base \
   --target_rank 8 \
   --epochs 3 \
@@ -364,7 +364,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 ```bash
 python run_benchmark.py \
   --methods lora adalora evorank lora-ga sora \
-  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
   --model_list roberta-base \
   --target_rank 8 \
   --batch_size 16 \
@@ -394,7 +394,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
   --methods lora adalora evorank lora-ga sora \
-  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
   --model_list roberta-base \
   --target_rank 8 \
   --batch_size 16 \
@@ -606,7 +606,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 ```bash
 python run_benchmark.py \
   --methods lora adalora sora evorank \
-  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
   --model_list microsoft/deberta-v3-base \
   --target_rank 8 \
   --lora_alpha 16 \
@@ -632,7 +632,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
   --methods lora adalora sora evorank \
-  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
   --model_list microsoft/deberta-v3-base \
   --target_rank 8 \
   --lora_alpha 16 \
@@ -657,7 +657,7 @@ CSV 会自动追加每个 `task×backbone×method` 的 **一对**汇总行（`se
 ### 论文级实验完成度（操作清单）
 | 步骤 | 内容 | 参考 |
 |------|------|------|
-| 1 | DeBERTa-v3-base + GLUE **10 任务** + 多种子 + SoRA/AdaLoRA 向超参 | 本节 **AdaLoRA / SoRA 论文复现** 命令（已含 `--task_list ax cola … wnli` 与 `--seed_list 0 21 42 81 100`） |
+| 1 | DeBERTa-v3-base + GLUE **9 项有监督任务** + 多种子 + SoRA/AdaLoRA 向超参 | 本节 **AdaLoRA / SoRA 论文复现** 命令（`--task_list` 为 `cola … wnli`，**不含 `ax`**；`ax` 在 HF 上无金标） |
 | 2 | 如需 **6 类模块** 等与 AdaLoRA 原文完全一致 | 按 [requirements US-2](.kiro/specs/experiment-alignment/requirements.md) 调整 `--target_modules`（如 `query_proj,key_proj,value_proj,intermediate.dense,output.dense`） |
 | 3 | XSum（AdaLoRA Table 3） | 下文 **NLG** 节 **XSum 论文级复现** |
 | 4 | 填表与论文数字对照 | 导出 CSV + `metrics.jsonl` / TensorBoard，人工整理主结果表 |
@@ -667,7 +667,7 @@ CSV 会自动追加每个 `task×backbone×method` 的 **一对**汇总行（`se
 ```bash
 python run_benchmark.py \
   --methods lora-ga \
-  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
   --model_list roberta-base \
   --target_rank 8 \
   --lora_alpha 16 \
@@ -690,7 +690,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
   --methods lora-ga \
-  --task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
   --model_list roberta-base \
   --target_rank 8 \
   --lora_alpha 16 \
@@ -739,6 +739,6 @@ pytest tests/test_rank_compensation.py -v
 - `rank_evolution_controller.py`：演化控制器与 Mutation 体系
 - `train_integration.py`：注入与双时间尺度训练
 - `lora_ga_init.py`：LoRA-GA 梯度 SVD 初始化（含 `stable_gamma` 支持）
-- `glue_metrics.py`：GLUE 全 10 任务验证主指标（Matthews / Acc / F1 / Pearson–Spearman 均值等）
+- `glue_metrics.py`：GLUE 各子集验证主指标（Matthews / Acc / F1 / Pearson–Spearman 均值等；`ax` 在 HF 无金标时不走本脚本）
 - `run_benchmark.py`：主实验入口
 - `tests/`：正确性单元测试（`pytest tests/ -v`，CPU 可运行）

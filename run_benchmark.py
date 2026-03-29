@@ -56,8 +56,10 @@ GLUE_REGRESSION_TASKS = frozenset({"stsb"})
 
 def glue_nlu_train_val_splits(dataset, task_name: str) -> Tuple[str, str]:
     """
-    返回 (train_split, val_split)。HF `datasets` 的 `glue`/`ax` **仅有 test**，无 train/validation；
-    此时训练与评估均复用 `test`（与官方「在 MNLI 上训练再在 AX 上测」不同，仅保证脚本可跑通与指标计算）。
+    返回 (train_split, val_split)。
+    - mnli：train + validation_matched
+    - 有 train：train + validation（或 test）
+    - 无 train 仅有 test/validation：两者复用同一 split（若金标全为 -1 如 HF glue/ax，则由 _assert_glue_split_has_gold_labels 拒绝）
     """
     keys = set(dataset.keys())
     if task_name == "mnli":
@@ -78,6 +80,19 @@ def glue_nlu_train_val_splits(dataset, task_name: str) -> Tuple[str, str]:
     if "test" in keys:
         return "test", "test"
     raise ValueError(f"GLUE {task_name} 无可用 split（需含 train、validation 或 test 之一）：{sorted(keys)}")
+
+
+def _assert_glue_split_has_gold_labels(dataset, split_name: str, task_name: str) -> None:
+    """HuggingFace `glue`/`ax` 的 test 集标签全为 -1（金标不公开），不能用于 CE 训练或主指标。"""
+    labs = dataset[split_name]["label"]
+    if not labs:
+        return
+    if all(int(y) == -1 for y in labs):
+        raise ValueError(
+            f"GLUE 任务 {task_name!r} 的 split {split_name!r} 在 HuggingFace `datasets` 中标签全部为 -1（不公开金标），"
+            "无法进行有监督训练或验证（CrossEntropyLoss 需要有效类别下标）。"
+            "请从 `--task_name` / `--task_list` 中移除 ax，或先在 `mnli` 上训练后再按官方流程在本地评估 AX。"
+        )
 
 
 def nlu_is_glue_regression(task_name: Optional[str]) -> bool:
@@ -163,6 +178,9 @@ def setup_data_and_model(
             )
 
         train_split, val_split = glue_nlu_train_val_splits(dataset, task_name)
+        _assert_glue_split_has_gold_labels(dataset, train_split, task_name)
+        if val_split != train_split:
+            _assert_glue_split_has_gold_labels(dataset, val_split, task_name)
 
         tokenized = dataset.map(tokenize_fn, batched=True)
         tokenized = tokenized.rename_column("label", "labels")
@@ -1101,8 +1119,8 @@ def parse_args() -> argparse.Namespace:
         "--task_name",
         type=str,
         default="sst2",
-        help="NLU：`load_dataset('glue', task_name)` 的子集，已支持 ax, cola, sst2, mrpc, qqp, stsb, mnli, qnli, rte, wnli；"
-        "验证集使用各任务 GLUE 官方主指标（见 glue_metrics / README）。NLG：占位/命名用。",
+        help="NLU：`load_dataset('glue', task_name)` 的子集；含 ax, cola, sst2, …（HF glue/ax 无金标，有监督训练会报错，见 README）。"
+        "验证使用各任务 GLUE 官方主指标（见 glue_metrics / README）。NLG：占位/命名用。",
     )
     parser.add_argument("--task_type", type=str, default="nlu", choices=["nlu", "nlg"], help="nlu=GLUE分类，nlg=文本生成")
     parser.add_argument("--nlg_dataset_name", type=str, default="cnn_dailymail", help="nlg 数据集名（如 cnn_dailymail）")
