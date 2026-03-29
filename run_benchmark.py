@@ -54,10 +54,30 @@ GLUE_TASK_SENTENCE_KEYS: Dict[str, Tuple[str, Optional[str]]] = {
 GLUE_REGRESSION_TASKS = frozenset({"stsb"})
 
 
-def glue_validation_split(task_name: str) -> str:
+def glue_nlu_train_val_splits(dataset, task_name: str) -> Tuple[str, str]:
+    """
+    返回 (train_split, val_split)。HF `datasets` 的 `glue`/`ax` **仅有 test**，无 train/validation；
+    此时训练与评估均复用 `test`（与官方「在 MNLI 上训练再在 AX 上测」不同，仅保证脚本可跑通与指标计算）。
+    """
+    keys = set(dataset.keys())
     if task_name == "mnli":
-        return "validation_matched"
-    return "validation"
+        val = "validation_matched" if "validation_matched" in keys else "validation"
+        if "train" not in keys:
+            raise ValueError(f"GLUE mnli 缺少 train split，现有: {sorted(keys)}")
+        if val not in keys:
+            raise ValueError(f"GLUE mnli 缺少 {val} split，现有: {sorted(keys)}")
+        return "train", val
+    if "train" in keys:
+        if "validation" in keys:
+            return "train", "validation"
+        if "test" in keys:
+            return "train", "test"
+        raise ValueError(f"GLUE {task_name} 有 train 但无 validation/test：{sorted(keys)}")
+    if "validation" in keys:
+        return "validation", "validation"
+    if "test" in keys:
+        return "test", "test"
+    raise ValueError(f"GLUE {task_name} 无可用 split（需含 train、validation 或 test 之一）：{sorted(keys)}")
 
 
 def nlu_is_glue_regression(task_name: Optional[str]) -> bool:
@@ -142,21 +162,23 @@ def setup_data_and_model(
                 max_length=max_length,
             )
 
+        train_split, val_split = glue_nlu_train_val_splits(dataset, task_name)
+
         tokenized = dataset.map(tokenize_fn, batched=True)
         tokenized = tokenized.rename_column("label", "labels")
         keep_cols = ["input_ids", "attention_mask", "labels"]
-        if "token_type_ids" in tokenized["train"].column_names:
+        ref_cols = tokenized[train_split].column_names
+        if "token_type_ids" in ref_cols:
             keep_cols.append("token_type_ids")
-        tokenized = tokenized.remove_columns([c for c in tokenized["train"].column_names if c not in keep_cols])
+        tokenized = tokenized.remove_columns([c for c in ref_cols if c not in keep_cols])
         tokenized.set_format(type="torch")
 
         collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
-        val_split_name = glue_validation_split(task_name)
 
         val_loader_eval_full: Optional[DataLoader] = None
         if ddp_enabled and world_size > 1:
             train_sampler = DistributedSampler(
-                tokenized["train"],
+                tokenized[train_split],
                 num_replicas=world_size,
                 rank=rank,
                 shuffle=True,
@@ -165,7 +187,7 @@ def setup_data_and_model(
             )
             # 为了让 mini_val_k 的批次数在各卡上尽量一致，这里使用 drop_last=True。
             val_sampler = DistributedSampler(
-                tokenized[val_split_name],
+                tokenized[val_split],
                 num_replicas=world_size,
                 rank=rank,
                 shuffle=False,
@@ -173,18 +195,18 @@ def setup_data_and_model(
                 drop_last=True,
             )
             train_loader = DataLoader(
-                tokenized["train"], batch_size=batch_size, sampler=train_sampler, collate_fn=collator
+                tokenized[train_split], batch_size=batch_size, sampler=train_sampler, collate_fn=collator
             )
             val_loader = DataLoader(
-                tokenized[val_split_name], batch_size=batch_size, sampler=val_sampler, collate_fn=collator
+                tokenized[val_split], batch_size=batch_size, sampler=val_sampler, collate_fn=collator
             )
             # GLUE 官方主指标（MCC/F1 等）需全验证集；与 NLG 一致，仅 rank0 用该 loader 做评估。
             val_loader_eval_full = DataLoader(
-                tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator
+                tokenized[val_split], batch_size=batch_size, shuffle=False, collate_fn=collator
             )
         else:
-            train_loader = DataLoader(tokenized["train"], batch_size=batch_size, shuffle=True, collate_fn=collator)
-            val_loader = DataLoader(tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator)
+            train_loader = DataLoader(tokenized[train_split], batch_size=batch_size, shuffle=True, collate_fn=collator)
+            val_loader = DataLoader(tokenized[val_split], batch_size=batch_size, shuffle=False, collate_fn=collator)
 
         if task_name == "stsb":
             base_model = AutoModelForSequenceClassification.from_pretrained(
@@ -194,11 +216,11 @@ def setup_data_and_model(
                 cache_dir=model_cache_dir,
             )
         else:
-            label_feature = dataset["train"].features.get("label", None)
+            label_feature = dataset[train_split].features.get("label", None)
             if label_feature is not None and hasattr(label_feature, "num_classes") and label_feature.num_classes is not None:
                 num_labels = int(label_feature.num_classes)
             else:
-                num_labels = len(set(dataset["train"]["label"]))
+                num_labels = len(set(dataset[train_split]["label"]))
             base_model = AutoModelForSequenceClassification.from_pretrained(
                 model_name,
                 num_labels=num_labels,

@@ -33,10 +33,11 @@
 | `qnli` | 问答蕴含 | `validation` | **Accuracy** |
 | `rte` | 文本蕴含 | `validation` | **Accuracy** |
 | `wnli` | Winograd 式蕴含（极小集） | `validation` | **Accuracy** |
-| `ax` | 诊断集（MNLI 风格前提–假设） | `validation` | **Accuracy** |
+| `ax` | 诊断集（MNLI 风格前提–假设） | 见下 **`ax` 说明** | **Accuracy** |
 
 **注意：**
 
+- **`ax`（HuggingFace `glue`）**：该配置**仅有 `test` split**（无 `train`/`validation`）。脚本将 **训练与验证均映射到 `test`**，以便跑通基准与指标；与 GLUE 官方「在 MNLI 上训练、在 AX 上提交/评估」的协议不同，**打表对比论文时请改用 MNLI 训练后再在 `ax` 上评估**（需自行扩展流程或分两步跑）。
 - **`stsb`**：训练为 MSE 回归；验证在**完整 dev 集**上算 Pearson 与 Spearman，主标量为二者**算术平均**（与 GLUE 总分里该任务的常见合成方式一致）。
 - **DDP**：与 NLG 相同，验证指标仅在 **rank0** 上对**全量** dev 集计算，再 `broadcast` 到各卡，避免 `DistributedSampler` 子集偏差。
 - CSV 列名仍为 **`best_val_accuracy`**，语义为「该任务验证主指标」（不限于 accuracy）；TensorBoard 为 **`val/<指标名>`**（如 `val/matthews_corrcoef`、`val/f1`、`val/pearson_spearman_mean`）。`metrics.jsonl` 含字段 **`glue_metric`** 标明指标键名。
