@@ -29,7 +29,7 @@ from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
 from adalora_utils import adalora_update_and_allocate, compute_adalora_orthogonal_loss, get_adalora_orth_reg_weight, unwrap_inner_from_training_model
 from lora_ga_init import apply_lora_ga_init_to_peft, run_lora_ga_init_pipeline
 from rank_evolution_controller import RankEvolutionController
-from sora_inject import inject_sora
+from sora_inject import SparseAdamW, inject_sora
 from train_integration import inject_evo_lora, train_evo_lora_step
 
 from glue_metrics import collect_nlu_predictions, compute_glue_primary_metric, glue_primary_metric_key
@@ -595,6 +595,7 @@ def run_training_loop(
     random_seed: Optional[int] = None,
     val_loader_eval_full: Optional[DataLoader] = None,
     sora_sparse_lambda: float = 1e-3,
+    sora_sparse_lambda_2: float = 1e-3,
     sora_lambda_warmup_steps: int = 0,
     task_name: Optional[str] = None,
     checkpoint_root: Optional[str] = None,
@@ -622,7 +623,15 @@ def run_training_loop(
             device_ids=[local_rank],
             output_device=local_rank,
         )
-    optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
+    if method_name == "sora":
+        # 官方 SoRA：gate 参数使用独立的 SparseAdamW（近端梯度），其余参数使用标准 AdamW。
+        _non_gate = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate")]
+        _gate = [p for n, p in model.named_parameters() if p.requires_grad and n.endswith(".gate")]
+        optimizer = AdamW(_non_gate, lr=lr, weight_decay=weight_decay)
+        sparse_optimizer = SparseAdamW(_gate, lr=lr, sparse_lambda=sora_sparse_lambda_2, weight_decay=0.0)
+    else:
+        optimizer = AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
+        sparse_optimizer = None
     if task_type == "nlu":
         if nlu_is_glue_regression(task_name):
 
@@ -652,6 +661,14 @@ def run_training_loop(
         num_warmup_steps=warmup_steps,
         num_training_steps=total_train_steps,
     )
+    if sparse_optimizer is not None:
+        sparse_lr_scheduler = get_linear_schedule_with_warmup(
+            optimizer=sparse_optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_train_steps,
+        )
+    else:
+        sparse_lr_scheduler = None
     writer = SummaryWriter(log_dir=os.path.join(log_dir, method_name)) if is_main_process else None
 
     if checkpoint_root and is_main_process:
@@ -717,6 +734,8 @@ def run_training_loop(
                 )
             else:
                 optimizer.zero_grad(set_to_none=True)
+                if sparse_optimizer is not None:
+                    sparse_optimizer.zero_grad(set_to_none=True)
                 logits = model(features)
                 loss = loss_fn(logits, labels)
                 if method_name == "adalora":
@@ -728,12 +747,18 @@ def run_training_loop(
                     lam = float(sora_sparse_lambda)
                     if sora_lambda_warmup_steps > 0:
                         lam *= min(1.0, float(global_step + 1) / float(sora_lambda_warmup_steps))
+                    # 官方 SoRA：L1 Loss 除以 gate 总元素数做归一化
                     l1_penalty = sum(
                         p.abs().sum() for n, p in model.named_parameters() if n.endswith(".gate")
                     )
-                    loss = loss + lam * l1_penalty
+                    gate_numel = sum(
+                        p.numel() for n, p in model.named_parameters() if n.endswith(".gate")
+                    )
+                    loss = loss + lam * l1_penalty / max(gate_numel, 1)
                 loss.backward()
                 optimizer.step()
+                if sparse_optimizer is not None:
+                    sparse_optimizer.step()
                 if method_name == "adalora":
                     _adalora_post_step_update(model, global_step)
                 train_loss = float(loss.detach().item())
@@ -741,6 +766,8 @@ def run_training_loop(
 
             # 无论哪条路径，optimizer.step() 都已在本步完成，此处统一推进学习率调度。
             lr_scheduler.step()
+            if sparse_lr_scheduler is not None:
+                sparse_lr_scheduler.step()
             current_lr = float(optimizer.param_groups[0]["lr"])
 
             train_loss_ema = train_loss if train_loss_ema is None else (ema_beta * train_loss_ema + (1 - ema_beta) * train_loss)
@@ -1048,6 +1075,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora_ga_batches", type=int, default=8, help="LoRA-GA 梯度估计用的训练 batch 数（仅前若干个 batch）")
     parser.add_argument("--sora_sparse_lambda", type=float, default=1e-3, help="SoRA：gate L1 惩罚系数")
     parser.add_argument("--sora_lambda_warmup_steps", type=int, default=0, help="SoRA：前若干步将 sparse_lambda 从 0 线性升到设定值；0 表示关闭")
+    parser.add_argument("--sora_sparse_lambda_2", type=float, default=1e-3, help="SoRA：gate 近端梯度硬裁剪阈值（Proximal Gradient / Soft-Thresholding），对标官方 SparseAdamW")
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -1158,6 +1186,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     random_seed=args.seed,
                     val_loader_eval_full=val_loader_eval_full,
                     sora_sparse_lambda=args.sora_sparse_lambda,
+                    sora_sparse_lambda_2=args.sora_sparse_lambda_2,
                     sora_lambda_warmup_steps=args.sora_lambda_warmup_steps,
                     task_name=task_name,
                     checkpoint_root=checkpoint_root,

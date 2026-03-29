@@ -1,4 +1,4 @@
-﻿"""SoRA-style sparse gate LoRA branch."""
+"""SoRA-style sparse gate LoRA branch."""
 from __future__ import annotations
 import math
 from typing import List
@@ -45,3 +45,35 @@ def inject_sora(model: nn.Module, target_modules: List[str], r: int, lora_alpha:
     for name, param in model.named_parameters():
         if "classifier" in name or "score" in name or "lm_head" in name or name == "shared":
             param.requires_grad = True
+
+
+class SparseAdamW(torch.optim.AdamW):
+    """
+    近端梯度 (Proximal Gradient) 的 AdamW，用于 SoRA gate 参数。
+
+    在标准 AdamW 更新后，应用 Soft-Thresholding 对参数执行硬裁剪：
+        θ ← sign(θ) · max(|θ| - λ, 0)
+
+    这保证了门控参数可以达到精确的数学零值（稀疏性保障），相比仅在 Loss 上加 L1 惩罚的
+    次梯度方法（Subgradient），近端梯度方法产生的解有更好的稀疏结构。
+
+    参考：TsinghuaC3I/SoRA (EMNLP 2023) src/sparse_optimizer.py
+    """
+
+    def __init__(self, params, sparse_lambda: float = 1e-3, **kwargs):
+        super().__init__(params, **kwargs)
+        self.sparse_lambda = sparse_lambda
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = super().step(closure)
+        if self.sparse_lambda > 0:
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    # Soft-thresholding (proximal operator of L1 norm)
+                    p.data[p.data > self.sparse_lambda] -= self.sparse_lambda
+                    p.data[p.data < -self.sparse_lambda] += self.sparse_lambda
+                    p.data[p.data.abs() < self.sparse_lambda] = 0.0
+        return loss
