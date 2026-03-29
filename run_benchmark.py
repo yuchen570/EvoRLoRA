@@ -372,6 +372,11 @@ def peft_factory(
 
     controller: Optional[RankEvolutionController] = None
 
+    if task_type == "nlu":
+        modules_to_save = ["classifier", "score"]
+    else:
+        modules_to_save = ["lm_head", "shared"]
+
     if method_name == "lora":
         config = LoraConfig(
             task_type=peft_task_type,
@@ -379,6 +384,7 @@ def peft_factory(
             lora_alpha=effective_alpha,
             lora_dropout=0.1,
             target_modules=target_modules,
+            modules_to_save=modules_to_save,
             bias="none",
         )
         model = get_peft_model(model, config)
@@ -410,6 +416,7 @@ def peft_factory(
             lora_alpha=effective_alpha,
             lora_dropout=0.1,
             target_modules=target_modules,
+            modules_to_save=modules_to_save,
             bias="none",
             beta1=0.85,
             beta2=0.85,
@@ -575,10 +582,17 @@ def _collect_rank_distribution(
     n_layers = max(len(per_layer), 1)
     avg_rank = total_active / n_layers
 
+    base_rank = target_rank
+    if method_name == "adalora":
+        config = getattr(inner, "peft_config", {}).get("default", None)
+        if config is not None:
+            base_rank = getattr(config, "init_r", target_rank * 2)
+
     summary = {
         "avg_rank": round(avg_rank, 4),
         "total_active": total_active,
         "total_capacity": total_capacity,
+        "base_rank": base_rank,
     }
     if 'extra_info' in locals() and extra_info:
         summary["extra_string"] = extra_info
@@ -602,21 +616,29 @@ def _print_rank_distribution(
     extra_str = f" [{summary['extra_string']}]" if "extra_string" in summary else ""
     print(f"[{method_name}] === Rank Distribution (epoch={epoch}/{epochs}){extra_str} ===")
     
-    for layer_name, eff_r in per_layer.items():
-        # 简化层名：只保留 layer.X.xxx.yyy 部分
-        short_name = layer_name
-        parts = layer_name.split(".")
-        # 尝试从 'layer' 关键字开始截取
-        for i, part in enumerate(parts):
-            if part == "layer":
-                short_name = ".".join(parts[i:])
-                break
-        label = "r" if method_name in ("lora", "lora-ga") else (
-            "eff_r" if method_name == "adalora" else (
+    if method_name not in ("lora", "lora-ga"):
+        base_rank = summary.get("base_rank", -1)
+        omitted = 0
+        for layer_name, eff_r in per_layer.items():
+            if eff_r == base_rank:
+                omitted += 1
+                continue
+            # 简化层名：只保留 layer.X.xxx.yyy 部分
+            short_name = layer_name
+            parts = layer_name.split(".")
+            # 尝试从 'layer' 关键字开始截取
+            for i, part in enumerate(parts):
+                if part == "layer":
+                    short_name = ".".join(parts[i:])
+                    break
+            label = "eff_r" if method_name == "adalora" else (
                 "gates" if method_name == "sora" else "r"
             )
-        )
-        print(f"  {short_name}: {label}={eff_r}")
+            print(f"  {short_name}: {label}={eff_r}")
+        
+        if omitted > 0:
+            print(f"  ... (+ {omitted} layers unchanged at {base_rank})")
+            
     print(
         f"  avg_rank={summary['avg_rank']:.2f}  "
         f"total_active={summary['total_active']}/{summary['total_capacity']}"
