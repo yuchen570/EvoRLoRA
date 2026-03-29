@@ -5,7 +5,7 @@
 - `EvoRankLoRALayer`：最大秩超空间 + 掩码激活 + 在线扩张/修剪
 - `RankEvolutionController`：EMA 统计、动态阈值、计数器与冷却、Mutation 生成与提交
 - `train_integration.py`：模型注入（`inject_evo_lora`）与双时间尺度训练步（`train_evo_lora_step`）
-- `run_benchmark.py`：GLUE/NLG 基准脚本，支持 LoRA、AdaLoRA、EvoRank、**LoRA-GA**、**SoRA**（及 MTL-LoRA 占位说明）；支持 TensorBoard / W&B、**CSV 导出**，以及 **`--output_dir` 下按实验写入 `metrics.jsonl`、可选中间 checkpoint、训练结束 `final/`（权重 + tokenizer）与 `--verify_n_samples` 冒烟打印**
+- `run_benchmark.py`：GLUE（**HuggingFace `glue` 全部 10 个配置**）/ NLG 基准脚本，支持 LoRA、AdaLoRA、EvoRank、**LoRA-GA**、**SoRA**（及 MTL-LoRA 占位说明）；支持 TensorBoard / W&B、**CSV 导出**，以及 **`--output_dir` 下按实验写入 `metrics.jsonl`、可选中间 checkpoint、训练结束 `final/`（权重 + tokenizer）与 `--verify_n_samples` 冒烟打印**
 
 ### 对比方法（`--methods`）
 
@@ -18,9 +18,9 @@
 | `sora` | 带 `gate` 的稀疏低秩旁路；训练时需在主损失上加 L1（脚本已用 `--sora_sparse_lambda`，可选 `--sora_lambda_warmup_steps`） |
 | `mtl-lora` | 未实现：需联合多任务与 task id，与当前 `--task_list` 串行协议不对齐 |
 
-### GLUE 子集（`--task_name`，`task_type=nlu`）
+### GLUE 全任务（`--task_name`，`task_type=nlu`）
 
-脚本通过 `load_dataset("glue", task_name)` 加载数据，**已内置字段映射**的子集如下（与 [HuggingFace `glue`](https://huggingface.co/datasets/glue) 配置名一致）：
+脚本通过 `load_dataset("glue", task_name)` 加载数据；**已覆盖 [HuggingFace `glue`](https://huggingface.co/datasets/glue) 的全部 10 个配置**（字段映射与验证 split 约定已内置，与官方配置名一致）：
 
 | `task_name` | 说明 | 验证 split | 验证主指标（与 GLUE 常用约定一致，实现见 `glue_metrics.py`） |
 |-------------|------|------------|----------------------------------|
@@ -40,8 +40,8 @@
 - **`stsb`**：训练为 MSE 回归；验证在**完整 dev 集**上算 Pearson 与 Spearman，主标量为二者**算术平均**（与 GLUE 总分里该任务的常见合成方式一致）。
 - **DDP**：与 NLG 相同，验证指标仅在 **rank0** 上对**全量** dev 集计算，再 `broadcast` 到各卡，避免 `DistributedSampler` 子集偏差。
 - CSV 列名仍为 **`best_val_accuracy`**，语义为「该任务验证主指标」（不限于 accuracy）；TensorBoard 为 **`val/<指标名>`**（如 `val/matthews_corrcoef`、`val/f1`、`val/pearson_spearman_mean`）。`metrics.jsonl` 含字段 **`glue_metric`** 标明指标键名。
-- **`--task_list`** 可串行跑多子集；一次扫全部分类+回归子集时可写：  
-  `--task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli`（耗时与磁盘占用随任务数线性增长）。
+- **`--task_list`** 可串行跑多个 `task_name`；一次扫**全部 10 个 GLUE 任务**（含诊断集 `ax` 与回归 `stsb`）时可写：  
+  `--task_list ax cola sst2 mrpc qqp stsb mnli qnli rte wnli`（顺序可任意；耗时与磁盘占用随任务数线性增长）。
 
 ---
 
@@ -64,7 +64,7 @@
   - `--task_list`
   - `--model_list`
   - `--export_csv`
-- GLUE：各子集验证使用 **官方主指标**（CoLA→Matthews，MRPC/QQP→F1，STS-B→Pearson 与 Spearman 均值，其余分类任务→Accuracy），见 `glue_metrics.py`。
+- GLUE：**10 个任务**验证均使用 **官方主指标**（CoLA→Matthews，MRPC/QQP→F1，STS-B→Pearson 与 Spearman 均值，其余分类任务→Accuracy），见 `glue_metrics.py`。
 - 训练产物与 checkpoint（与 `--log_dir` 分离）：
   - 默认 `--output_dir artifacts`，子目录形如 `artifacts/<task>_<backbone>_<method>/`
   - `metrics.jsonl`、可选 `--save_steps` / `--save_every_epoch`、结束 `final/`（PEFT 为 `save_pretrained`；`evorank`/`sora` 为 `model_state.pt`）
@@ -495,5 +495,5 @@ python run_benchmark.py \
 - `evo_rank_lora.py`：可演化 LoRA 层
 - `rank_evolution_controller.py`：演化控制器与 Mutation 体系
 - `train_integration.py`：注入与双时间尺度训练
-- `glue_metrics.py`：GLUE 各子集验证主指标（Matthews / Acc / F1 / Pearson–Spearman 均值等）
+- `glue_metrics.py`：GLUE 全 10 任务验证主指标（Matthews / Acc / F1 / Pearson–Spearman 均值等）
 - `run_benchmark.py`：主实验入口
