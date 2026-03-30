@@ -1116,8 +1116,11 @@ def run_training_loop(
                     import evaluate  # type: ignore
 
                     rouge_metric = evaluate.load("rouge")
-                except Exception:
+                except Exception as e:
+                    # NLG 指标在一些离线/依赖缺失环境下可能无法加载 rouge。
+                    # 之前静默写 0 分，导致“全 0”难以定位原因；这里显式打印异常。
                     rouge_metric = None
+                    print(f"[warn] evaluate.load('rouge') failed: {type(e).__name__}: {e!r}")
 
                 # 生成阶段需要底层 seq2seq 模型（可能在 DictFeatureClassifier.inner 或 DDP.module.inner 中）
                 if isinstance(model, DDP):
@@ -1161,13 +1164,31 @@ def run_training_loop(
                             break
 
                 if rouge_metric is None:
+                    if is_main_process:
+                        # 避免误以为模型真的完全没有任何重叠
+                        print(
+                            f"[warn] rouge metric skipped -> 0.0 (preds={len(preds_text)}, refs={len(refs_text)})"
+                        )
                     val_metric = 0.0
                     rouge1_val = rouge2_val = 0.0
                 else:
+                    if len(preds_text) == 0 or len(refs_text) == 0 or len(preds_text) != len(refs_text):
+                        print(
+                            f"[warn] rouge inputs look suspicious: preds={len(preds_text)}, refs={len(refs_text)}; "
+                            f"pred0={preds_text[0][:80] if preds_text else ''!r}; ref0={refs_text[0][:80] if refs_text else ''!r}"
+                        )
                     scores = rouge_metric.compute(predictions=preds_text, references=refs_text)
                     rouge1_val = float(scores.get("rouge1", 0.0))
                     rouge2_val = float(scores.get("rouge2", 0.0))
                     val_metric = float(scores.get("rougeL", scores.get("rougeLsum", 0.0)))
+                    if rouge1_val == 0.0 and rouge2_val == 0.0 and val_metric == 0.0:
+                        # 如果确实存在可见文本但 rouge 全 0，通常是 tokenize/metric 解析问题或重叠为 0
+                        if is_main_process:
+                            print(
+                                "[warn] rouge scores all 0.0; "
+                                f"pred0={preds_text[0][:120] if preds_text else ''!r}; "
+                                f"ref0={refs_text[0][:120] if refs_text else ''!r}"
+                            )
 
                 best_val_acc = max(best_val_acc, val_metric)
                 print(
