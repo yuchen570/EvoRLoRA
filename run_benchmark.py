@@ -265,8 +265,7 @@ def setup_data_and_model(
             inputs = examples[text_key]
             targets = examples[target_key]
             model_inputs = tokenizer(inputs, max_length=max_length, truncation=True)
-            with tokenizer.as_target_tokenizer():
-                labels = tokenizer(targets, max_length=max_target_length, truncation=True)
+            labels = tokenizer(text_target=targets, max_length=max_target_length, truncation=True)
             model_inputs["labels"] = labels["input_ids"]
             return model_inputs
 
