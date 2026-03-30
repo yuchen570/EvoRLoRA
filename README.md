@@ -279,15 +279,24 @@ torchrun --nproc_per_node=2 --master_port=29500 \
 
 **说明：** 下列命令用于 **RoBERTa-base + 常见微调超参**（`lr=2e-5`、`epochs=3`、`weight_decay=0.01`）下的 **方法同台对比**，**不是** AdaLoRA / SoRA 等论文原文的表格数字复现。论文级协议见下文 **「AdaLoRA / SoRA 论文复现（DeBERTa-v3-base，GLUE NLU）」** 等专节。
 
+> [!TIP]
+> **关于不同 GLUE 任务的 Epoch 设置建议**
+> 根据评测日志分析，统一设置 3 个或 5 个 Epoch 对于所有任务**是不合理**的。不同任务应设置不同的 Epoch 才能确保充分训练以及稳定的数值表现：
+> - **严重欠拟合的任务（需 15 ~ 20 Epochs）**：`stsb`, `cola`, `rte`。这些子集数据量小且所需更新步数少，如果在 5 个 Epoch 内停止会导致明显欠拟合或严重震荡。
+> - **极小数据集易波动任务（需 10 ~ 20 Epochs）**：`mrpc`, `wnli`。非常容易出现大幅震荡或直接崩溃（如 WNLI 预测多数类别）。建议充分 Warmup 并放长训练轮数，最好配合 Early Stopping。
+> - **大数据集易收敛的任务（3 ~ 5 Epochs 即可）**：`sst2`, `mnli`, `qnli`, `qqp`。这些数据量大的任务在 3~5 轮时通常已展现完美的收敛平台，为了最高精度最多尝试 5~10 轮。
+> 如果你需要同时对所有子集跑 `--task_list ...`，建议为大规模和小规模数据集分别设置不同的训练脚本。
+
 全对比时包含 LoRA-GA / SoRA；若只想跑基线，可将 `--methods` 改为 `lora adalora evorank` 并去掉 `--lora_ga_batches` / `--sora_*`。若与 **SoRA 论文**对齐，请在同一命令中追加例如 `--max_grad_norm 0.1`，并按该节调整 `batch_size` / `lr` / `epochs` / `weight_decay` / `--sora_sparse_lambda*`。
 
+# === 脚本 A: 大数据集 (3~5 Epochs 即可收敛) ===
 ```bash
 python run_benchmark.py \
   --methods lora adalora evorank lora-ga sora \
-  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list sst2 mnli qnli qqp \
   --model_list roberta-base \
   --target_rank 8 \
-  --epochs 3 \
+  --epochs 5 \
   --batch_size 16 \
   --lr 2e-5 \
   --weight_decay 0.01 \
@@ -302,11 +311,12 @@ python run_benchmark.py \
   --complexity_mode rank_sum \
   --population_strategy all \
   --seed 42 \
-  --log_dir runs/main_results \
+  --log_dir runs/main_results_large \
   --output_dir artifacts \
-  --export_csv results_main.csv
+  --export_csv results_main_large.csv
 ```
 
+# === 脚本 B: 中小数据集 (需 15~20 Epochs 充分训练) ===
 双卡（torchrun）+ nohup 后台运行：
 
 ```bash
@@ -314,10 +324,10 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
   --methods lora adalora evorank lora-ga sora \
-  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list cola mrpc stsb rte wnli \
   --model_list roberta-base \
   --target_rank 8 \
-  --epochs 5 \
+  --epochs 20 \
   --batch_size 32 \
   --lr 2e-5 \
   --weight_decay 0.01 \
@@ -332,10 +342,10 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --complexity_mode rank_sum \
   --population_strategy all \
   --seed 42 \
-  --log_dir runs/main_results_ddp \
+  --log_dir runs/main_results_small_ddp \
   --output_dir artifacts \
-  --export_csv results_main_ddp.csv \
-  > logs/main_results_ddp.out 2>&1 &
+  --export_csv results_main_small_ddp.csv \
+  > logs/main_results_small_ddp.out 2>&1 &
 ```
 
 ### 3) 消融模板（EvoRank）
@@ -387,10 +397,11 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 
 ### 4) 效率模板
 
+# === 脚本 A: 大数据集 ===
 ```bash
 python run_benchmark.py \
   --methods lora adalora evorank lora-ga sora \
-  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list sst2 mnli qnli qqp \
   --model_list roberta-base \
   --target_rank 8 \
   --batch_size 16 \
@@ -408,11 +419,12 @@ python run_benchmark.py \
   --lambda_pop 16 \
   --population_strategy all \
   --seed 42 \
-  --log_dir runs/efficiency \
+  --log_dir runs/efficiency_large \
   --output_dir artifacts \
-  --export_csv results_efficiency.csv
+  --export_csv results_efficiency_large.csv
 ```
 
+# === 脚本 B: 中小数据集 ===
 双卡（torchrun）+ nohup 后台运行：
 
 ```bash
@@ -420,7 +432,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
   --methods lora adalora evorank lora-ga sora \
-  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list cola mrpc stsb rte wnli \
   --model_list roberta-base \
   --target_rank 8 \
   --batch_size 16 \
@@ -438,10 +450,10 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --lambda_pop 16 \
   --population_strategy all \
   --seed 42 \
-  --log_dir runs/efficiency_ddp \
+  --log_dir runs/efficiency_small_ddp \
   --output_dir artifacts \
-  --export_csv results_efficiency_ddp.csv \
-  > logs/efficiency_ddp.out 2>&1 &
+  --export_csv results_efficiency_small_ddp.csv \
+  > logs/efficiency_small_ddp.out 2>&1 &
 ```
 
 ---
@@ -629,15 +641,16 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 
 ### AdaLoRA / SoRA 论文复现（DeBERTa-v3-base，GLUE NLU）
 
+# === 大数据集 (建议 5~10 epochs) ===
 ```bash
 python run_benchmark.py \
   --methods lora adalora sora evorank \
-  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list sst2 mnli qnli qqp \
   --model_list microsoft/deberta-v3-base \
   --target_rank 8 \
   --lora_alpha 16 \
   --target_modules query_proj,key_proj,value_proj \
-  --epochs 24 \
+  --epochs 10 \
   --batch_size 32 \
   --lr 5e-4 \
   --weight_decay 0.1 \
@@ -645,11 +658,12 @@ python run_benchmark.py \
   --max_grad_norm 0.1 \
   --sora_sparse_lambda 10 \
   --seed_list 0 21 42 81 100 \
-  --log_dir runs/deberta_glue \
+  --log_dir runs/deberta_glue_large \
   --output_dir artifacts \
-  --export_csv results_deberta_glue.csv
+  --export_csv results_deberta_glue_large.csv
 ```
 
+# === 中小数据集 (论文建议 20~24 epochs) ===
 双卡（torchrun）+ nohup 后台运行：
 
 ```bash
@@ -657,7 +671,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
   --methods lora adalora sora evorank \
-  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list cola mrpc stsb rte wnli \
   --model_list microsoft/deberta-v3-base \
   --target_rank 8 \
   --lora_alpha 16 \
@@ -670,10 +684,10 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --max_grad_norm 0.1 \
   --sora_sparse_lambda 10 \
   --seed_list 0 21 42 81 100 \
-  --log_dir runs/deberta_glue_ddp \
+  --log_dir runs/deberta_glue_small_ddp \
   --output_dir artifacts \
-  --export_csv results_deberta_glue_ddp.csv \
-  > logs/deberta_glue_ddp.out 2>&1 &
+  --export_csv results_deberta_glue_small_ddp.csv \
+  > logs/deberta_glue_small_ddp.out 2>&1 &
 ```
 
 CSV 会自动追加每个 `task×backbone×method` 的 **一对**汇总行（`seed` 为 `mean` / `std`）：主指标列 `best_val_accuracy` 取各种子均值/标准差；**NLG** 时同一对行内同时写入 `rouge1`、`rouge2` 的均值与标准差（主指标仍为 `rougeL`，存在 `best_val_accuracy`）。
@@ -688,10 +702,11 @@ CSV 会自动追加每个 `task×backbone×method` 的 **一对**汇总行（`se
 
 ### LoRA-GA 官方 reproduce 配置
 
+# === 大数据集 (LoRA-GA 官方 reproduce 设为 3 epochs) ===
 ```bash
 python run_benchmark.py \
   --methods lora-ga \
-  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list sst2 mnli qnli qqp \
   --model_list roberta-base \
   --target_rank 8 \
   --lora_alpha 16 \
@@ -702,11 +717,12 @@ python run_benchmark.py \
   --batch_size 16 \
   --lr 2e-5 \
   --seed 42 \
-  --log_dir runs/lora_ga_reproduce \
+  --log_dir runs/lora_ga_large \
   --output_dir artifacts \
-  --export_csv results_lora_ga.csv
+  --export_csv results_lora_ga_large.csv
 ```
 
+# === 中小数据集 (必须提高 epochs 以免严重欠拟合) ===
 双卡（torchrun）+ nohup 后台运行：
 
 ```bash
@@ -714,21 +730,21 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
   --methods lora-ga \
-  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --task_list cola mrpc stsb rte wnli \
   --model_list roberta-base \
   --target_rank 8 \
   --lora_alpha 16 \
   --lora_ga_batches 8 \
   --lora_ga_use_rslora \
   --lora_ga_stable_gamma 64 \
-  --epochs 3 \
+  --epochs 20 \
   --batch_size 16 \
   --lr 2e-5 \
   --seed 42 \
-  --log_dir runs/lora_ga_reproduce_ddp \
+  --log_dir runs/lora_ga_small_ddp \
   --output_dir artifacts \
-  --export_csv results_lora_ga_ddp.csv \
-  > logs/lora_ga_reproduce_ddp.out 2>&1 &
+  --export_csv results_lora_ga_small_ddp.csv \
+  > logs/lora_ga_small_ddp.out 2>&1 &
 ```
 
 ---
