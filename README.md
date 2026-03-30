@@ -287,20 +287,24 @@ torchrun --nproc_per_node=2 --master_port=29500 \
 > - **大数据集易收敛的任务（3 ~ 5 Epochs 即可）**：`sst2`, `mnli`, `qnli`, `qqp`。这些数据量大的任务在 3~5 轮时通常已展现完美的收敛平台，为了最高精度最多尝试 5~10 轮。
 > 如果你需要同时对所有子集跑 `--task_list ...`，建议为大规模和小规模数据集分别设置不同的训练脚本。
 
-全对比时包含 LoRA-GA / SoRA；若只想跑基线，可将 `--methods` 改为 `lora adalora evorank` 并去掉 `--lora_ga_batches` / `--sora_*`。若与 **SoRA 论文**对齐，请在同一命令中追加例如 `--max_grad_norm 0.1`，并按该节调整 `batch_size` / `lr` / `epochs` / `weight_decay` / `--sora_sparse_lambda*`。
-
+全对比时包含 LoRA-GA / SoRA；若只想专注跑基线，可将 `--methods` 改为 `lora adalora evorank` 并去掉 `--lora_ga_batches / --sora_sparse_lambda*` 等分支参数。框架内部已经为 `sora` 和 `lora-ga` 等强约束算法做好了动态超参兼容（如自动切换 `max_grad_norm=0.1` 和免衰减修正），因此**您可以在同一个命令中横向并跑这些算法**，而完全不需要手动切碎脚本调整那些苛刻的论文约束。
 # === 脚本 A: 大数据集 (3~5 Epochs 即可收敛) ===
+双卡（torchrun）+ nohup 后台运行：
+
 ```bash
-python run_benchmark.py \
+nohup torchrun --nproc_per_node=2 --master_port=29500 \
+  run_benchmark.py \
+  --ddp \
   --methods lora adalora evorank lora-ga sora \
   --task_list sst2 mnli qnli qqp \
   --model_list roberta-base \
   --target_rank 8 \
   --epochs 5 \
   --batch_size 16 \
-  --lr 2e-5 \
-  --weight_decay 0.01 \
-  --warmup_ratio 0.1 \
+  --lr 5e-4 \
+  --weight_decay 0.1 \
+  --warmup_ratio 0.06 \
+  --max_grad_norm 0.1 \
   --T_es 200 \
   --mini_val_k 8 \
   --adalora_delta_t 200 \
@@ -311,9 +315,10 @@ python run_benchmark.py \
   --complexity_mode rank_sum \
   --population_strategy all \
   --seed 42 \
-  --log_dir runs/main_results_large \
+  --log_dir runs/main_results_large_ddp \
   --output_dir artifacts \
-  --export_csv results_main_large.csv
+  --export_csv results_main_large_ddp.csv \
+  > logs/main_results_large_ddp.out 2>&1 &
 ```
 
 # === 脚本 B: 中小数据集 (需 15~20 Epochs 充分训练) ===
@@ -329,9 +334,10 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --target_rank 8 \
   --epochs 20 \
   --batch_size 32 \
-  --lr 2e-5 \
-  --weight_decay 0.01 \
-  --warmup_ratio 0.1 \
+  --lr 5e-4 \
+  --weight_decay 0.1 \
+  --warmup_ratio 0.06 \
+  --max_grad_norm 0.1 \
   --T_es 200 \
   --mini_val_k 8 \
   --adalora_delta_t 200 \
@@ -398,8 +404,12 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 ### 4) 效率模板
 
 # === 脚本 A: 大数据集 ===
+双卡（torchrun）+ nohup 后台运行：
+
 ```bash
-python run_benchmark.py \
+nohup torchrun --nproc_per_node=2 --master_port=29500 \
+  run_benchmark.py \
+  --ddp \
   --methods lora adalora evorank lora-ga sora \
   --task_list sst2 mnli qnli qqp \
   --model_list roberta-base \
@@ -419,9 +429,10 @@ python run_benchmark.py \
   --lambda_pop 16 \
   --population_strategy all \
   --seed 42 \
-  --log_dir runs/efficiency_large \
+  --log_dir runs/efficiency_large_ddp \
   --output_dir artifacts \
-  --export_csv results_efficiency_large.csv
+  --export_csv results_efficiency_large_ddp.csv \
+  > logs/efficiency_large_ddp.out 2>&1 &
 ```
 
 # === 脚本 B: 中小数据集 ===
@@ -467,7 +478,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   - 命令增加 `--use_wandb --wandb_project <project_name>`
 - CSV 导出：
   - `--export_csv <file.csv>`
-  - 默认字段：`task/backbone/method/seed/val_metric_key/trainable_params/best_val_accuracy/rouge1/rouge2/peak_memory_mb/avg_active_rank/total_train_time_sec/artifact_dir/final_dir`（`val_metric_key` 标明主指标；NLU 的 `rouge*` 常为 `N/A`；`--seed_list` 多种子时追加 `mean`/`std` 行，NLG 下 `rouge1`/`rouge2` 一并聚合）
+  - 默认字段：`task/backbone/method/seed/val_metric_key/trainable_params/matthews_corrcoef/accuracy/f1/pearson_spearman_mean/rouge1/rouge2/rougeL/peak_memory_mb/avg_active_rank/total_train_time_sec/artifact_dir/final_dir`（每个任务只会向其所属的官方评价指标列写入数值，其余为空列。`--seed_list` 多种子时追加 `mean`/`std` 行，自动聚合所有激活的指标行）
 - **训练产物目录**（与 TensorBoard 的 `--log_dir` 相互独立）：
   - `--output_dir`：默认 `artifacts`；每个 `task×backbone×method` 会在其下创建子目录，例如 `artifacts/sst2_roberta-base_lora/`。
   - `--no_output_dir`：关闭该目录下所有落盘（不写 `metrics.jsonl`、checkpoint、`final/`）。
@@ -482,7 +493,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 
 ## NLG（生成任务）示例：CNN/DailyMail / XSum + ROUGE-1/2/L
 
-脚本支持 `--task_type nlg`，验证阶段同时计算并记录 **ROUGE-1、ROUGE-2、ROUGE-L** 三项指标（TensorBoard `val/rouge1`、`val/rouge2`、`val/rougeL`；CSV 含 `rouge1`、`rouge2` 列，`best_val_accuracy` 存 `rougeL`）。
+脚本支持 `--task_type nlg`，验证阶段同时计算并记录 **ROUGE-1、ROUGE-2、ROUGE-L** 三项指标（TensorBoard `val/rouge1`、`val/rouge2`、`val/rougeL`；CSV 中的专属列）。
 
 支持数据集：
 
@@ -642,8 +653,12 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 ### AdaLoRA / SoRA 论文复现（DeBERTa-v3-base，GLUE NLU）
 
 # === 大数据集 (建议 5~10 epochs) ===
+双卡（torchrun）+ nohup 后台运行：
+
 ```bash
-python run_benchmark.py \
+nohup torchrun --nproc_per_node=2 --master_port=29500 \
+  run_benchmark.py \
+  --ddp \
   --methods lora adalora sora evorank \
   --task_list sst2 mnli qnli qqp \
   --model_list microsoft/deberta-v3-base \
@@ -658,9 +673,10 @@ python run_benchmark.py \
   --max_grad_norm 0.1 \
   --sora_sparse_lambda 10 \
   --seed_list 0 21 42 81 100 \
-  --log_dir runs/deberta_glue_large \
+  --log_dir runs/deberta_glue_large_ddp \
   --output_dir artifacts \
-  --export_csv results_deberta_glue_large.csv
+  --export_csv results_deberta_glue_large_ddp.csv \
+  > logs/deberta_glue_large_ddp.out 2>&1 &
 ```
 
 # === 中小数据集 (论文建议 20~24 epochs) ===
@@ -690,7 +706,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   > logs/deberta_glue_small_ddp.out 2>&1 &
 ```
 
-CSV 会自动追加每个 `task×backbone×method` 的 **一对**汇总行（`seed` 为 `mean` / `std`）：主指标列 `best_val_accuracy` 取各种子均值/标准差；**NLG** 时同一对行内同时写入 `rouge1`、`rouge2` 的均值与标准差（主指标仍为 `rougeL`，存在 `best_val_accuracy`）。
+CSV 会自动追加每个 `task×backbone×method` 的 **一对**汇总行（`seed` 为 `mean` / `std`）：针对该任务有效的所有数值指标（如 classification 的 MCC/Acc/F1 或 NLG 的 rouge1/rouge2/rougeL 等）分别计算所有随机种子的均值/标准差并在同行输出。
 
 ### 论文级实验完成度（操作清单）
 | 步骤 | 内容 | 参考 |
@@ -703,8 +719,12 @@ CSV 会自动追加每个 `task×backbone×method` 的 **一对**汇总行（`se
 ### LoRA-GA 官方 reproduce 配置
 
 # === 大数据集 (LoRA-GA 官方 reproduce 设为 3 epochs) ===
+双卡（torchrun）+ nohup 后台运行：
+
 ```bash
-python run_benchmark.py \
+nohup torchrun --nproc_per_node=2 --master_port=29500 \
+  run_benchmark.py \
+  --ddp \
   --methods lora-ga \
   --task_list sst2 mnli qnli qqp \
   --model_list roberta-base \
@@ -717,9 +737,10 @@ python run_benchmark.py \
   --batch_size 16 \
   --lr 2e-5 \
   --seed 42 \
-  --log_dir runs/lora_ga_large \
+  --log_dir runs/lora_ga_large_ddp \
   --output_dir artifacts \
-  --export_csv results_lora_ga_large.csv
+  --export_csv results_lora_ga_large_ddp.csv \
+  > logs/lora_ga_large_ddp.out 2>&1 &
 ```
 
 # === 中小数据集 (必须提高 epochs 以免严重欠拟合) ===
@@ -749,28 +770,6 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 
 ---
 
-## 单元测试
-
-`tests/` 目录包含三组正确性验证测试，均可在 **CPU 上独立运行**，无需 GPU：
-
-```bash
-pytest tests/ -v
-```
-
-| 测试文件 | 验证内容 |
-|---|---|
-| `tests/test_importance_score.py` | EvoRank Trace Trick 两种计算路径等价（误差 < 1e-5） |
-| `tests/test_rank_compensation.py` | `activate_component` / `deactivate_component` 前后 ΔW 幅值不变（误差 < 1e-5） |
-| `tests/test_sparse_adamw.py` | SparseAdamW soft-thresholding 行为与预期一致（对标 SoRA 官方实现） |
-
-单独运行某一组：
-
-```bash
-pytest tests/test_sparse_adamw.py -v
-pytest tests/test_importance_score.py -v
-pytest tests/test_rank_compensation.py -v
-```
-
 ---
 
 ## 主要脚本
@@ -781,4 +780,3 @@ pytest tests/test_rank_compensation.py -v
 - `lora_ga_init.py`：LoRA-GA 梯度 SVD 初始化（含 `stable_gamma` 支持）
 - `glue_metrics.py`：GLUE 各子集验证主指标（Matthews / Acc / F1 / Pearson–Spearman 均值等；`ax` 在 HF 无金标时不走本脚本）
 - `run_benchmark.py`：主实验入口
-- `tests/`：正确性单元测试（`pytest tests/ -v`，CPU 可运行）

@@ -842,10 +842,13 @@ def run_training_loop(
         _non_gate_head = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate") and any(k in n for k in ["classifier", "score", "lm_head", "shared"])]
         _gate = [p for n, p in model.named_parameters() if p.requires_grad and n.endswith(".gate")]
         
+        # 兼容 SoRA 的官方实现限制 (动态修正为 0.1 阻值)
+        sora_wd = 0.1 if weight_decay == 0.01 else weight_decay
+
         optimizer = AdamW([
             {"params": _non_gate_peft, "lr": lr},
             {"params": _non_gate_head, "lr": head_lr_val}
-        ], weight_decay=weight_decay)
+        ], weight_decay=sora_wd)
         sparse_optimizer = SparseAdamW(_gate, lr=lr, sparse_lambda=sora_sparse_lambda_2, weight_decay=0.0)
     else:
         _peft_params = [p for n, p in model.named_parameters() if p.requires_grad and not any(k in n for k in ["classifier", "score", "lm_head", "shared"])]
@@ -1290,24 +1293,28 @@ def run_training_loop(
     elif task_type == "nlg":
         val_metric_key_str = "rougeL"
 
+    try:
+        rank_dist = _collect_rank_distribution(model, method_name, controller, args.target_rank)
+        final_avg_active_rank = rank_dist["summary"]["avg_rank"]
+    except Exception:
+        final_avg_active_rank = "N/A"
+
     result = {
         "method": method_name,
-        "best_val_accuracy": best_val_acc,
-        "rouge1": rouge1_val if task_type == "nlg" else "N/A",
-        "rouge2": rouge2_val if task_type == "nlg" else "N/A",
         "total_train_time_sec": total_time,
         "peak_memory_mb": peak_mem_mb,
-        "avg_active_rank": (
-            float(
-                sum(layer.get_active_rank() for layer in controller.layers.values())
-                / max(len(controller.layers), 1)
-            )
-            if method_name == "evorank" and controller is not None
-            else "N/A"
-        ),
+        "avg_active_rank": final_avg_active_rank,
         "artifact_dir": artifact_dir_str,
         "final_dir": final_dir_str,
         "val_metric_key": val_metric_key_str,
+        
+        "matthews_corrcoef": best_val_acc if val_metric_key_str == "matthews_corrcoef" else "",
+        "accuracy": best_val_acc if val_metric_key_str == "accuracy" else "",
+        "f1": best_val_acc if val_metric_key_str == "f1" else "",
+        "pearson_spearman_mean": best_val_acc if val_metric_key_str == "pearson_spearman_mean" else "",
+        "rouge1": rouge1_val if task_type == "nlg" else "",
+        "rouge2": rouge2_val if task_type == "nlg" else "",
+        "rougeL": best_val_acc if val_metric_key_str == "rougeL" else "",
     }
     return result
 
@@ -1577,45 +1584,34 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
                 # 多种子聚合：追加均值/标准差汇总行
                 if args.is_main_process and len(seed_results) > 1:
-                    metric_vals = [
-                        r["best_val_accuracy"]
-                        for r in seed_results
-                        if isinstance(r["best_val_accuracy"], float)
-                    ]
-                    rouge1_vals: List[float] = []
-                    rouge2_vals: List[float] = []
-                    if args.task_type == "nlg":
-                        rouge1_vals = [
-                            float(r["rouge1"])
+                    metric_keys = ["matthews_corrcoef", "accuracy", "f1", "pearson_spearman_mean", "rouge1", "rouge2", "rougeL"]
+                    
+                    mean_row = dict(seed_results[0])
+                    std_row = dict(seed_results[0])
+                    mean_row["seed"] = "mean"
+                    std_row["seed"] = "std"
+
+                    for m_key in metric_keys:
+                        vals = [
+                            float(r[m_key])
                             for r in seed_results
-                            if isinstance(r.get("rouge1"), (int, float))
+                            if m_key in r and isinstance(r[m_key], (int, float)) and not isinstance(r[m_key], bool)
                         ]
-                        rouge2_vals = [
-                            float(r["rouge2"])
-                            for r in seed_results
-                            if isinstance(r.get("rouge2"), (int, float))
-                        ]
-                    if metric_vals:
-                        mean_row = dict(seed_results[0])
-                        mean_row["seed"] = "mean"
-                        mean_row["best_val_accuracy"] = statistics.mean(metric_vals)
-                        std_row = dict(seed_results[0])
-                        std_row["seed"] = "std"
-                        std_row["best_val_accuracy"] = statistics.stdev(metric_vals) if len(metric_vals) > 1 else 0.0
-                        if args.task_type == "nlg" and rouge1_vals:
-                            mean_row["rouge1"] = statistics.mean(rouge1_vals)
-                            std_row["rouge1"] = statistics.stdev(rouge1_vals) if len(rouge1_vals) > 1 else 0.0
-                        if args.task_type == "nlg" and rouge2_vals:
-                            mean_row["rouge2"] = statistics.mean(rouge2_vals)
-                            std_row["rouge2"] = statistics.stdev(rouge2_vals) if len(rouge2_vals) > 1 else 0.0
-                        # 清空不适合聚合的字段
-                        for row in (mean_row, std_row):
-                            row["artifact_dir"] = ""
-                            row["final_dir"] = ""
-                            row["peak_memory_mb"] = ""
-                            row["total_train_time_sec"] = ""
-                            row["avg_active_rank"] = ""
-                        all_results.extend([mean_row, std_row])
+                        if vals:
+                            mean_row[m_key] = statistics.mean(vals)
+                            std_row[m_key] = statistics.stdev(vals) if len(vals) > 1 else 0.0
+                        else:
+                            mean_row[m_key] = ""
+                            std_row[m_key] = ""
+                            
+                    # 清空不适合聚合的字段
+                    for row in (mean_row, std_row):
+                        row["artifact_dir"] = ""
+                        row["final_dir"] = ""
+                        row["peak_memory_mb"] = ""
+                        row["total_train_time_sec"] = ""
+                        row["avg_active_rank"] = ""
+                    all_results.extend([mean_row, std_row])
 
     if args.is_main_process:
         with open(args.export_csv, "w", newline="", encoding="utf-8") as f:
@@ -1628,9 +1624,13 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "seed",
                     "val_metric_key",
                     "trainable_params",
-                    "best_val_accuracy",
+                    "matthews_corrcoef",
+                    "accuracy",
+                    "f1",
+                    "pearson_spearman_mean",
                     "rouge1",
                     "rouge2",
+                    "rougeL",
                     "peak_memory_mb",
                     "avg_active_rank",
                     "total_train_time_sec",
@@ -1681,7 +1681,7 @@ if __name__ == "__main__":
                 mk = (results[0].get("val_metric_key") or "").strip()
                 if mk:
                     print(
-                        f"[summary] 验证主指标日志键为 val_{mk}；CSV 列名仍为 best_val_accuracy（存同一数值）。"
+                        f"[summary] 验证主指标日志键为 val_{mk}；该值已落入 CSV 对应列。"
                     )
             print("\n=== Benchmark Summary ===")
             print(
@@ -1691,14 +1691,20 @@ if __name__ == "__main__":
             for r in results:
                 ar = r["avg_active_rank"]
                 ar_fmt = f"{float(ar):.4f}" if isinstance(ar, float) else str(ar)
+                
+                eval_key = r.get("val_metric_key", "")
+                best_val = r.get(eval_key, 0.0) if eval_key else 0.0
+                if best_val == "" or best_val == "N/A":
+                    best_val = 0.0
+
                 print(
                     f"{r.get('task', args.task_name):<8} "
                     f"{r.get('backbone', args.model_name):<16} "
                     f"{r['method']:<12} "
-                    f"{r['best_val_accuracy']:<12.4f} "
-                    f"{r['peak_memory_mb']:<12.2f} "
+                    f"{float(best_val):<12.4f} "
+                    f"{r.get('peak_memory_mb', 0.0):<12.2f} "
                     f"{ar_fmt:<10} "
-                    f"{r['total_train_time_sec']:<10.2f}"
+                    f"{r.get('total_train_time_sec', 0.0):<10.2f}"
                 )
     finally:
         if args.ddp_enabled and dist.is_available() and dist.is_initialized():
