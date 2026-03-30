@@ -479,6 +479,7 @@ def peft_factory(
             lora_alpha=effective_alpha,
             lora_dropout=0.1,
             target_modules=target_modules,
+            modules_to_save=modules_to_save,
             bias="none",
             use_rslora=lora_ga_use_rslora,
         )

@@ -479,6 +479,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 - CSV 导出：
   - `--export_csv <file.csv>`
   - 默认字段：`task/backbone/method/seed/val_metric_key/trainable_params/matthews_corrcoef/accuracy/f1/pearson_spearman_mean/rouge1/rouge2/rougeL/peak_memory_mb/avg_active_rank/total_train_time_sec/artifact_dir/final_dir`（每个任务只会向其所属的官方评价指标列写入数值，其余为空列。`--seed_list` 多种子时追加 `mean`/`std` 行，自动聚合所有激活的指标行）
+  - **`trainable_params`**：`DictFeatureClassifier` 下 `requires_grad=True` 的参数总元素数。**不同 method 本就不必相同**：例如 AdaLoRA 默认 `init_r=2×target_r`、EvoRank 使用 **`r_max=16`** 的秩超空间而活跃秩为 `r_init=target_rank`；SoRA 每层多 **`gate`**（`1×r`）；RoBERTa 上 LoRA 与 LoRA-GA 在相同 `r` 与 `modules_to_save` 下应一致。**严格同预算可比时需自行统一秩与模块集合**（如把 EvoRank 的 `r_max` 与 `--target_rank` 对齐）。
 - **训练产物目录**（与 TensorBoard 的 `--log_dir` 相互独立）：
   - `--output_dir`：默认 `artifacts`；每个 `task×backbone×method` 会在其下创建子目录，例如 `artifacts/sst2_roberta-base_lora/`。
   - `--no_output_dir`：关闭该目录下所有落盘（不写 `metrics.jsonl`、checkpoint、`final/`）。
