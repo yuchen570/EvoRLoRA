@@ -374,7 +374,7 @@ def peft_factory(
     if task_type == "nlu":
         modules_to_save = ["classifier", "score"]
     else:
-        modules_to_save = ["lm_head", "shared"]
+        modules_to_save = None
 
     if method_name == "lora":
         config = LoraConfig(
@@ -838,6 +838,7 @@ def run_training_loop(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
+            find_unused_parameters=True,
         )
     head_lr_val = head_lr if head_lr is not None else max(lr, 5e-4)
 
