@@ -572,7 +572,7 @@ python run_benchmark.py \
   --nlg_dataset_name xsum \
   --task_name xsum \
   --model_name facebook/bart-large \
-  --methods lora adalora evorank \
+  --methods lora adalora lora-ga sora evorank \
   --target_rank 8 \
   --lora_alpha 32 \
   --target_modules q_proj,k_proj,v_proj,out_proj,fc1,fc2 \
@@ -585,6 +585,8 @@ python run_benchmark.py \
   --weight_decay 0.01 \
   --warmup_ratio 0.06 \
   --max_grad_norm 0.1 \
+  --lora_ga_batches 4 \
+  --sora_sparse_lambda 1e-3 \
   --seed 42 \
   --log_dir runs/xsum \
   --output_dir artifacts \
@@ -601,7 +603,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --nlg_dataset_name xsum \
   --task_name xsum \
   --model_name facebook/bart-large \
-  --methods lora adalora evorank \
+  --methods lora adalora lora-ga sora evorank \
   --target_rank 8 \
   --lora_alpha 32 \
   --target_modules q_proj,k_proj,v_proj,out_proj,fc1,fc2 \
@@ -614,6 +616,8 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --weight_decay 0.01 \
   --warmup_ratio 0.06 \
   --max_grad_norm 0.1 \
+  --lora_ga_batches 4 \
+  --sora_sparse_lambda 1e-3 \
   --seed 42 \
   --log_dir runs/xsum_ddp \
   --output_dir artifacts \
@@ -660,7 +664,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
-  --methods lora adalora sora evorank \
+  --methods lora adalora lora-ga sora evorank \
   --task_list sst2 mnli qnli qqp \
   --model_list microsoft/deberta-v3-base \
   --target_rank 8 \
@@ -672,7 +676,8 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --weight_decay 0.1 \
   --warmup_ratio 0.06 \
   --max_grad_norm 0.1 \
-  --sora_sparse_lambda 10 \
+  --sora_sparse_lambda 3e-4 \
+  --lora_ga_batches 8 \
   --seed_list 0 21 42 81 100 \
   --log_dir runs/deberta_glue_large_ddp \
   --output_dir artifacts \
@@ -687,7 +692,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
-  --methods lora adalora sora evorank \
+  --methods lora adalora lora-ga sora evorank \
   --task_list cola mrpc stsb rte wnli \
   --model_list microsoft/deberta-v3-base \
   --target_rank 8 \
@@ -699,7 +704,8 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --weight_decay 0.1 \
   --warmup_ratio 0.06 \
   --max_grad_norm 0.1 \
-  --sora_sparse_lambda 10 \
+  --sora_sparse_lambda 3e-4 \
+  --lora_ga_batches 8 \
   --seed_list 0 21 42 81 100 \
   --log_dir runs/deberta_glue_small_ddp \
   --output_dir artifacts \
