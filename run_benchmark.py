@@ -432,11 +432,16 @@ def peft_factory(
         except Exception:
             _adalora_field_names = set()
         if "orth_reg_weight" in _adalora_field_names:
+            tgt_orth = float(adalora_orth_reg_weight)
             if planned_steps < 10000:
-                # 对极小数据集移除正交惩罚，因为任何惩罚都可能让它还没学到特征就陷入大多数类的局部最优
-                adalora_kw["orth_reg_weight"] = 0.0
-            else:
-                adalora_kw["orth_reg_weight"] = float(adalora_orth_reg_weight)
+                # 对极小数据集移除正交惩罚，采用极小值 1e-8 以满足 PEFT 底层不能 <=0 的硬性断言要求
+                tgt_orth = 1e-8
+            
+            if tgt_orth <= 0:
+                print("Warning: PEFT AdaLoRA requires orth_reg_weight > 0. Clamping to 1e-8 to avoid crash.")
+                tgt_orth = 1e-8
+                
+            adalora_kw["orth_reg_weight"] = tgt_orth
         config = AdaLoraConfig(**adalora_kw)
         model = get_peft_model(model, config)
 
