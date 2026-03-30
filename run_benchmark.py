@@ -432,7 +432,11 @@ def peft_factory(
         except Exception:
             _adalora_field_names = set()
         if "orth_reg_weight" in _adalora_field_names:
-            adalora_kw["orth_reg_weight"] = float(adalora_orth_reg_weight)
+            if planned_steps < 10000:
+                # 对极小数据集移除正交惩罚，因为任何惩罚都可能让它还没学到特征就陷入大多数类的局部最优
+                adalora_kw["orth_reg_weight"] = 0.0
+            else:
+                adalora_kw["orth_reg_weight"] = float(adalora_orth_reg_weight)
         config = AdaLoraConfig(**adalora_kw)
         model = get_peft_model(model, config)
 
@@ -847,8 +851,13 @@ def run_training_loop(
         _peft_params = [p for n, p in model.named_parameters() if p.requires_grad and not any(k in n for k in ["classifier", "score", "lm_head", "shared"])]
         _head_params = [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in ["classifier", "score", "lm_head", "shared"])]
         
+        # LoRA-GA 完全依靠 A、B 矩阵精准抵消基础权重中巨大的负向偏移。
+        # 权重衰减会压缩 A、B 矩阵，瞬间破坏这种脆弱的平衡并损坏模型。
+        # 因此，LoRA-GA 参数的 weight_decay 必须设为 0.0，分类头可以保留权重衰减。
+        dynamic_wd_peft = 0.0 if method_name == "lora-ga" else weight_decay
+
         optimizer = AdamW([
-            {"params": _peft_params, "lr": lr},
+            {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
             {"params": _head_params, "lr": head_lr_val}
         ], weight_decay=weight_decay)
         sparse_optimizer = None
@@ -1453,6 +1462,22 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
             planned_total_steps = (
                 args.max_train_steps if args.max_train_steps is not None else args.epochs * len(train_loader)
             )
+
+            current_sora_lambda_schedule = args.sora_lambda_schedule
+            current_sora_sparse_lambda_2 = args.sora_sparse_lambda_2
+            current_lora_ga_batches = args.lora_ga_batches
+            current_lora_ga_stable_gamma = args.lora_ga_stable_gamma
+
+            if planned_total_steps < 10000:
+                if current_sora_lambda_schedule is None:
+                    current_sora_lambda_schedule = "linear"
+                if current_sora_sparse_lambda_2 >= 1e-3:
+                    current_sora_sparse_lambda_2 = 1e-4
+                if current_lora_ga_batches < 32:
+                    current_lora_ga_batches = min(32, len(train_loader) if len(train_loader) > 0 else 32)
+                if current_lora_ga_stable_gamma is None:
+                    pass
+
             for method in args.methods:
                 seed_results: List[Dict[str, Any]] = []
                 for seed in seeds:
@@ -1476,7 +1501,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         adalora_tfinal=args.adalora_tfinal,
                         adalora_orth_reg_weight=args.adalora_orth_reg_weight,
                         train_loader=train_loader,
-                        lora_ga_batches=args.lora_ga_batches,
+                        lora_ga_batches=current_lora_ga_batches,
                         task_type=args.task_type,
                         lora_ga_device=lora_ga_dev,
                         is_main_process=args.is_main_process,
@@ -1485,7 +1510,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         lora_alpha=args.lora_alpha,
                         target_modules_override=args.target_modules,
                         lora_ga_use_rslora=args.lora_ga_use_rslora,
-                        lora_ga_stable_gamma=args.lora_ga_stable_gamma,
+                        lora_ga_stable_gamma=current_lora_ga_stable_gamma,
                     )
                     checkpoint_root: Optional[str] = None
                     if not args.no_output_dir:
@@ -1525,9 +1550,9 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         random_seed=seed,
                         val_loader_eval_full=val_loader_eval_full,
                         sora_sparse_lambda=args.sora_sparse_lambda,
-                        sora_sparse_lambda_2=args.sora_sparse_lambda_2,
+                        sora_sparse_lambda_2=current_sora_sparse_lambda_2,
                         sora_lambda_warmup_steps=args.sora_lambda_warmup_steps,
-                        sora_lambda_schedule=args.sora_lambda_schedule,
+                        sora_lambda_schedule=current_sora_lambda_schedule,
                         sora_max_lambda=args.sora_max_lambda,
                         sora_lambda_num=args.sora_lambda_num,
                         task_name=task_name,

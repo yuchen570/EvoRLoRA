@@ -65,6 +65,7 @@ def estimate_lora_ga_init_tensors(model, data_loader, target_modules, lora_r, lo
             else:
                 raise ValueError(task_type)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_([w], max_norm=1.0)
             if w.grad is None:
                 raise RuntimeError("LoRA-GA: no grad for " + full_name)
             grad_sum += w.grad.detach()
@@ -78,16 +79,16 @@ def estimate_lora_ga_init_tensors(model, data_loader, target_modules, lora_r, lo
         r = min(lora_r, S.numel())
         if r < 1:
             raise RuntimeError("LoRA-GA: r < 1")
-        sqrt_s = torch.sqrt(torch.clamp(S[:r], min=0.0))
         if stable_gamma is not None:
-            # stable init: scale A/B so that ||B @ A||_F ≈ gamma * ||W||_F / sqrt(r)
-            # Following LoRA-GA official: lora_B = U[:, :r], lora_A = Vh[:r, :] * (gamma / sqrt(r))
+            # SVD stable initialization according to official LoRA-GA (dumps S to prevent gradient noise)
             gamma = float(stable_gamma)
-            w_norm = torch.linalg.norm(linear.weight.detach().cpu().float())
-            scale = gamma * w_norm / (math.sqrt(r) * max(float(S[0]), 1e-8))
+            m, _ = G.shape  # output features dimension
+            scale = (m ** 0.25) / (gamma ** 0.5)
             lora_B = (U[:, :r] * scale).to(dtype=w.dtype)
-            lora_A = Vh[:r, :].to(dtype=w.dtype)
+            lora_A = (Vh[:r, :] * scale).to(dtype=w.dtype)
         else:
+            # Fallback to standard SVD weighting if scaling isn't specified
+            sqrt_s = torch.sqrt(torch.clamp(S[:r], min=0.0))
             lora_B = (U[:, :r] * sqrt_s.unsqueeze(0)).to(dtype=w.dtype)
             lora_A = (sqrt_s.unsqueeze(1) * Vh[:r, :]).to(dtype=w.dtype)
         result[full_name] = (lora_A.contiguous(), lora_B.contiguous())
@@ -117,11 +118,28 @@ def apply_lora_ga_init_to_peft(peft_model, init_by_key, target_device):
             adapter = "default" if "default" in lora_A else next(iter(lora_A.keys()))
             la, lb = lora_A[adapter], lora_B[adapter]
         else:
+            adapter = "default"
             la, lb = lora_A, lora_B
+            
         if not hasattr(la, "weight") or not hasattr(lb, "weight"):
             continue
+            
         la.weight.data.copy_(A_cpu.to(device=target_device, dtype=la.weight.dtype))
         lb.weight.data.copy_(B_cpu.to(device=target_device, dtype=lb.weight.dtype))
+        
+        # --- Base Weight Compensation (Essential to prevent representation collapse) ---
+        if hasattr(module, "base_layer") and hasattr(module.base_layer, "weight"):
+            base_weight = module.base_layer.weight
+            scaling = 1.0
+            if hasattr(module, "scaling") and adapter in module.scaling:
+                scaling = module.scaling[adapter]
+                
+            A_f32 = A_cpu.to(device=target_device, dtype=torch.float32)
+            B_f32 = B_cpu.to(device=target_device, dtype=torch.float32)
+            offset = (B_f32 @ A_f32) * float(scaling)
+            
+            base_weight.data.sub_(offset.to(dtype=base_weight.dtype))
+            
         applied += 1
     if applied == 0:
         raise RuntimeError("LoRA-GA: no PEFT layer updated")
