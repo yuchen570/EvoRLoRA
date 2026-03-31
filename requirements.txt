@@ -8,3 +8,8 @@ scipy>=1.11.0
 wandb>=0.17.0
 evaluate>=0.4.0
 
+# NLP Tokenizers & Metrics Dependencies
+sentencepiece>=0.2.0
+tiktoken>=0.7.0
+protobuf>=4.25.0
+rouge_score>=0.1.2
