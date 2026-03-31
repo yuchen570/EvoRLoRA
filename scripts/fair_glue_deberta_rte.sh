@@ -2,11 +2,9 @@
 # ============================================================================
 # 公平对比: RTE 单任务 × DeBERTa-v3-base × 全方法
 # ----------------------------------------------------------------------------
-# RTE 是极小数据集 (2.5k 训练样本), 需要更多训练轮数与更大学习率.
-# 参考:
-#   - SoRA (run_glue_sora_schedule_dense.sh): lr=1.2e-3, epochs=50, bsz=32
-#   - AdaLoRA (run_debertav3_rte.sh): lr=1.2e-3, epochs=50, bsz=32
-# 两者在 RTE 上完全一致的超参, 直接采用统一配置.
+# RTE 是极小数据集 (2.5k 训练样本)。
+# 实测在统一大 lr (1.2e-3) 下 LoRA 会早期出现 NaN，导致验证恒定预测。
+# 这里改为跨方法统一且稳定的 lr=2e-4 做公平横向对比。
 # ============================================================================
 mkdir -p logs runs artifacts
 
@@ -22,7 +20,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29510 \
   --epochs 50 \
   --batch_size 32 \
   --max_length 320 \
-  --lr 1.2e-3 \
+  --lr 2e-4 \
   --warmup_ratio 0.06 \
   --weight_decay 0.1 \
   --max_grad_norm 0.1 \

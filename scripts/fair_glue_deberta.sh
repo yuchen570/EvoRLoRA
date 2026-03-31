@@ -10,6 +10,7 @@
 #   - LoRA-GA (reproduce): lora_alpha=16, stable_gamma=16, use_rslora=false
 #
 # 公平原则: 同 lr / epochs / batch_size / warmup / weight_decay / grad_norm / seed
+# 注：为避免 LoRA 在 DeBERTa+CoLA 上出现 NaN，本脚本统一使用更稳定的 2e-4。
 # 方法特有参数 (adalora_*, sora_*, lora_ga_*) 仅作为该方法的内部自由度
 # ============================================================================
 mkdir -p logs runs artifacts
@@ -26,7 +27,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --epochs 20 \
   --batch_size 32 \
   --max_length 128 \
-  --lr 8e-4 \
+  --lr 2e-4 \
   --warmup_ratio 0.06 \
   --weight_decay 0.1 \
   --max_grad_norm 0.1 \
