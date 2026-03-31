@@ -372,7 +372,7 @@ def peft_factory(
     controller: Optional[RankEvolutionController] = None
 
     if task_type == "nlu":
-        modules_to_save = ["classifier", "score"]
+        modules_to_save = ["classifier", "score", "pooler"]
     else:
         modules_to_save = None
 
@@ -498,11 +498,6 @@ def peft_factory(
             r=target_rank,
             lora_alpha=effective_alpha,
             lora_dropout=0.1,
-        )
-
-    elif method_name == "mtl-lora":
-        raise NotImplementedError(
-            "mtl-lora 需联合多任务数据与 task id；当前 --task_list 为逐任务串行。见 README / MTL-LoRA 官方仓库。"
         )
     else:
         raise ValueError(f"未知 method_name: {method_name}")
@@ -931,8 +926,8 @@ def run_training_loop(
 
     if method_name == "sora":
         # 官方 SoRA：gate 参数使用独立的 SparseAdamW（近端梯度），其余参数使用标准 AdamW。
-        _non_gate_peft = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate") and not any(k in n for k in ["classifier", "score", "lm_head", "shared"])]
-        _non_gate_head = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate") and any(k in n for k in ["classifier", "score", "lm_head", "shared"])]
+        _non_gate_peft = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate") and not any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
+        _non_gate_head = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate") and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
         _gate = [p for n, p in model.named_parameters() if p.requires_grad and n.endswith(".gate")]
         
         # 兼容 SoRA 的官方实现限制 (动态修正为 0.1 阻值)
@@ -944,8 +939,8 @@ def run_training_loop(
         ], weight_decay=sora_wd)
         sparse_optimizer = SparseAdamW(_gate, lr=lr, sparse_lambda=sora_sparse_lambda_2, weight_decay=0.0)
     else:
-        _peft_params = [p for n, p in model.named_parameters() if p.requires_grad and not any(k in n for k in ["classifier", "score", "lm_head", "shared"])]
-        _head_params = [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in ["classifier", "score", "lm_head", "shared"])]
+        _peft_params = [p for n, p in model.named_parameters() if p.requires_grad and not any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
+        _head_params = [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
         
         # LoRA-GA 完全依靠 A、B 矩阵精准抵消基础权重中巨大的负向偏移。
         # 权重衰减会压缩 A、B 矩阵，瞬间破坏这种脆弱的平衡并损坏模型。
