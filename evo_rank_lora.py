@@ -91,9 +91,9 @@ class EvoRankLoRALayer(nn.Module):
         
         # 仅截取激活维度的向量:
         # lora_A.weight 形状: (r_max, in_features)
-        A_active = self.lora_A.weight[active_indices, :]  
+        A_active = self.lora_A.weight[active_indices, :].to(x.dtype)
         # lora_B.weight 形状: (out_features, r_max)
-        B_active = self.lora_B.weight[:, active_indices]  
+        B_active = self.lora_B.weight[:, active_indices].to(x.dtype)
         
         # 计算低秩投影
         out = x @ A_active.T @ B_active.T
@@ -244,8 +244,8 @@ class EvoRankLoRALayer(nn.Module):
             return
             
         active_indices = self.get_active_indices()
-        A_active = self.lora_A.weight[active_indices, :]  
-        B_active = self.lora_B.weight[:, active_indices]  
+        A_active = self.lora_A.weight[active_indices, :].to(W.dtype)
+        B_active = self.lora_B.weight[:, active_indices].to(W.dtype)
         scaling = self.get_scaling_factor(len(active_indices))
         
         delta_W = (B_active @ A_active) * scaling
