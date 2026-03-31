@@ -19,7 +19,7 @@ python run_benchmark.py \
   --weight_decay 0.1 \
   --max_grad_norm 0.1 \
   --T_es 20 \
-  --adalora_delta_t 50 \
+  --adalora_delta_t 10 \
   --adalora_orth_reg_weight 0.1 \
   --lora_ga_batches 4 \
   --lora_ga_stable_gamma 16 \

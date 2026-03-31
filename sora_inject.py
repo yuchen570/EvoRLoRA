@@ -23,9 +23,9 @@ class SoRALinear(nn.Module):
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.lora_dropout(x) @ self.lora_A.T
-        h = h * self.gate
-        delta = (h @ self.lora_B.T) * self.scaling
+        h = self.lora_dropout(x) @ self.lora_A.to(dtype=x.dtype).T
+        h = h * self.gate.to(dtype=x.dtype)
+        delta = (h @ self.lora_B.to(dtype=x.dtype).T) * self.scaling
         return self.base_layer(x) + delta
 
 def inject_sora(model: nn.Module, target_modules: List[str], r: int, lora_alpha: float, lora_dropout: float = 0.1) -> None:
