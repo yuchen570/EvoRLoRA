@@ -54,6 +54,23 @@ GLUE_TASK_SENTENCE_KEYS: Dict[str, Tuple[str, Optional[str]]] = {
 GLUE_REGRESSION_TASKS = frozenset({"stsb"})
 
 
+def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    payload = {
+        "sessionId": "a6bd12",
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open("debug-a6bd12.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
+
+
 def glue_nlu_train_val_splits(dataset, task_name: str) -> Tuple[str, str]:
     """
     返回 (train_split, val_split)。
@@ -244,6 +261,29 @@ def setup_data_and_model(
                 num_labels=num_labels,
                 cache_dir=model_cache_dir,
             )
+        if rank == 0 and task_name in {"cola", "rte"}:
+            train_labels = dataset[train_split]["label"]
+            val_labels = dataset[val_split]["label"]
+            train_dist = {str(int(k)): int(sum(1 for x in train_labels if int(x) == int(k))) for k in sorted(set(train_labels))}
+            val_dist = {str(int(k)): int(sum(1 for x in val_labels if int(x) == int(k))) for k in sorted(set(val_labels))}
+            # region agent log
+            _debug_log(
+                run_id=f"{task_name}-setup-seed{seed}",
+                hypothesis_id="H2",
+                location="run_benchmark.py:setup_data_and_model",
+                message="glue_label_distribution",
+                data={
+                    "task": task_name,
+                    "train_split": train_split,
+                    "val_split": val_split,
+                    "train_size": len(train_labels),
+                    "val_size": len(val_labels),
+                    "train_label_dist": train_dist,
+                    "val_label_dist": val_dist,
+                    "num_labels": int(getattr(base_model.config, "num_labels", -1)),
+                },
+            )
+            # endregion
         return train_loader, val_loader, val_loader_eval_full, base_model, tokenizer
 
     if task_type == "nlg":
@@ -952,6 +992,24 @@ def run_training_loop(
             {"params": _head_params, "lr": head_lr_val}
         ], weight_decay=weight_decay)
         sparse_optimizer = None
+    if is_main_process and method_name == "lora" and task_name in {"cola", "rte"}:
+        # region agent log
+        _debug_log(
+            run_id=f"{task_name}-{method_name}-seed{random_seed}-opt",
+            hypothesis_id="H1",
+            location="run_benchmark.py:run_training_loop",
+            message="optimizer_param_groups",
+            data={
+                "task": task_name,
+                "method": method_name,
+                "peft_params": int(sum(p.numel() for p in _peft_params)) if method_name != "sora" else int(sum(p.numel() for p in _non_gate_peft)),
+                "head_params": int(sum(p.numel() for p in _head_params)) if method_name != "sora" else int(sum(p.numel() for p in _non_gate_head)),
+                "trainable_params_total": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
+                "lr": float(lr),
+                "head_lr": float(head_lr_val),
+            },
+        )
+        # endregion
     if task_type == "nlu":
         if nlu_is_glue_regression(task_name):
 
@@ -976,6 +1034,7 @@ def run_training_loop(
 
     total_train_steps = max_train_steps if max_train_steps is not None else epochs * len(train_loader)
     warmup_steps = int(total_train_steps * warmup_ratio)
+    debug_steps = {0, min(99, max(total_train_steps - 1, 0)), max(total_train_steps - 1, 0)}
     lr_scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=warmup_steps,
@@ -1089,6 +1148,48 @@ def run_training_loop(
                     torch.nn.utils.clip_grad_norm_(
                         [p for p in model.parameters() if p.requires_grad], max_grad_norm
                     )
+                if (
+                    is_main_process
+                    and method_name == "lora"
+                    and task_name in {"cola", "rte"}
+                    and global_step in debug_steps
+                ):
+                    head_norm = None
+                    head_grad_norm = None
+                    lora_norm = None
+                    lora_grad_norm = None
+                    for n, p in model.named_parameters():
+                        if head_norm is None and any(k in n for k in ["classifier.weight", "score.weight", "pooler.dense.weight"]):
+                            head_norm = float(p.detach().norm().item())
+                            if p.grad is not None:
+                                head_grad_norm = float(p.grad.detach().norm().item())
+                        if lora_norm is None and ("lora_A" in n or "lora_B" in n):
+                            lora_norm = float(p.detach().norm().item())
+                            if p.grad is not None:
+                                lora_grad_norm = float(p.grad.detach().norm().item())
+                        if head_norm is not None and lora_norm is not None:
+                            break
+                    label_vals, label_counts = labels.detach().cpu().unique(return_counts=True)
+                    # region agent log
+                    _debug_log(
+                        run_id=f"{task_name}-{method_name}-seed{random_seed}-train",
+                        hypothesis_id="H1",
+                        location="run_benchmark.py:train_step",
+                        message="train_step_snapshot",
+                        data={
+                            "task": task_name,
+                            "global_step": int(global_step),
+                            "loss": float(loss.detach().item()),
+                            "logits_mean": float(logits.detach().float().mean().item()),
+                            "logits_std": float(logits.detach().float().std().item()),
+                            "batch_label_dist": {str(int(k.item())): int(v.item()) for k, v in zip(label_vals, label_counts)},
+                            "head_norm": head_norm,
+                            "head_grad_norm": head_grad_norm,
+                            "lora_norm": lora_norm,
+                            "lora_grad_norm": lora_grad_norm,
+                        },
+                    )
+                    # endregion
                 if method_name == "sora":
                     # 防止 gate 梯度中的 NaN/Inf 传入优化器状态，导致后续参数全 NaN。
                     for n, p in model.named_parameters():
@@ -1168,6 +1269,30 @@ def run_training_loop(
                 y_pred, y_true = collect_nlu_predictions(eval_model, ev_loader, device, regression=regression)
                 val_metric = compute_glue_primary_metric(task_name, y_pred, y_true)
                 metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred, y_true)
+                if method_name == "lora" and task_name in {"cola", "rte"} and epoch in {0, epochs - 1}:
+                    pred_list = [int(x) for x in y_pred.reshape(-1).tolist()]
+                    true_list = [int(x) for x in y_true.reshape(-1).tolist()]
+                    pred_dist = {str(k): int(sum(1 for x in pred_list if x == k)) for k in sorted(set(pred_list))}
+                    true_dist = {str(k): int(sum(1 for x in true_list if x == k)) for k in sorted(set(true_list))}
+                    # region agent log
+                    _debug_log(
+                        run_id=f"{task_name}-{method_name}-seed{random_seed}-eval",
+                        hypothesis_id="H3",
+                        location="run_benchmark.py:nlu_eval",
+                        message="eval_prediction_distribution",
+                        data={
+                            "task": task_name,
+                            "epoch": int(epoch + 1),
+                            "global_step": int(global_step),
+                            "metric_key": mkey,
+                            "metric_value": float(val_metric),
+                            "pred_dist": pred_dist,
+                            "true_dist": true_dist,
+                            "sample_preds": pred_list[:16],
+                            "sample_true": true_list[:16],
+                        },
+                    )
+                    # endregion
             if ddp_enabled and dist.is_available() and dist.is_initialized():
                 m_tensor = torch.tensor([val_metric], device=device, dtype=torch.float64)
                 dist.broadcast(m_tensor, src=0)
