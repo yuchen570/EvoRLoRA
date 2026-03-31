@@ -23,8 +23,9 @@ python run_benchmark.py \
   --adalora_orth_reg_weight 0.1 \
   --lora_ga_batches 4 \
   --lora_ga_stable_gamma 16 \
-  --sora_sparse_lambda 10 \
+  --sora_sparse_lambda 1e-3 \
   --sora_sparse_lambda_2 3e-4 \
+  --sora_lambda_warmup_steps 50 \
   --seed 42 \
   --log_dir runs/fair_smoke \
   --output_dir artifacts \

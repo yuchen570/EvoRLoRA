@@ -543,6 +543,7 @@ def _collect_rank_distribution(
 
     elif method_name == "adalora":
         extra_info = ""
+        eff_source = "lora_E"
         try:
             for mod in inner.modules():
                 if hasattr(mod, "rankallocator"):
@@ -554,16 +555,33 @@ def _collect_rank_distribution(
         except Exception:
             pass
 
-        # AdaLoRA: lora_E 中非零奇异值个数 = 有效秩
-        for n, p in inner.named_parameters():
-            if "lora_E" in n and p.numel() > 0:
-                eff_r = int((p.data.abs() > 1e-9).sum().item())
-                # 从参数名提取层路径（去掉 .lora_E.default.weight 等后缀）
-                layer_key = n.replace(".lora_E.default.weight", "").replace(".lora_E.weight", "").replace(".lora_E", "")
-                per_layer[layer_key] = eff_r
-        total_capacity = sum(
-            p.numel() for n, p in inner.named_parameters() if "lora_E" in n
-        )
+        # AdaLoRA: 优先使用 peft_config.rank_pattern（更贴近 PEFT 内部的“有效秩”口径）。
+        # 若不可用，再回退到 lora_E 非零计数（在极短步数下可能全 0，容易误读）。
+        try:
+            cfg = getattr(inner, "peft_config", {}).get("default", None)
+            rank_pattern = getattr(cfg, "rank_pattern", None) if cfg is not None else None
+            if isinstance(rank_pattern, dict) and len(rank_pattern) > 0:
+                for k, v in rank_pattern.items():
+                    try:
+                        per_layer[str(k)] = int(v)
+                    except Exception:
+                        continue
+                eff_source = "rank_pattern"
+        except Exception:
+            pass
+
+        if not per_layer:
+            for n, p in inner.named_parameters():
+                if "lora_E" in n and p.numel() > 0:
+                    eff_r = int((p.data.abs() > 1e-9).sum().item())
+                    # 从参数名提取层路径（去掉 .lora_E.default.weight 等后缀）
+                    layer_key = n.replace(".lora_E.default.weight", "").replace(".lora_E.weight", "").replace(".lora_E", "")
+                    per_layer[layer_key] = eff_r
+
+        if eff_source == "rank_pattern":
+            total_capacity = len(per_layer) * max(int(target_rank), 1)
+        else:
+            total_capacity = sum(p.numel() for n, p in inner.named_parameters() if "lora_E" in n)
 
     elif method_name == "sora":
         # SoRA: gate 中非零元素个数 = 有效秩
@@ -603,8 +621,10 @@ def _collect_rank_distribution(
         "total_capacity": total_capacity,
         "base_rank": base_rank,
     }
+    if method_name == "adalora":
+        summary["eff_source"] = eff_source
     if 'extra_info' in locals() and extra_info:
-        summary["extra_string"] = extra_info
+        summary["extra_string"] = extra_info + (f", eff_source={eff_source}" if method_name == "adalora" else "")
 
     return {
         "per_layer": per_layer,

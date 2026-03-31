@@ -1,4 +1,4 @@
-﻿# EvoRank-LoRA
+# EvoRank-LoRA
 
 本仓库实现了一个可演化的 LoRA 框架（EvoRank-LoRA），核心包括：
 
@@ -238,6 +238,11 @@ mkdir -p logs
 ### 1.1) DDP 多卡冒烟测试（torchrun）
 
 在 Linux 多卡上先用极小步数验证：各卡 loss/同步、EvoRank trial、LoRA-GA 的 barrier/broadcast（若包含 `lora-ga`）。
+
+**重要说明（避免误读 `avg_rank=0`）**：
+
+- **SoRA**：若在极短冒烟（例如 `--max_train_steps 50`）里使用论文级强稀疏（如 `--sora_sparse_lambda 10`），gate 很可能被快速压到全 0，从而打印 `gates=0 / avg_rank=0`。这通常是**超参导致的退化**，不代表代码崩溃。冒烟建议用温和系数（如 `1e-3`）并开启 `--sora_lambda_warmup_steps`。
+- **AdaLoRA**：PEFT 内部有效秩有多种口径；本仓库默认优先从 `peft_config.rank_pattern` 读取（若可用），否则回退到 `lora_E` 非零计数。短步数下 `lora_E` 口径可能显示偏低，不建议据此下结论。
 
 **最小三法：**
 
