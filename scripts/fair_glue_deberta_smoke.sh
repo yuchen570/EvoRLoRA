@@ -24,7 +24,7 @@ python run_benchmark.py \
   --lora_ga_batches 4 \
   --lora_ga_stable_gamma 16 \
   --sora_sparse_lambda 1e-3 \
-  --sora_sparse_lambda_2 3e-4 \
+  --sora_sparse_lambda_2 1e-4 \
   --sora_lambda_warmup_steps 50 \
   --seed 42 \
   --log_dir runs/fair_smoke \

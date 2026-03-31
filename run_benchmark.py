@@ -544,6 +544,7 @@ def _collect_rank_distribution(
     elif method_name == "adalora":
         extra_info = ""
         eff_source = "lora_E"
+        rank_pattern_capacity = 0
         try:
             for mod in inner.modules():
                 if hasattr(mod, "rankallocator"):
@@ -566,10 +567,13 @@ def _collect_rank_distribution(
                     try:
                         if isinstance(v, (list, tuple)):
                             parsed_from_rank_pattern[str(k)] = int(sum(bool(x) for x in v))
+                            rank_pattern_capacity += int(len(v))
                         elif torch.is_tensor(v):
                             parsed_from_rank_pattern[str(k)] = int(v.view(-1).sum().item())
+                            rank_pattern_capacity += int(v.numel())
                         else:
                             parsed_from_rank_pattern[str(k)] = int(v)
+                            rank_pattern_capacity += max(int(target_rank), int(v))
                     except Exception:
                         continue
             if parsed_from_rank_pattern:
@@ -587,7 +591,7 @@ def _collect_rank_distribution(
                     per_layer[layer_key] = eff_r
 
         if eff_source == "rank_pattern":
-            total_capacity = len(per_layer) * max(int(target_rank), 1)
+            total_capacity = rank_pattern_capacity if rank_pattern_capacity > 0 else (len(per_layer) * max(int(target_rank), 1))
         else:
             total_capacity = sum(p.numel() for n, p in inner.named_parameters() if "lora_E" in n)
 
@@ -604,6 +608,11 @@ def _collect_rank_distribution(
         total_capacity = sum(
             p.numel() for n, p in inner.named_parameters() if n.endswith(".gate")
         )
+        gate_nan_count = int(sum(
+            torch.isnan(p.detach()).sum().item()
+            for n, p in inner.named_parameters()
+            if n.endswith(".gate")
+        ))
         gate_abs_vals = torch.cat(
             [p.detach().abs().view(-1) for n, p in inner.named_parameters() if n.endswith(".gate") and p.numel() > 0]
         ) if total_capacity > 0 else None
@@ -654,6 +663,7 @@ def _collect_rank_distribution(
             }
     if method_name == "sora":
         summary["gate_abs_stats"] = summary_gate_stats if "summary_gate_stats" in locals() else None
+        summary["gate_nan_count"] = gate_nan_count if "gate_nan_count" in locals() else 0
     if 'extra_info' in locals() and extra_info:
         summary["extra_string"] = extra_info + (f", eff_source={eff_source}" if method_name == "adalora" else "")
 
@@ -726,6 +736,9 @@ def _print_rank_distribution(
                     f"max={gate_stats['max']:.3e} "
                     f"mean={gate_stats['mean']:.3e}"
                 )
+            gate_nan_count = int(summary.get("gate_nan_count", 0))
+            if gate_nan_count > 0:
+                print(f"  [diag] gate contains NaN values: count={gate_nan_count}")
 
 
 def _unwrap_training_module(model: nn.Module) -> nn.Module:
@@ -1081,9 +1094,19 @@ def run_training_loop(
                     torch.nn.utils.clip_grad_norm_(
                         [p for p in model.parameters() if p.requires_grad], max_grad_norm
                     )
+                if method_name == "sora":
+                    # 防止 gate 梯度中的 NaN/Inf 传入优化器状态，导致后续参数全 NaN。
+                    for n, p in model.named_parameters():
+                        if n.endswith(".gate") and p.grad is not None and not torch.isfinite(p.grad).all():
+                            p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
                 optimizer.step()
                 if sparse_optimizer is not None:
                     sparse_optimizer.step()
+                if method_name == "sora":
+                    # 近端更新后再次兜底清洗 gate 参数，避免 NaN 造成 rank 统计全部为 0。
+                    for n, p in model.named_parameters():
+                        if n.endswith(".gate") and not torch.isfinite(p).all():
+                            p.data = torch.nan_to_num(p.data, nan=0.0, posinf=0.0, neginf=0.0)
                 if method_name == "adalora":
                     _adalora_post_step_update(model, global_step)
                 train_loss = float(loss.detach().item())
