@@ -241,8 +241,8 @@ mkdir -p logs
 
 **重要说明（避免误读 `avg_rank=0`）**：
 
-- **SoRA**：若在极短冒烟（例如 `--max_train_steps 50`）里使用论文级强稀疏（如 `--sora_sparse_lambda 10`），gate 很可能被快速压到全 0，从而打印 `gates=0 / avg_rank=0`。这通常是**超参导致的退化**，不代表代码崩溃。冒烟建议用温和系数（如 `1e-3`）并开启 `--sora_lambda_warmup_steps`。
-- **AdaLoRA**：PEFT 内部有效秩有多种口径；本仓库默认优先从 `peft_config.rank_pattern` 读取（若可用），否则回退到 `lora_E` 非零计数。短步数下 `lora_E` 口径可能显示偏低，不建议据此下结论。
+- **SoRA**：若在极短冒烟（例如 `--max_train_steps 50`）里使用论文级强稀疏（如 `--sora_sparse_lambda 10`），gate 很可能被快速压到全 0，从而打印 `gates=0 / avg_rank=0`。这通常是**超参导致的退化**，不代表代码崩溃。冒烟建议用温和系数（如 `1e-3`）并开启 `--sora_lambda_warmup_steps`。当前脚本不会再在短训练时隐式改写 `--sora_lambda_schedule`，若需要 `linear` 调度请显式传参。
+- **AdaLoRA**：PEFT 中 `lora_E` 默认零初始化；在极短训练中，即便 `update_and_allocate` 正常触发，也可能长期显示 `eff_r=0`。本仓库优先从 `peft_config.rank_pattern`（布尔掩码求和）读取有效秩，回退口径才使用 `lora_E` 非零计数。出现 0 时请结合日志里的 `[diag] adalora_config` 一并判断，不建议仅凭单次冒烟结论判定算法失效。
 
 **最小三法：**
 

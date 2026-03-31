@@ -560,12 +560,20 @@ def _collect_rank_distribution(
         try:
             cfg = getattr(inner, "peft_config", {}).get("default", None)
             rank_pattern = getattr(cfg, "rank_pattern", None) if cfg is not None else None
+            parsed_from_rank_pattern: Dict[str, int] = {}
             if isinstance(rank_pattern, dict) and len(rank_pattern) > 0:
                 for k, v in rank_pattern.items():
                     try:
-                        per_layer[str(k)] = int(v)
+                        if isinstance(v, (list, tuple)):
+                            parsed_from_rank_pattern[str(k)] = int(sum(bool(x) for x in v))
+                        elif torch.is_tensor(v):
+                            parsed_from_rank_pattern[str(k)] = int(v.view(-1).sum().item())
+                        else:
+                            parsed_from_rank_pattern[str(k)] = int(v)
                     except Exception:
                         continue
+            if parsed_from_rank_pattern:
+                per_layer.update(parsed_from_rank_pattern)
                 eff_source = "rank_pattern"
         except Exception:
             pass
@@ -596,6 +604,17 @@ def _collect_rank_distribution(
         total_capacity = sum(
             p.numel() for n, p in inner.named_parameters() if n.endswith(".gate")
         )
+        gate_abs_vals = torch.cat(
+            [p.detach().abs().view(-1) for n, p in inner.named_parameters() if n.endswith(".gate") and p.numel() > 0]
+        ) if total_capacity > 0 else None
+        if gate_abs_vals is not None and gate_abs_vals.numel() > 0:
+            summary_gate_stats = {
+                "min": float(gate_abs_vals.min().item()),
+                "max": float(gate_abs_vals.max().item()),
+                "mean": float(gate_abs_vals.mean().item()),
+            }
+        else:
+            summary_gate_stats = None
 
     else:
         # LoRA / LoRA-GA: 固定秩
@@ -623,6 +642,18 @@ def _collect_rank_distribution(
     }
     if method_name == "adalora":
         summary["eff_source"] = eff_source
+        cfg = getattr(inner, "peft_config", {}).get("default", None)
+        if cfg is not None:
+            summary["adalora_config_diag"] = {
+                "init_r": int(getattr(cfg, "init_r", base_rank)),
+                "target_r": int(getattr(cfg, "target_r", target_rank)),
+                "total_step": int(getattr(cfg, "total_step", -1)),
+                "tinit": int(getattr(cfg, "tinit", -1)),
+                "tfinal": int(getattr(cfg, "tfinal", -1)),
+                "deltaT": int(getattr(cfg, "deltaT", -1)),
+            }
+    if method_name == "sora":
+        summary["gate_abs_stats"] = summary_gate_stats if "summary_gate_stats" in locals() else None
     if 'extra_info' in locals() and extra_info:
         summary["extra_string"] = extra_info + (f", eff_source={eff_source}" if method_name == "adalora" else "")
 
@@ -672,6 +703,29 @@ def _print_rank_distribution(
         f"  avg_rank={summary['avg_rank']:.2f}  "
         f"total_active={summary['total_active']}/{summary['total_capacity']}"
     )
+    if float(summary.get("avg_rank", 0.0)) == 0.0:
+        if method_name == "adalora":
+            cfg_diag = summary.get("adalora_config_diag", {})
+            if cfg_diag:
+                print(
+                    "  [diag] adalora_config: "
+                    f"init_r={cfg_diag.get('init_r')} "
+                    f"target_r={cfg_diag.get('target_r')} "
+                    f"total_step={cfg_diag.get('total_step')} "
+                    f"tinit={cfg_diag.get('tinit')} "
+                    f"tfinal={cfg_diag.get('tfinal')} "
+                    f"deltaT={cfg_diag.get('deltaT')}"
+                )
+            print("  [diag] lora_E 在 PEFT AdaLoRA 中零初始化；极短步数可能尚未形成非零有效秩。")
+        elif method_name == "sora":
+            gate_stats = summary.get("gate_abs_stats")
+            if gate_stats is not None:
+                print(
+                    "  [diag] gate|abs| stats: "
+                    f"min={gate_stats['min']:.3e} "
+                    f"max={gate_stats['max']:.3e} "
+                    f"mean={gate_stats['mean']:.3e}"
+                )
 
 
 def _unwrap_training_module(model: nn.Module) -> nn.Module:
@@ -1533,8 +1587,6 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
             current_lora_ga_stable_gamma = args.lora_ga_stable_gamma
 
             if planned_total_steps < 10000:
-                if current_sora_lambda_schedule is None:
-                    current_sora_lambda_schedule = "linear"
                 if current_sora_sparse_lambda_2 >= 1e-3:
                     current_sora_sparse_lambda_2 = 1e-4
                 if current_lora_ga_batches < 32:
