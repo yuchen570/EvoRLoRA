@@ -9,7 +9,7 @@
 # ============================================================================
 mkdir -p logs runs artifacts
 
-nohup torchrun --nproc_per_node=2 --master_port=29500 \
+nohup torchrun --nproc_per_node=2 --master_port=29530 \
   run_benchmark.py \
   --ddp \
   --task_type nlg \

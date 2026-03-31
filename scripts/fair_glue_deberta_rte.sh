@@ -10,7 +10,7 @@
 # ============================================================================
 mkdir -p logs runs artifacts
 
-nohup torchrun --nproc_per_node=2 --master_port=29500 \
+nohup torchrun --nproc_per_node=2 --master_port=29510 \
   run_benchmark.py \
   --ddp \
   --methods lora adalora evorank lora-ga sora \
