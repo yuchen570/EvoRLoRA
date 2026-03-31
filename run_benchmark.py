@@ -32,7 +32,7 @@ from rank_evolution_controller import RankEvolutionController
 from sora_inject import SparseAdamW, inject_sora
 from train_integration import inject_evo_lora, train_evo_lora_step
 
-from glue_metrics import collect_nlu_predictions, compute_glue_primary_metric, glue_primary_metric_key
+from glue_metrics import collect_nlu_predictions, compute_glue_primary_metric, glue_primary_metric_key, compute_glue_metrics_dict
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -935,6 +935,7 @@ def run_training_loop(
     start_time = time.perf_counter()
     global_step = 0
     best_val_acc = 0.0
+    best_val_metrics: Dict[str, float] = {}
     train_loss_ema = None
     ema_beta = 0.95
     rouge1_val: float = 0.0
@@ -1068,17 +1069,24 @@ def run_training_loop(
             val_metric = 0.0
             mkey = glue_primary_metric_key(task_name)
             regression = nlu_is_glue_regression(task_name)
+            metrics_dict_val = {}
             if is_main_process:
                 ev_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
                 eval_model = _unwrap_training_module(model)
                 y_pred, y_true = collect_nlu_predictions(eval_model, ev_loader, device, regression=regression)
                 val_metric = compute_glue_primary_metric(task_name, y_pred, y_true)
+                metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred, y_true)
             if ddp_enabled and dist.is_available() and dist.is_initialized():
                 m_tensor = torch.tensor([val_metric], device=device, dtype=torch.float64)
                 dist.broadcast(m_tensor, src=0)
                 val_metric = float(m_tensor.item())
+                # DDP环境下，这里只广播主指标。字典仅由is_main_process维护！
                 dist.barrier()
-            best_val_acc = max(best_val_acc, val_metric)
+            if val_metric > best_val_acc:
+                best_val_acc = val_metric
+                best_val_metrics = metrics_dict_val
+            elif val_metric == best_val_acc and not best_val_metrics:
+                best_val_metrics = metrics_dict_val
             if is_main_process:
                 print(
                     f"[{method_name}] epoch={epoch + 1}/{epochs} "
@@ -1335,10 +1343,12 @@ def run_training_loop(
         "final_dir": final_dir_str,
         "val_metric_key": val_metric_key_str,
         
-        "matthews_corrcoef": best_val_acc if val_metric_key_str == "matthews_corrcoef" else "",
-        "accuracy": best_val_acc if val_metric_key_str == "accuracy" else "",
-        "f1": best_val_acc if val_metric_key_str == "f1" else "",
-        "pearson_spearman_mean": best_val_acc if val_metric_key_str == "pearson_spearman_mean" else "",
+        "matthews_corrcoef": best_val_metrics.get("matthews_corrcoef", "") if task_type == "nlu" else "",
+        "accuracy": best_val_metrics.get("accuracy", "") if task_type == "nlu" else "",
+        "f1": best_val_metrics.get("f1", "") if task_type == "nlu" else "",
+        "pearson_spearman_mean": best_val_metrics.get("pearson_spearman_mean", "") if task_type == "nlu" else "",
+        "pearson": best_val_metrics.get("pearson", "") if task_type == "nlu" else "",
+        "spearman": best_val_metrics.get("spearman", "") if task_type == "nlu" else "",
         "rouge1": rouge1_val if task_type == "nlg" else "",
         "rouge2": rouge2_val if task_type == "nlg" else "",
         "rougeL": best_val_acc if val_metric_key_str == "rougeL" else "",
@@ -1611,7 +1621,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
                 # 多种子聚合：追加均值/标准差汇总行
                 if args.is_main_process and len(seed_results) > 1:
-                    metric_keys = ["matthews_corrcoef", "accuracy", "f1", "pearson_spearman_mean", "rouge1", "rouge2", "rougeL"]
+                    metric_keys = ["matthews_corrcoef", "accuracy", "f1", "pearson_spearman_mean", "pearson", "spearman", "rouge1", "rouge2", "rougeL"]
                     
                     mean_row = dict(seed_results[0])
                     std_row = dict(seed_results[0])
@@ -1655,6 +1665,8 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "accuracy",
                     "f1",
                     "pearson_spearman_mean",
+                    "pearson",
+                    "spearman",
                     "rouge1",
                     "rouge2",
                     "rougeL",

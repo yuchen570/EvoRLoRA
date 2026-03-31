@@ -54,6 +54,31 @@ def compute_glue_primary_metric(task_name: str, y_pred: np.ndarray, y_true: np.n
         return (p + s) / 2.0
     raise ValueError(f"未知 GLUE task_name: {task_name}")
 
+def compute_glue_metrics_dict(task_name: str, y_pred: np.ndarray, y_true: np.ndarray) -> dict[str, float]:
+    """返回该子集的所有评估指标字典，用于记录和存放到 CSV 结果中。"""
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_pred).reshape(-1)
+
+    res = {}
+    if task_name == "cola":
+        res["matthews_corrcoef"] = float(matthews_corrcoef(y_true, y_pred))
+    elif task_name in ("sst2", "mnli", "qnli", "rte", "wnli", "ax"):
+        res["accuracy"] = float(accuracy_score(y_true, y_pred))
+    elif task_name in ("mrpc", "qqp"):
+        res["f1"] = float(f1_score(y_true, y_pred, average="binary", zero_division=0))
+        res["accuracy"] = float(accuracy_score(y_true, y_pred))
+    elif task_name == "stsb":
+        p, _ = pearsonr(y_pred, y_true)
+        s, _ = spearmanr(y_pred, y_true)
+        p = 0.0 if np.isnan(p) else float(p)
+        s = 0.0 if np.isnan(s) else float(s)
+        res["pearson_spearman_mean"] = (p + s) / 2.0
+        res["pearson"] = p
+        res["spearman"] = s
+    else:
+        raise ValueError(f"未知 GLUE task_name: {task_name}")
+    return res
+
 
 @torch.no_grad()
 def collect_nlu_predictions(
