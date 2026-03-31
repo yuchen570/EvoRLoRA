@@ -21,7 +21,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29520 \
   --lora_alpha 32 \
   --target_modules q_proj,k_proj,v_proj,out_proj,fc1,fc2 \
   --epochs 15 \
-  --batch_size 4 \
+  --batch_size 16 \
   --max_length 1024 \
   --max_target_length 160 \
   --generation_max_new_tokens 160 \

@@ -24,7 +24,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --lora_alpha 16 \
   --target_modules query_proj,key_proj,value_proj,intermediate.dense,output.dense \
   --epochs 20 \
-  --batch_size 8 \
+  --batch_size 32 \
   --max_length 128 \
   --lr 8e-4 \
   --warmup_ratio 0.06 \
