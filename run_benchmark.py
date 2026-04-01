@@ -458,7 +458,8 @@ def peft_factory(
             target_modules=target_modules,
             modules_to_save=modules_to_save,
             bias="none",
-            use_rslora=bool("deberta" in model_type),
+            # RSLoRA 与极小 warmup lr 下的 Adam 首步曾在日志中与 classifier 范数发散同时出现；标准缩放先保证稳定。
+            use_rslora=False,
         )
         model = get_peft_model(model, config)
 
@@ -995,8 +996,7 @@ def run_training_loop(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            # LoRA 全层参与反传；True 时每步遍历 autograd 图，曾与 PEFT+小 batch 组合出现过不稳定报告。
-            find_unused_parameters=False,
+            find_unused_parameters=True,
         )
     # 默认与适配器同 lr；显式提高分类头速率请传 --head_lr（原先 max(lr,5e-4) 易使 pooler/classifier 相对 LoRA 过快更新）。
     head_lr_val = head_lr if head_lr is not None else lr
@@ -1023,11 +1023,19 @@ def run_training_loop(
         # 标准 LoRA / AdaLoRA：适配器矩阵通常不做 weight_decay（与常见 PEFT 复现一致），
         # 否则在 GLUE 等小数据、较高 lr 下易出现数值爆炸（logits/loss NaN）。
         dynamic_wd_peft = 0.0 if method_name in ("lora-ga", "lora", "adalora") else weight_decay
+        # 第二组若不写 weight_decay，会继承 AdamW(..., weight_decay=0.1)。运行证据：warmup 首步 lr 已非零后，
+        # CoLA 在 global_step=1 出现 classifier.weight 范数为 Infinity；显式对 PEFT 两族均关掉 decay 可避免该路径。
+        _peft_no_decay = method_name in ("lora-ga", "lora", "adalora")
+        _head_wd = 0.0 if _peft_no_decay else weight_decay
+        _adam_wd = 0.0 if _peft_no_decay else weight_decay
 
-        optimizer = AdamW([
-            {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
-            {"params": _head_params, "lr": head_lr_val},
-        ], weight_decay=weight_decay)
+        optimizer = AdamW(
+            [
+                {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
+                {"params": _head_params, "lr": head_lr_val, "weight_decay": _head_wd},
+            ],
+            weight_decay=_adam_wd,
+        )
         sparse_optimizer = None
     if is_main_process and method_name == "lora" and task_name in {"cola", "rte"}:
         # region agent log
@@ -1045,6 +1053,8 @@ def run_training_loop(
                 "lr": float(lr),
                 "head_lr": float(head_lr_val),
                 "peft_weight_decay": float(dynamic_wd_peft),
+                "head_weight_decay": float(_head_wd),
+                "adam_constructor_weight_decay": float(_adam_wd),
                 "global_weight_decay": float(weight_decay),
                 "peft_target_modules": list(peft_meta.get("target_modules", [])) if peft_meta else [],
             },
