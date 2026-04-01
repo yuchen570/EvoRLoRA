@@ -424,8 +424,10 @@ def peft_factory(
     if method_name == "lora" and "deberta" in model_type:
         _ffn_linear = {"intermediate.dense", "output.dense"}
         target_modules = [m for m in target_modules if m not in _ffn_linear]
+        # 日志：head_weight_decay=0 后 global_step=1 仍 head_norm=Inf。与 RoBERTa 默认仅 q/v 对齐，去掉 key 上 LoRA，降低 DisentangledAttention 里注意力 logits 被异常放大的风险。
+        target_modules = [m for m in target_modules if m != "key_proj"]
         if not target_modules:
-            target_modules = ["query_proj", "key_proj", "value_proj"]
+            target_modules = ["query_proj", "value_proj"]
 
     # PEFT 的 task_type 需要与 backbone 类型匹配，避免 seq2seq/causal 分支内部逻辑错误。
     if "t5" in model_type:
@@ -1270,6 +1272,36 @@ def run_training_loop(
                         if n.endswith(".gate") and p.grad is not None and not torch.isfinite(p.grad).all():
                             p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
                 optimizer.step()
+                if (
+                    is_main_process
+                    and method_name == "lora"
+                    and task_name in {"cola", "rte"}
+                    and global_step == 0
+                ):
+                    # region agent log
+                    _hmax = None
+                    _hfin: Optional[bool] = None
+                    for _n, _p in model.named_parameters():
+                        if (
+                            _p.requires_grad
+                            and "classifier" in _n
+                            and _n.endswith(".weight")
+                        ):
+                            _hmax = float(_p.detach().float().abs().max().item())
+                            _hfin = bool(torch.isfinite(_p.detach()).all().item())
+                            break
+                    _debug_log(
+                        run_id=f"{task_name}-{method_name}-seed{random_seed}-train",
+                        hypothesis_id="H4",
+                        location="run_benchmark.py:after_first_optimizer_step",
+                        message="post_step0_head_stats",
+                        data={
+                            "task": task_name,
+                            "head_weight_max_abs": _hmax,
+                            "head_all_finite": _hfin,
+                        },
+                    )
+                    # endregion
                 if sparse_optimizer is not None:
                     sparse_optimizer.step()
                 if method_name == "sora":
@@ -1678,7 +1710,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="逗号分隔的注入模块后缀列表，如 'query,key,value,intermediate'。"
-             "未指定时按模型类型自动推断（DeBERTa→query_proj/key_proj/value_proj，RoBERTa/BERT→query/value，T5→q/v）。",
+             "未指定时按模型类型自动推断（DeBERTa→query_proj/key_proj/value_proj；method=lora 时对 DeBERTa 另会排除 FFN 与 key_proj 上的 LoRA。RoBERTa/BERT→query/value，T5→q/v）。",
     )
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=16)
