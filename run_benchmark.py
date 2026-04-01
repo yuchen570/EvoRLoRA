@@ -438,9 +438,12 @@ def peft_factory(
     controller: Optional[RankEvolutionController] = None
 
     if task_type == "nlu":
-        # 必须同时训练 classifier、score、pooler。若漏掉随机初始化的 pooler，网络会把随机噪声输入给分类头，导致 CoLA MCC=0。
-        # 至于导致 NaN 的风险：下方的 float32 强转已解决 fp16 下由于 eps 溢出导致的发散问题。
         modules_to_save = ["classifier", "score", "pooler"]
+        # DeBERTa 上 pooler 经常保持在 backbone 原 dtype（常见为 fp16/bf16）执行。
+        # 将其作为 modules_to_save 训练并与 LoRA/头部参数混合后，容易出现 dtype 不一致路径；
+        # 对 GLUE 任务仅保留 classifier/score 可避免该问题。
+        if "deberta" in model_type:
+            modules_to_save = ["classifier", "score"]
     else:
         modules_to_save = None
 
@@ -576,13 +579,6 @@ def peft_factory(
         raise ValueError(f"未知 method_name: {method_name}")
 
     wrapped_model = DictFeatureClassifier(model)
-
-    # 强制将所有可训练参数转换为 float32。
-    # 因为 HF 自动加载的 base_model 可能处于 float16 (比如 modules_to_save 中的 classifier/pooler)。
-    # AdamW 优化 fp16 参数极易因 eps (如 1e-8) 下溢出导致分母为 0，从而使更新量无限大瞬间产生 NaN/Inf 发散。
-    for param in wrapped_model.parameters():
-        if param.requires_grad:
-            param.data = param.data.to(torch.float32)
 
     trainable_params = count_trainable_params(wrapped_model)
     meta = {"trainable_params": trainable_params, "target_modules": list(target_modules)}
@@ -1067,6 +1063,8 @@ def run_training_loop(
                 "adam_constructor_weight_decay": float(_adam_wd),
                 "adam_eps": float(_adam_eps) if method_name != "sora" else None,
                 "global_weight_decay": float(weight_decay),
+                "pooler_trainable_params": int(sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and "pooler" in n)),
+                "pooler_trainable_dtypes": sorted({str(p.dtype) for n, p in model.named_parameters() if p.requires_grad and "pooler" in n}),
                 "peft_target_modules": list(peft_meta.get("target_modules", [])) if peft_meta else [],
             },
         )
