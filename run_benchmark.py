@@ -995,11 +995,19 @@ def run_training_loop(
         # 标准 LoRA / AdaLoRA：适配器矩阵通常不做 weight_decay（与常见 PEFT 复现一致），
         # 否则在 GLUE 等小数据、较高 lr 下易出现数值爆炸（logits/loss NaN）。
         dynamic_wd_peft = 0.0 if method_name in ("lora-ga", "lora", "adalora") else weight_decay
+        # 日志证据：step 0 的 grad_norm 有限，约 step 70 起 loss/grad_norm 变 NaN；第二组未显式 weight_decay 时
+        # 仍继承 AdamW(..., weight_decay=0.1)，小分类头 + modules_to_save 上持续 decay 易与 LoRA 扰动叠加导致发散。
+        _peft_head_stable = method_name in ("lora-ga", "lora", "adalora")
+        dynamic_wd_head = 0.0 if _peft_head_stable else weight_decay
+        _adam_top_wd = 0.0 if _peft_head_stable else weight_decay
 
-        optimizer = AdamW([
-            {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
-            {"params": _head_params, "lr": head_lr_val}
-        ], weight_decay=weight_decay)
+        optimizer = AdamW(
+            [
+                {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
+                {"params": _head_params, "lr": head_lr_val, "weight_decay": dynamic_wd_head},
+            ],
+            weight_decay=_adam_top_wd,
+        )
         sparse_optimizer = None
     if is_main_process and method_name == "lora" and task_name in {"cola", "rte"}:
         # region agent log
@@ -1017,6 +1025,8 @@ def run_training_loop(
                 "lr": float(lr),
                 "head_lr": float(head_lr_val),
                 "peft_weight_decay": float(dynamic_wd_peft),
+                "head_weight_decay": float(dynamic_wd_head),
+                "adam_constructor_weight_decay": float(_adam_top_wd),
                 "global_weight_decay": float(weight_decay),
             },
         )
@@ -1169,7 +1179,7 @@ def run_training_loop(
                     and task_name in {"cola", "rte"}
                     and (
                         global_step in debug_steps
-                        or (lora_glue_step_trace and 70 <= global_step <= 99)
+                        or (lora_glue_step_trace and 40 <= global_step < 100)
                     )
                 ):
                     head_norm = None
