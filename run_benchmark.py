@@ -421,6 +421,8 @@ def peft_factory(
         modules_to_save = None
 
     if method_name == "lora":
+        # DeBERTa：LoRA 梯度幅度随层内激活范数放大，易出现早期数值爆炸（见 huggingface/peft#3073 等讨论）。
+        # RSLoRA（alpha/sqrt(r)）可显著缓和该问题；与 AdaLoRA/其他方法对比时仅影响标准 lora 分支。
         config = LoraConfig(
             task_type=peft_task_type,
             r=target_rank,
@@ -429,6 +431,7 @@ def peft_factory(
             target_modules=target_modules,
             modules_to_save=modules_to_save,
             bias="none",
+            use_rslora=bool("deberta" in model_type),
         )
         model = get_peft_model(model, config)
 
@@ -964,7 +967,8 @@ def run_training_loop(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True,
+            # LoRA 全层参与反传；True 时每步遍历 autograd 图，曾与 PEFT+小 batch 组合出现过不稳定报告。
+            find_unused_parameters=False,
         )
     # 默认与适配器同 lr；显式提高分类头速率请传 --head_lr（原先 max(lr,5e-4) 易使 pooler/classifier 相对 LoRA 过快更新）。
     head_lr_val = head_lr if head_lr is not None else lr
@@ -1153,17 +1157,19 @@ def run_training_loop(
                     )
                     loss = loss + lam * l1_penalty / max(gate_numel, 1)
                 loss.backward()
+                grad_norm_total: Optional[float] = None
                 if max_grad_norm is not None and max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(
+                    _gn = torch.nn.utils.clip_grad_norm_(
                         [p for p in model.parameters() if p.requires_grad], max_grad_norm
                     )
+                    grad_norm_total = float(_gn.detach().item()) if isinstance(_gn, torch.Tensor) else float(_gn)
                 if (
                     is_main_process
                     and method_name == "lora"
                     and task_name in {"cola", "rte"}
                     and (
                         global_step in debug_steps
-                        or (lora_glue_step_trace and 90 <= global_step <= 99)
+                        or (lora_glue_step_trace and 70 <= global_step <= 99)
                     )
                 ):
                     head_norm = None
@@ -1213,6 +1219,7 @@ def run_training_loop(
                             "lr_peft": float(optimizer.param_groups[0]["lr"]),
                             "lr_head": float(optimizer.param_groups[1]["lr"]) if len(optimizer.param_groups) > 1 else None,
                             "warmup_steps": int(warmup_steps),
+                            "grad_norm_total": grad_norm_total,
                         },
                     )
                     # endregion
