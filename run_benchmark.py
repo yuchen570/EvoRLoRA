@@ -401,6 +401,14 @@ def peft_factory(
 
     model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
 
+    # DeBERTa + 标准 LoRA：对 FFN（intermediate/output）注 LoRA 时激活范数大，与 DisentangledAttention 组合在 DDP+GLUE 下可在数十步内 forward NaN（运行证据：step0 有限，首个密采样步已 NaN）。
+    # 仅收紧 method=lora；AdaLoRA/LoRA-GA 等仍保留用户传入的 target_modules。
+    if method_name == "lora" and "deberta" in model_type:
+        _ffn_linear = {"intermediate.dense", "output.dense"}
+        target_modules = [m for m in target_modules if m not in _ffn_linear]
+        if not target_modules:
+            target_modules = ["query_proj", "key_proj", "value_proj"]
+
     # PEFT 的 task_type 需要与 backbone 类型匹配，避免 seq2seq/causal 分支内部逻辑错误。
     if "t5" in model_type:
         peft_task_type = TaskType.SEQ_2_SEQ_LM
@@ -423,11 +431,12 @@ def peft_factory(
     if method_name == "lora":
         # DeBERTa：LoRA 梯度幅度随层内激活范数放大，易出现早期数值爆炸（见 huggingface/peft#3073 等讨论）。
         # RSLoRA（alpha/sqrt(r)）可显著缓和该问题；与 AdaLoRA/其他方法对比时仅影响标准 lora 分支。
+        _lora_dropout = 0.0 if "deberta" in model_type else 0.1
         config = LoraConfig(
             task_type=peft_task_type,
             r=target_rank,
             lora_alpha=effective_alpha,
-            lora_dropout=0.1,
+            lora_dropout=_lora_dropout,
             target_modules=target_modules,
             modules_to_save=modules_to_save,
             bias="none",
@@ -551,7 +560,7 @@ def peft_factory(
 
     wrapped_model = DictFeatureClassifier(model)
     trainable_params = count_trainable_params(wrapped_model)
-    meta = {"trainable_params": trainable_params}
+    meta = {"trainable_params": trainable_params, "target_modules": list(target_modules)}
     return wrapped_model, controller, meta
 
 
@@ -948,6 +957,7 @@ def run_training_loop(
     save_final_model: bool = True,
     verify_n_samples: int = 2,
     max_grad_norm: Optional[float] = None,
+    peft_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         if not torch.cuda.is_available():
@@ -995,19 +1005,11 @@ def run_training_loop(
         # 标准 LoRA / AdaLoRA：适配器矩阵通常不做 weight_decay（与常见 PEFT 复现一致），
         # 否则在 GLUE 等小数据、较高 lr 下易出现数值爆炸（logits/loss NaN）。
         dynamic_wd_peft = 0.0 if method_name in ("lora-ga", "lora", "adalora") else weight_decay
-        # 日志证据：step 0 的 grad_norm 有限，约 step 70 起 loss/grad_norm 变 NaN；第二组未显式 weight_decay 时
-        # 仍继承 AdamW(..., weight_decay=0.1)，小分类头 + modules_to_save 上持续 decay 易与 LoRA 扰动叠加导致发散。
-        _peft_head_stable = method_name in ("lora-ga", "lora", "adalora")
-        dynamic_wd_head = 0.0 if _peft_head_stable else weight_decay
-        _adam_top_wd = 0.0 if _peft_head_stable else weight_decay
 
-        optimizer = AdamW(
-            [
-                {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
-                {"params": _head_params, "lr": head_lr_val, "weight_decay": dynamic_wd_head},
-            ],
-            weight_decay=_adam_top_wd,
-        )
+        optimizer = AdamW([
+            {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
+            {"params": _head_params, "lr": head_lr_val},
+        ], weight_decay=weight_decay)
         sparse_optimizer = None
     if is_main_process and method_name == "lora" and task_name in {"cola", "rte"}:
         # region agent log
@@ -1025,9 +1027,8 @@ def run_training_loop(
                 "lr": float(lr),
                 "head_lr": float(head_lr_val),
                 "peft_weight_decay": float(dynamic_wd_peft),
-                "head_weight_decay": float(dynamic_wd_head),
-                "adam_constructor_weight_decay": float(_adam_top_wd),
                 "global_weight_decay": float(weight_decay),
+                "peft_target_modules": list(peft_meta.get("target_modules", [])) if peft_meta else [],
             },
         )
         # endregion
@@ -1058,6 +1059,7 @@ def run_training_loop(
     debug_steps = {0, min(99, max(total_train_steps - 1, 0)), max(total_train_steps - 1, 0)}
     # LoRA+GLUE：在已知易发散区间逐步打点，便于确认首个 NaN 出现在哪一步（不仅依赖硬编码的 99）。
     lora_glue_step_trace = method_name == "lora" and task_name in {"cola", "rte"}
+    lora_glue_early_steps = frozenset({1, 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 39})
     lr_scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=warmup_steps,
@@ -1180,6 +1182,7 @@ def run_training_loop(
                     and (
                         global_step in debug_steps
                         or (lora_glue_step_trace and 40 <= global_step < 100)
+                        or (lora_glue_step_trace and global_step in lora_glue_early_steps)
                     )
                 ):
                     head_norm = None
@@ -1864,6 +1867,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         save_final_model=not args.no_save_final_model,
                         verify_n_samples=args.verify_n_samples,
                         max_grad_norm=args.max_grad_norm,
+                        peft_meta=meta,
                     )
                     res.update(
                         {
