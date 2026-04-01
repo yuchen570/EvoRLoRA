@@ -438,11 +438,9 @@ def peft_factory(
     controller: Optional[RankEvolutionController] = None
 
     if task_type == "nlu":
+        # 必须同时训练 classifier、score、pooler。若漏掉随机初始化的 pooler，网络会把随机噪声输入给分类头，导致 CoLA MCC=0。
+        # 至于导致 NaN 的风险：下方的 float32 强转已解决 fp16 下由于 eps 溢出导致的发散问题。
         modules_to_save = ["classifier", "score", "pooler"]
-        # DeBERTa：把 pooler 放进 modules_to_save 后，会与「head 组」的 head_lr / weight_decay 一起更新；
-        # 与 LoRA  encoder 扰动叠加时易出现数值发散（训练中期 loss、logits 变 NaN）。GLUE+LoRA 常见做法是只训 classifier + LoRA。
-        if "deberta" in model_type:
-            modules_to_save = ["classifier", "score"]
     else:
         modules_to_save = None
 
@@ -527,9 +525,9 @@ def peft_factory(
             controller_kwargs={"rho": 0.9, "p_g": 0.8, "p_p": 0.1, "H_g": 2, "H_p": 3, "cooldown_steps": 2},
         )
         # EvoRank 手动注入后，需要显式解冻任务头（与 HF PEFT 在 SEQ_CLS 下的行为对齐）。
-        # NLU 通常是 classifier.*（或 score.*）；NLG Seq2Seq 通常为 lm_head/shared。
+        # NLU 通常是 classifier.*（或 score.*、pooler）；NLG Seq2Seq 通常为 lm_head/shared。
         for name, param in model.named_parameters():
-            if "classifier" in name or "score" in name or "lm_head" in name or name == "shared":
+            if "classifier" in name or "score" in name or "lm_head" in name or name == "shared" or "pooler" in name:
                 param.requires_grad = True
 
     elif method_name == "lora-ga":
@@ -578,6 +576,14 @@ def peft_factory(
         raise ValueError(f"未知 method_name: {method_name}")
 
     wrapped_model = DictFeatureClassifier(model)
+
+    # 强制将所有可训练参数转换为 float32。
+    # 因为 HF 自动加载的 base_model 可能处于 float16 (比如 modules_to_save 中的 classifier/pooler)。
+    # AdamW 优化 fp16 参数极易因 eps (如 1e-8) 下溢出导致分母为 0，从而使更新量无限大瞬间产生 NaN/Inf 发散。
+    for param in wrapped_model.parameters():
+        if param.requires_grad:
+            param.data = param.data.to(torch.float32)
+
     trainable_params = count_trainable_params(wrapped_model)
     meta = {"trainable_params": trainable_params, "target_modules": list(target_modules)}
     return wrapped_model, controller, meta
@@ -1029,12 +1035,16 @@ def run_training_loop(
         _head_wd = 0.0 if _peft_no_decay else weight_decay
         _adam_wd = 0.0 if _peft_no_decay else weight_decay
 
+        # fp16 参数（如 DeBERTa classifier）在 eps=1e-8 时易在首步触发分母下溢并数值爆炸；
+        # 运行日志已证实本仓库 LoRA+DeBERTa 路径存在该问题，LoRA 家族统一提升 eps。
+        _adam_eps = 1e-6 if method_name in ("lora-ga", "lora", "adalora") else 1e-8
         optimizer = AdamW(
             [
                 {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
                 {"params": _head_params, "lr": head_lr_val, "weight_decay": _head_wd},
             ],
             weight_decay=_adam_wd,
+            eps=_adam_eps,
         )
         sparse_optimizer = None
     if is_main_process and method_name == "lora" and task_name in {"cola", "rte"}:
@@ -1055,6 +1065,7 @@ def run_training_loop(
                 "peft_weight_decay": float(dynamic_wd_peft),
                 "head_weight_decay": float(_head_wd),
                 "adam_constructor_weight_decay": float(_adam_wd),
+                "adam_eps": float(_adam_eps) if method_name != "sora" else None,
                 "global_weight_decay": float(weight_decay),
                 "peft_target_modules": list(peft_meta.get("target_modules", [])) if peft_meta else [],
             },
