@@ -413,6 +413,10 @@ def peft_factory(
 
     if task_type == "nlu":
         modules_to_save = ["classifier", "score", "pooler"]
+        # DeBERTa：把 pooler 放进 modules_to_save 后，会与「head 组」的 head_lr / weight_decay 一起更新；
+        # 与 LoRA  encoder 扰动叠加时易出现数值发散（训练中期 loss、logits 变 NaN）。GLUE+LoRA 常见做法是只训 classifier + LoRA。
+        if "deberta" in model_type:
+            modules_to_save = ["classifier", "score"]
     else:
         modules_to_save = None
 
@@ -962,7 +966,8 @@ def run_training_loop(
             output_device=local_rank,
             find_unused_parameters=True,
         )
-    head_lr_val = head_lr if head_lr is not None else max(lr, 5e-4)
+    # 默认与适配器同 lr；显式提高分类头速率请传 --head_lr（原先 max(lr,5e-4) 易使 pooler/classifier 相对 LoRA 过快更新）。
+    head_lr_val = head_lr if head_lr is not None else lr
 
     if method_name == "sora":
         # 官方 SoRA：gate 参数使用独立的 SparseAdamW（近端梯度），其余参数使用标准 AdamW。
@@ -1037,6 +1042,8 @@ def run_training_loop(
     total_train_steps = max_train_steps if max_train_steps is not None else epochs * len(train_loader)
     warmup_steps = int(total_train_steps * warmup_ratio)
     debug_steps = {0, min(99, max(total_train_steps - 1, 0)), max(total_train_steps - 1, 0)}
+    # LoRA+GLUE：在已知易发散区间逐步打点，便于确认首个 NaN 出现在哪一步（不仅依赖硬编码的 99）。
+    lora_glue_step_trace = method_name == "lora" and task_name in {"cola", "rte"}
     lr_scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=warmup_steps,
@@ -1154,7 +1161,10 @@ def run_training_loop(
                     is_main_process
                     and method_name == "lora"
                     and task_name in {"cola", "rte"}
-                    and global_step in debug_steps
+                    and (
+                        global_step in debug_steps
+                        or (lora_glue_step_trace and 90 <= global_step <= 99)
+                    )
                 ):
                     head_norm = None
                     head_grad_norm = None
@@ -1200,6 +1210,9 @@ def run_training_loop(
                             "lora_norm": lora_norm,
                             "lora_grad_norm": lora_grad_norm,
                             "lora_param_name": lora_name,
+                            "lr_peft": float(optimizer.param_groups[0]["lr"]),
+                            "lr_head": float(optimizer.param_groups[1]["lr"]) if len(optimizer.param_groups) > 1 else None,
+                            "warmup_steps": int(warmup_steps),
                         },
                     )
                     # endregion
@@ -1623,7 +1636,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--head_lr", type=float, default=None, help="分类头或额外可训练参数的学习率。None时默认 max(lr, 5e-4) 以解决 CE 任务不收敛问题")
+    parser.add_argument("--head_lr", type=float, default=None, help="分类头等可训练参数学习率。None 时默认与 --lr 相同；需要更快收敛可显式调高")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--T_es", type=int, default=200)
