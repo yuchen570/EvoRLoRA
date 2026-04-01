@@ -424,10 +424,8 @@ def peft_factory(
     if method_name == "lora" and "deberta" in model_type:
         _ffn_linear = {"intermediate.dense", "output.dense"}
         target_modules = [m for m in target_modules if m not in _ffn_linear]
-        # 日志：head_weight_decay=0 后 global_step=1 仍 head_norm=Inf。与 RoBERTa 默认仅 q/v 对齐，去掉 key 上 LoRA，降低 DisentangledAttention 里注意力 logits 被异常放大的风险。
-        target_modules = [m for m in target_modules if m != "key_proj"]
         if not target_modules:
-            target_modules = ["query_proj", "value_proj"]
+            target_modules = ["query_proj", "key_proj", "value_proj"]
 
     # PEFT 的 task_type 需要与 backbone 类型匹配，避免 seq2seq/causal 分支内部逻辑错误。
     if "t5" in model_type:
@@ -1217,8 +1215,10 @@ def run_training_loop(
                 ):
                     head_norm = None
                     head_grad_norm = None
+                    head_dtype = None
                     lora_norm = None
                     lora_grad_norm = None
+                    lora_dtype = None
                     head_name = None
                     lora_name = None
                     for n, p in model.named_parameters():
@@ -1230,11 +1230,13 @@ def run_training_loop(
                         ):
                             head_name = n
                             head_norm = float(p.detach().norm().item())
+                            head_dtype = str(p.dtype)
                             if p.grad is not None:
                                 head_grad_norm = float(p.grad.detach().norm().item())
                         if lora_norm is None and p.requires_grad and ("lora_A" in n or "lora_B" in n):
                             lora_name = n
                             lora_norm = float(p.detach().norm().item())
+                            lora_dtype = str(p.dtype)
                             if p.grad is not None:
                                 lora_grad_norm = float(p.grad.detach().norm().item())
                         if head_norm is not None and lora_norm is not None:
@@ -1255,12 +1257,15 @@ def run_training_loop(
                             "batch_label_dist": {str(int(k.item())): int(v.item()) for k, v in zip(label_vals, label_counts)},
                             "head_norm": head_norm,
                             "head_grad_norm": head_grad_norm,
+                            "head_dtype": head_dtype,
                             "head_param_name": head_name,
                             "lora_norm": lora_norm,
                             "lora_grad_norm": lora_grad_norm,
+                            "lora_dtype": lora_dtype,
                             "lora_param_name": lora_name,
                             "lr_peft": float(optimizer.param_groups[0]["lr"]),
                             "lr_head": float(optimizer.param_groups[1]["lr"]) if len(optimizer.param_groups) > 1 else None,
+                            "optimizer_eps": float(getattr(optimizer, "defaults", {}).get("eps", 1e-8)),
                             "warmup_steps": int(warmup_steps),
                             "grad_norm_total": grad_norm_total,
                         },
@@ -1281,6 +1286,7 @@ def run_training_loop(
                     # region agent log
                     _hmax = None
                     _hfin: Optional[bool] = None
+                    _hdtype: Optional[str] = None
                     for _n, _p in model.named_parameters():
                         if (
                             _p.requires_grad
@@ -1289,6 +1295,7 @@ def run_training_loop(
                         ):
                             _hmax = float(_p.detach().float().abs().max().item())
                             _hfin = bool(torch.isfinite(_p.detach()).all().item())
+                            _hdtype = str(_p.dtype)
                             break
                     _debug_log(
                         run_id=f"{task_name}-{method_name}-seed{random_seed}-train",
@@ -1299,6 +1306,8 @@ def run_training_loop(
                             "task": task_name,
                             "head_weight_max_abs": _hmax,
                             "head_all_finite": _hfin,
+                            "head_dtype": _hdtype,
+                            "optimizer_eps": float(getattr(optimizer, "defaults", {}).get("eps", 1e-8)),
                         },
                     )
                     # endregion
@@ -1710,7 +1719,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="逗号分隔的注入模块后缀列表，如 'query,key,value,intermediate'。"
-             "未指定时按模型类型自动推断（DeBERTa→query_proj/key_proj/value_proj；method=lora 时对 DeBERTa 另会排除 FFN 与 key_proj 上的 LoRA。RoBERTa/BERT→query/value，T5→q/v）。",
+             "未指定时按模型类型自动推断（DeBERTa→query_proj/key_proj/value_proj，RoBERTa/BERT→query/value，T5→q/v）。",
     )
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=16)
