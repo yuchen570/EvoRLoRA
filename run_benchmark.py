@@ -982,10 +982,10 @@ def run_training_loop(
         _peft_params = [p for n, p in model.named_parameters() if p.requires_grad and not any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
         _head_params = [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
         
-        # LoRA-GA 完全依靠 A、B 矩阵精准抵消基础权重中巨大的负向偏移。
-        # 权重衰减会压缩 A、B 矩阵，瞬间破坏这种脆弱的平衡并损坏模型。
-        # 因此，LoRA-GA 参数的 weight_decay 必须设为 0.0，分类头可以保留权重衰减。
-        dynamic_wd_peft = 0.0 if method_name == "lora-ga" else weight_decay
+        # LoRA-GA：A/B 与基座权重的抵消对 decay 极敏感，必须为 0。
+        # 标准 LoRA / AdaLoRA：适配器矩阵通常不做 weight_decay（与常见 PEFT 复现一致），
+        # 否则在 GLUE 等小数据、较高 lr 下易出现数值爆炸（logits/loss NaN）。
+        dynamic_wd_peft = 0.0 if method_name in ("lora-ga", "lora", "adalora") else weight_decay
 
         optimizer = AdamW([
             {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
@@ -1007,6 +1007,8 @@ def run_training_loop(
                 "trainable_params_total": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
                 "lr": float(lr),
                 "head_lr": float(head_lr_val),
+                "peft_weight_decay": float(dynamic_wd_peft),
+                "global_weight_decay": float(weight_decay),
             },
         )
         # endregion
@@ -1158,12 +1160,21 @@ def run_training_loop(
                     head_grad_norm = None
                     lora_norm = None
                     lora_grad_norm = None
+                    head_name = None
+                    lora_name = None
                     for n, p in model.named_parameters():
-                        if head_norm is None and any(k in n for k in ["classifier.weight", "score.weight", "pooler.dense.weight"]):
+                        if (
+                            head_norm is None
+                            and p.requires_grad
+                            and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])
+                            and n.endswith(".weight")
+                        ):
+                            head_name = n
                             head_norm = float(p.detach().norm().item())
                             if p.grad is not None:
                                 head_grad_norm = float(p.grad.detach().norm().item())
-                        if lora_norm is None and ("lora_A" in n or "lora_B" in n):
+                        if lora_norm is None and p.requires_grad and ("lora_A" in n or "lora_B" in n):
+                            lora_name = n
                             lora_norm = float(p.detach().norm().item())
                             if p.grad is not None:
                                 lora_grad_norm = float(p.grad.detach().norm().item())
@@ -1185,8 +1196,10 @@ def run_training_loop(
                             "batch_label_dist": {str(int(k.item())): int(v.item()) for k, v in zip(label_vals, label_counts)},
                             "head_norm": head_norm,
                             "head_grad_norm": head_grad_norm,
+                            "head_param_name": head_name,
                             "lora_norm": lora_norm,
                             "lora_grad_norm": lora_grad_norm,
+                            "lora_param_name": lora_name,
                         },
                     )
                     # endregion
