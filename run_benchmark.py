@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from datasets import load_dataset
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
@@ -21,7 +22,6 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     DataCollatorWithPadding,
     DataCollatorForSeq2Seq,
-    get_linear_schedule_with_warmup,
 )
 
 from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
@@ -35,6 +35,24 @@ from train_integration import inject_evo_lora, train_evo_lora_step
 from glue_metrics import collect_nlu_predictions, compute_glue_primary_metric, glue_primary_metric_key, compute_glue_metrics_dict
 
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+
+def _linear_warmup_decay_lr_lambda(num_warmup_steps: int, num_training_steps: int):
+    """
+    与 transformers.get_linear_schedule_with_warmup 同形的 warmup + 线性衰减，但 warmup 在 step=0 的乘子为 1/W 而非 0。
+    HF 的 LambdaLR 在构造时会 step 一次，使首步 lr 乘子为 0：此时 AdamW 仍按梯度更新动量，下一步用极小 lr 更新权重时易数值爆炸（运行证据：DeBERTa+LoRA 在 global_step=1 起 loss/分类头即 NaN）。
+    """
+
+    def lr_lambda(step: int) -> float:
+        if step < num_warmup_steps:
+            return float(step + 1) / float(max(1, num_warmup_steps))
+        return max(
+            0.0,
+            float(num_training_steps - step) / float(max(1, num_training_steps - num_warmup_steps)),
+        )
+
+    return lr_lambda
+
 
 # HuggingFace `datasets` 中 `load_dataset("glue", <config>)` 的全集（sentence 字段与验证 split 约定）。
 # 参考：https://huggingface.co/datasets/glue
@@ -1060,16 +1078,16 @@ def run_training_loop(
     # LoRA+GLUE：在已知易发散区间逐步打点，便于确认首个 NaN 出现在哪一步（不仅依赖硬编码的 99）。
     lora_glue_step_trace = method_name == "lora" and task_name in {"cola", "rte"}
     lora_glue_early_steps = frozenset({1, 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 39})
-    lr_scheduler = get_linear_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_train_steps,
+    lr_scheduler = LambdaLR(
+        optimizer,
+        _linear_warmup_decay_lr_lambda(warmup_steps, total_train_steps),
+        last_epoch=-1,
     )
     if sparse_optimizer is not None:
-        sparse_lr_scheduler = get_linear_schedule_with_warmup(
-            optimizer=sparse_optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_train_steps,
+        sparse_lr_scheduler = LambdaLR(
+            sparse_optimizer,
+            _linear_warmup_decay_lr_lambda(warmup_steps, total_train_steps),
+            last_epoch=-1,
         )
     else:
         sparse_lr_scheduler = None
