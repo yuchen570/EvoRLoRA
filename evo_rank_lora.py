@@ -62,7 +62,8 @@ class EvoRankLoRALayer(nn.Module):
         self.reset_parameters()
         # 反向传播后可缓存的统计量（避免同一步重复计算）
         self._cached_demand_score: Optional[float] = None
-        self._cached_component_importance: Optional[torch.Tensor] = None
+        self._cached_prune_scores: Optional[torch.Tensor] = None
+        self._cached_expand_bar_s: Optional[float] = None
         
     def reset_parameters(self):
         """标准 LoRA 初始化：A Kaiming, B Zero"""
@@ -165,16 +166,81 @@ class EvoRankLoRALayer(nn.Module):
     def clear_statistics_cache(self):
         """清空当前步的缓存统计量。"""
         self._cached_demand_score = None
-        self._cached_component_importance = None
+        self._cached_prune_scores = None
+        self._cached_expand_bar_s = None
 
     @torch.no_grad()
     def cache_statistics_from_current_gradients(self, alpha1: float = 1.0, alpha2: float = 0.1):
         """
-        在 backward 之后立即缓存本步统计量。
-        这样 controller 在结构步骤读取分数时无需重复计算。
+        backward 后一次性缓存 g_ℓ、s^red（剪枝）和 \\bar s（扩张容量），
+        避免 controller 读取时重复计算。
         """
         self._cached_demand_score = self.compute_demand_score()
-        self._cached_component_importance = self.compute_component_importance(alpha1=alpha1, alpha2=alpha2)
+        self._cached_prune_scores = self._compute_prune_scores_raw(alpha1, alpha2)
+        self._cached_expand_bar_s = self._compute_expand_bar_s_raw()
+
+    # ---- expand 路径：s_{ℓ,i} = ||b||·||a||（纯范数，论文式 142） ----
+    @torch.no_grad()
+    def _compute_expand_bar_s_raw(self) -> float:
+        """
+        扩张容量项 \\bar{s}_ℓ = (1/max(r_ℓ,1)) Σ_{i:active} ||b_{ℓ,i}||·||a_{ℓ,i}||。
+        """
+        active_idx = self.get_active_indices()
+        if not active_idx:
+            return 0.0
+        norm_A = torch.norm(self.lora_A.weight, dim=1)
+        norm_B = torch.norm(self.lora_B.weight, dim=0)
+        idx_t = torch.as_tensor(active_idx, device=self.lora_A.weight.device, dtype=torch.long)
+        return float((norm_A[idx_t] * norm_B[idx_t]).sum().item() / max(len(active_idx), 1))
+
+    @torch.no_grad()
+    def compute_expand_capacity_bar_s(self, use_cached: bool = False) -> float:
+        """u_ℓ 中的纯范数容量均值（论文式 146），经 controller 归一化后组合为 u_ℓ。"""
+        if use_cached and self._cached_expand_bar_s is not None:
+            return self._cached_expand_bar_s
+        return self._compute_expand_bar_s_raw()
+
+    # ---- prune 路径：s^red_{ℓ,i} = α₁||b||·||a|| + α₂|⟨G, ba⊤⟩|（论文式 150） ----
+    @torch.no_grad()
+    def _compute_prune_scores_raw(self, alpha1: float, alpha2: float) -> torch.Tensor:
+        """
+        s^red_{ℓ,i} = α₁‖b_{ℓ,i}‖‖a_{ℓ,i}‖ + α₂|⟨∂L/∂ΔW_ℓ, b_{ℓ,i}a_{ℓ,i}⊤⟩|。
+        仅活跃位有值，未激活位为 0。
+        """
+        if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
+            raise ValueError("需要先调用 .backward() 计算出 lora_A 和 lora_B 的梯度")
+        if self.debug and not self.lora_A.weight.grad.any():
+            warnings.warn("lora_A.grad 全为零，可能是 zero_grad() 之后未执行新的 backward()")
+
+        active_idx = self.get_active_indices()
+        s_layer = float(self.get_scaling_factor(max(len(active_idx), 1)))
+
+        # |⟨G, b_i a_i⊤⟩|：rsLoRA 下 ∂L/∂A 含额外标量 s，除去后得论文量
+        grad_interaction = torch.sum(self.lora_A.weight.grad * self.lora_A.weight, dim=1).abs()
+        if s_layer > 0.0:
+            grad_interaction = grad_interaction / s_layer
+
+        norm_A = torch.norm(self.lora_A.weight, dim=1)
+        norm_B = torch.norm(self.lora_B.weight, dim=0)
+        norm_product = norm_A * norm_B
+
+        scores = torch.zeros(self.r_max, device=self.lora_A.weight.device)
+        if active_idx:
+            idx_t = torch.as_tensor(active_idx, device=self.lora_A.weight.device, dtype=torch.long)
+            scores[idx_t] = alpha1 * norm_product[idx_t] + alpha2 * grad_interaction[idx_t]
+        return scores
+
+    @torch.no_grad()
+    def compute_prune_reduction_scores(
+        self,
+        alpha1: float = 1.0,
+        alpha2: float = 0.1,
+        use_cached: bool = False,
+    ) -> torch.Tensor:
+        """s^red_{ℓ,i}（论文式 150），供剪枝 EMA 与分位数阈值使用。"""
+        if use_cached and self._cached_prune_scores is not None:
+            return self._cached_prune_scores
+        return self._compute_prune_scores_raw(alpha1, alpha2)
 
     @torch.no_grad()
     def compute_component_importance(
@@ -183,43 +249,8 @@ class EvoRankLoRALayer(nn.Module):
         alpha2: float = 0.1,
         use_cached: bool = False,
     ) -> torch.Tensor:
-        """
-        计算活跃组件的重要性评分 (Importance Score s_{l,i})
-        完全避免实例化 G (d x k 大小的梯度矩阵)。
-        """
-        if use_cached and self._cached_component_importance is not None:
-            return self._cached_component_importance
-
-        # 鲁棒性检查
-        if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
-             raise ValueError("需要先调用 .backward() 计算出 lora_A 和 lora_B 的梯度")
-        # .any() 会触发 Device-to-Host 隐式同步，DDP 下频繁调用会拖慢性能，仅 debug 模式开启
-        if self.debug and not self.lora_A.weight.grad.any():
-             warnings.warn("lora_A.grad 全为零，可能是 zero_grad() 之后未执行新的 backward()")
-
-        active_idx = self.get_active_indices()
-        # 前向含 rsLoRA 标量 s=α/√r，故 ∂L/∂A 多带因子 s；除以 s 得到论文式 (222–235) 的 |⟨G, b_i a_i^T⟩|
-        s_layer = float(self.get_scaling_factor(max(len(active_idx), 1)))
-
-        # s_1: 梯度交互项 | <G, b_i a_i^T> |
-        # lora_A.grad 形状: (r_max, in_features), lora_A.weight 形状: (r_max, in_features)
-        # 通过在维度 1 (in_features) 上逐元素相乘后求和，等效提取出迹:
-        grad_interaction = torch.sum(self.lora_A.weight.grad * self.lora_A.weight, dim=1).abs()
-        if s_layer > 0.0:
-            grad_interaction = grad_interaction / s_layer
-        # [可选等价实现]
-        # grad_interaction = torch.sum(self.lora_B.weight.grad * self.lora_B.weight, dim=0).abs() / s_layer
-        
-        # s_2: 范数项 ||b_i|| * ||a_i||
-        norm_A = torch.norm(self.lora_A.weight, dim=1) # (r_max,)
-        norm_B = torch.norm(self.lora_B.weight, dim=0) # (r_max,)
-        norm_product = norm_A * norm_B
-        
-        # 总分，仅计算 active indices，未激活的返回 0.0
-        scores = torch.zeros(self.r_max, device=self.lora_A.weight.device)
-
-        scores[active_idx] = alpha1 * grad_interaction[active_idx] + alpha2 * norm_product[active_idx]
-        return scores
+        """同 compute_prune_reduction_scores（历史命名，供 controller 调用）。"""
+        return self.compute_prune_reduction_scores(alpha1=alpha1, alpha2=alpha2, use_cached=use_cached)
         
     @torch.no_grad()
     def compute_demand_score(self, use_cached: bool = False) -> float:

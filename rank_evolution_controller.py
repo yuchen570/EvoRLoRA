@@ -188,7 +188,13 @@ class RankEvolutionController:
                 pass
 
     def update_statistics(self):
-        """收集 g_ℓ、组件重要性，组合成 u_ℓ（论文式 217）并对 s_{ℓ,i} 做 EMA。"""
+        """
+        收集：
+        - g_ℓ（层需求，论文式 138）
+        - \\bar{s}_ℓ = (1/r_ℓ) Σ ||b||·||a||（纯范数，扩张容量，式 146）
+        - s^red_{ℓ,i} = α₁||b||·||a|| + α₂|⟨G,ba⊤⟩|（剪枝能量，式 150）
+        归一化后 u_ℓ = α \\tilde g_ℓ + β \\tilde{\\bar s}_ℓ；s^red 做 EMA 供 τ_prune。
+        """
         raw_g: Dict[str, float] = {}
         raw_bar_s: Dict[str, float] = {}
         curr_s_by_name: Dict[str, torch.Tensor] = {}
@@ -197,12 +203,8 @@ class RankEvolutionController:
             g_val = layer.compute_demand_score(use_cached=True)
             curr_s = layer.compute_component_importance(use_cached=True)
             curr_s_by_name[name] = curr_s
-            active = layer.active_mask
             raw_g[name] = g_val
-            if active.any():
-                raw_bar_s[name] = float(curr_s[active].mean().item())
-            else:
-                raw_bar_s[name] = 0.0
+            raw_bar_s[name] = float(layer.compute_expand_capacity_bar_s(use_cached=True))
 
         g_max = max(raw_g.values())
         s_max = max(raw_bar_s.values())
