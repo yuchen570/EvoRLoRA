@@ -1773,7 +1773,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adalora_delta_t", type=int, default=200)
     parser.add_argument("--adalora_init_r", type=int, default=None, help="AdaLoRA init_r，默认 2*target_rank")
     parser.add_argument("--adalora_tinit", type=int, default=None, help="AdaLoRA 初始满秩阶段步数 tinit，默认 floor(0.1*total_step)")
-    parser.add_argument("--adalora_tfinal", type=int, default=None, help="AdaLoRA 末尾不调秩阶段步数 tfinal，默认 floor(0.8*total_step)")
+    parser.add_argument(
+        "--adalora_tfinal",
+        type=int,
+        default=None,
+        help="AdaLoRA 末尾不调秩阶段步数 tfinal，默认 floor(0.1*total_step)（与 peft_factory 实际默认一致）",
+    )
     parser.add_argument(
         "--adalora_orth_reg_weight",
         type=float,

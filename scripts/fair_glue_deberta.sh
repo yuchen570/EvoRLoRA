@@ -12,6 +12,13 @@
 # 公平原则: 同 lr / epochs / batch_size / warmup / weight_decay / grad_norm / seed
 # 注：为避免 LoRA 在 DeBERTa+CoLA 上出现 NaN，本脚本统一使用更稳定的 2e-4。
 # 方法特有参数 (adalora_*, sora_*, lora_ga_*) 仅作为该方法的内部自由度
+#
+# EvoRank 专用（仅影响 method=evorank；其它方法忽略）:
+#   --mini_val_k   从验证集 loader 取前 K 个 batch 缓存，供每轮 ES trial 上算 reward。
+#                  过小则 reward 方差大、结构决策更噪；run_benchmark 默认 8。
+#   --lambda_pop   每轮 ES 里最多评估的结构候选数（不含始终参与的 no-op）；
+#                  配合默认 --population_strategy all 时取 generate_mutations 列表前 N 个。
+#                  省略或设为 <=0 表示不截断（评估全部候选）。曾用 2 可省墙钟，但易漏掉更优剪枝/重分配。
 # ============================================================================
 mkdir -p logs runs artifacts
 
