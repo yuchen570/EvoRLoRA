@@ -528,9 +528,11 @@ def peft_factory(
             controller_kwargs={"rho": 0.9, "p_g": 0.8, "p_p": 0.1, "H_g": 2, "H_p": 3, "cooldown_steps": 2},
         )
         # EvoRank 手动注入后，需要显式解冻任务头（与 HF PEFT 在 SEQ_CLS 下的行为对齐）。
-        # NLU 通常是 classifier.*（或 score.*、pooler）；NLG Seq2Seq 通常为 lm_head/shared。
+        # DeBERTa 上与标准 LoRA 一致：不训练 pooler，避免 dtype/数值路径问题。
         for name, param in model.named_parameters():
-            if "classifier" in name or "score" in name or "lm_head" in name or name == "shared" or "pooler" in name:
+            if "classifier" in name or "score" in name or "lm_head" in name or name == "shared":
+                param.requires_grad = True
+            elif "pooler" in name and "deberta" not in model_type:
                 param.requires_grad = True
 
     elif method_name == "lora-ga":
@@ -1024,16 +1026,16 @@ def run_training_loop(
         # LoRA-GA：A/B 与基座权重的抵消对 decay 极敏感，必须为 0。
         # 标准 LoRA / AdaLoRA：适配器矩阵通常不做 weight_decay（与常见 PEFT 复现一致），
         # 否则在 GLUE 等小数据、较高 lr 下易出现数值爆炸（logits/loss NaN）。
-        dynamic_wd_peft = 0.0 if method_name in ("lora-ga", "lora", "adalora") else weight_decay
+        dynamic_wd_peft = 0.0 if method_name in ("lora-ga", "lora", "adalora", "evorank") else weight_decay
         # 第二组若不写 weight_decay，会继承 AdamW(..., weight_decay=0.1)。运行证据：warmup 首步 lr 已非零后，
         # CoLA 在 global_step=1 出现 classifier.weight 范数为 Infinity；显式对 PEFT 两族均关掉 decay 可避免该路径。
-        _peft_no_decay = method_name in ("lora-ga", "lora", "adalora")
+        _peft_no_decay = method_name in ("lora-ga", "lora", "adalora", "evorank")
         _head_wd = 0.0 if _peft_no_decay else weight_decay
         _adam_wd = 0.0 if _peft_no_decay else weight_decay
 
         # fp16 参数（如 DeBERTa classifier）在 eps=1e-8 时易在首步触发分母下溢并数值爆炸；
-        # 运行日志已证实本仓库 LoRA+DeBERTa 路径存在该问题，LoRA 家族统一提升 eps。
-        _adam_eps = 1e-6 if method_name in ("lora-ga", "lora", "adalora") else 1e-8
+        # evorank 同样训练 fp16 头 + 适配器，与 lora/adalora/lora-ga 统一 eps。
+        _adam_eps = 1e-6 if method_name in ("lora-ga", "lora", "adalora", "evorank") else 1e-8
         optimizer = AdamW(
             [
                 {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
@@ -1043,7 +1045,7 @@ def run_training_loop(
             eps=_adam_eps,
         )
         sparse_optimizer = None
-    if is_main_process and method_name == "lora" and task_name in {"cola", "rte"}:
+    if is_main_process and method_name in {"lora", "evorank"} and task_name in {"cola", "rte"}:
         # region agent log
         _debug_log(
             run_id=f"{task_name}-{method_name}-seed{random_seed}-opt",
@@ -1095,7 +1097,7 @@ def run_training_loop(
     warmup_steps = int(total_train_steps * warmup_ratio)
     debug_steps = {0, min(99, max(total_train_steps - 1, 0)), max(total_train_steps - 1, 0)}
     # LoRA+GLUE：在已知易发散区间逐步打点，便于确认首个 NaN 出现在哪一步（不仅依赖硬编码的 99）。
-    lora_glue_step_trace = method_name == "lora" and task_name in {"cola", "rte"}
+    lora_glue_step_trace = method_name in {"lora", "evorank"} and task_name in {"cola", "rte"}
     lora_glue_early_steps = frozenset({1, 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 39})
     lr_scheduler = LambdaLR(
         optimizer,
@@ -1214,7 +1216,7 @@ def run_training_loop(
                     grad_norm_total = float(_gn.detach().item()) if isinstance(_gn, torch.Tensor) else float(_gn)
                 if (
                     is_main_process
-                    and method_name == "lora"
+                    and method_name in {"lora", "evorank"}
                     and task_name in {"cola", "rte"}
                     and (
                         global_step in debug_steps
@@ -1288,7 +1290,7 @@ def run_training_loop(
                 optimizer.step()
                 if (
                     is_main_process
-                    and method_name == "lora"
+                    and method_name in {"lora", "evorank"}
                     and task_name in {"cola", "rte"}
                     and global_step == 0
                 ):
@@ -1393,7 +1395,7 @@ def run_training_loop(
                 y_pred, y_true = collect_nlu_predictions(eval_model, ev_loader, device, regression=regression)
                 val_metric = compute_glue_primary_metric(task_name, y_pred, y_true)
                 metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred, y_true)
-                if method_name == "lora" and task_name in {"cola", "rte"} and epoch in {0, epochs - 1}:
+                if method_name in {"lora", "evorank"} and task_name in {"cola", "rte"} and epoch in {0, epochs - 1}:
                     pred_list = [int(x) for x in y_pred.reshape(-1).tolist()]
                     true_list = [int(x) for x in y_true.reshape(-1).tolist()]
                     pred_dist = {str(k): int(sum(1 for x in pred_list if x == k)) for k in sorted(set(pred_list))}
