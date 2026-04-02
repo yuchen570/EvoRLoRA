@@ -114,10 +114,9 @@ class EvoRankLoRALayer(nn.Module):
         new_rank = prev_rank + 1
         
         self.active_mask[index] = True
-        
-        # 新激活的 B 列不应绝对为 0，这可能阻碍梯度流动
-        # 使用小的高斯噪声进行初始化
-        nn.init.normal_(self.lora_B.weight[:, index], mean=0.0, std=1e-5)
+
+        # 论文 Practical Remarks：新分量可零初始化；B 列为零时该秩-1 通路初输出为 0，梯度仍经 A 与图回传。
+        nn.init.zeros_(self.lora_B.weight[:, index])
         
         # Double Scaling 防护：应用补偿因子
         # 缩放因子从 alpha/sqrt(prev_rank) 降为 alpha/sqrt(new_rank)，
@@ -197,13 +196,19 @@ class EvoRankLoRALayer(nn.Module):
         # .any() 会触发 Device-to-Host 隐式同步，DDP 下频繁调用会拖慢性能，仅 debug 模式开启
         if self.debug and not self.lora_A.weight.grad.any():
              warnings.warn("lora_A.grad 全为零，可能是 zero_grad() 之后未执行新的 backward()")
-             
+
+        active_idx = self.get_active_indices()
+        # 前向含 rsLoRA 标量 s=α/√r，故 ∂L/∂A 多带因子 s；除以 s 得到论文式 (222–235) 的 |⟨G, b_i a_i^T⟩|
+        s_layer = float(self.get_scaling_factor(max(len(active_idx), 1)))
+
         # s_1: 梯度交互项 | <G, b_i a_i^T> |
         # lora_A.grad 形状: (r_max, in_features), lora_A.weight 形状: (r_max, in_features)
         # 通过在维度 1 (in_features) 上逐元素相乘后求和，等效提取出迹:
         grad_interaction = torch.sum(self.lora_A.weight.grad * self.lora_A.weight, dim=1).abs()
+        if s_layer > 0.0:
+            grad_interaction = grad_interaction / s_layer
         # [可选等价实现]
-        # grad_interaction = torch.sum(self.lora_B.weight.grad * self.lora_B.weight, dim=0).abs()
+        # grad_interaction = torch.sum(self.lora_B.weight.grad * self.lora_B.weight, dim=0).abs() / s_layer
         
         # s_2: 范数项 ||b_i|| * ||a_i||
         norm_A = torch.norm(self.lora_A.weight, dim=1) # (r_max,)
@@ -212,16 +217,18 @@ class EvoRankLoRALayer(nn.Module):
         
         # 总分，仅计算 active indices，未激活的返回 0.0
         scores = torch.zeros(self.r_max, device=self.lora_A.weight.device)
-        active_idx = self.get_active_indices()
-        
+
         scores[active_idx] = alpha1 * grad_interaction[active_idx] + alpha2 * norm_product[active_idx]
         return scores
         
     @torch.no_grad()
     def compute_demand_score(self, use_cached: bool = False) -> float:
         """
-        计算当前层的容量需求分数代理 (Demand Score g_l)
-        用 ||grad_A||_F + ||grad_B||_F 这个代理指标完美承担相对大小的比较任务。
+        层需求信号 g_ℓ = ||∂L/∂(ΔW_ℓ)||_F（与论文式 (137) 一致）。
+
+        前向为 ΔW = s · B_active A_active（仅活跃秩），故 ∂L/∂B = s G A^T、∂L/∂A = s B^T G，
+        由 G A^T = (∂L/∂B)/s 得 G = (∂L/∂B/s) pinv(A^T)，且
+        ||G||_F^2 = tr(N^T N M M^T)，其中 N = ∂L/∂B/s，M = pinv(A^T)，只需 O(r^2) 与 r×k 的 pinv。
         """
         if use_cached and self._cached_demand_score is not None:
             return self._cached_demand_score
@@ -230,10 +237,25 @@ class EvoRankLoRALayer(nn.Module):
              raise ValueError("需要先调用 .backward() 计算出 lora_A 和 lora_B 的梯度")
         if self.debug and not self.lora_A.weight.grad.any():
              warnings.warn("lora_A.grad 全为零，可能是 zero_grad() 之后未执行新的 backward()")
-             
-        grad_norm_A = torch.norm(self.lora_A.weight.grad, p='fro')
-        grad_norm_B = torch.norm(self.lora_B.weight.grad, p='fro')
-        return (grad_norm_A + grad_norm_B).item()
+
+        active_idx = self.get_active_indices()
+        if len(active_idx) == 0:
+            return 0.0
+
+        s = float(self.get_scaling_factor(len(active_idx)))
+        if s == 0.0:
+            return 0.0
+
+        idx_t = torch.as_tensor(active_idx, device=self.lora_A.weight.device, dtype=torch.long)
+        gb = self.lora_B.weight.grad.index_select(1, idx_t).float()
+        a = self.lora_A.weight.index_select(0, idx_t).float()
+        n = gb / s
+        at = a.T
+        m = torch.linalg.pinv(at)
+        s_mtx = n.T @ n
+        t_mtx = m @ m.T
+        gf_sq = torch.trace(s_mtx @ t_mtx).clamp(min=0.0)
+        return float(torch.sqrt(gf_sq).item())
 
     def merge(self, W: nn.Parameter):
         """

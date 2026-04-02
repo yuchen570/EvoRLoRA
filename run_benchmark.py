@@ -397,6 +397,9 @@ def peft_factory(
     target_modules_override: Optional[str] = None,
     lora_ga_use_rslora: bool = False,
     lora_ga_stable_gamma: Optional[float] = None,
+    evorank_r_max: int = 16,
+    evorank_alpha_u: float = 1.0,
+    evorank_beta_u: float = 1.0,
 ) -> Tuple[nn.Module, Optional[RankEvolutionController], Dict[str, Any]]:
     # --target_modules 优先；否则按模型类型自动推断
     if target_modules_override:
@@ -521,11 +524,23 @@ def peft_factory(
         model = get_peft_model(model, config)
 
     elif method_name == "evorank":
+        er_max = int(evorank_r_max)
         controller = inject_evo_lora(
             model=model,
             target_modules=target_modules,
-            layer_kwargs={"r_max": 16, "r_init": target_rank, "lora_alpha": effective_alpha},
-            controller_kwargs={"rho": 0.9, "p_g": 0.8, "p_p": 0.1, "H_g": 2, "H_p": 3, "cooldown_steps": 2},
+            layer_kwargs={"r_max": er_max, "r_init": target_rank, "lora_alpha": effective_alpha},
+            controller_kwargs={
+                "rho": 0.9,
+                "p_g": 0.8,
+                "p_p": 0.1,
+                "H_g": 2,
+                "H_p": 3,
+                "cooldown_steps": 2,
+                "r_min": 2,
+                "r_max": er_max,
+                "alpha_u": float(evorank_alpha_u),
+                "beta_u": float(evorank_beta_u),
+            },
         )
         # EvoRank 手动注入后，需要显式解冻任务头（与 HF PEFT 在 SEQ_CLS 下的行为对齐）。
         # DeBERTa 上与标准 LoRA 一致：不训练 pooler，避免 dtype/数值路径问题。
@@ -829,6 +844,18 @@ def _state_dict_cpu(module: nn.Module) -> Dict[str, torch.Tensor]:
     return {k: v.detach().cpu() for k, v in module.state_dict().items()}
 
 
+def _extract_tunable_state_dict(module: nn.Module) -> Dict[str, torch.Tensor]:
+    """仅过滤出被微调（requires_grad=True）的权重以及核心相关的 Buffer（如 active_mask）。"""
+    ret = {}
+    trainable_keys = {n for n, p in module.named_parameters() if p.requires_grad}
+    for k, v in module.state_dict().items():
+        # EvoRank 的 active_mask 是 buffer，requires_grad 必然是 False，需硬匹配；
+        # 为了容错，也把带有 lora_ / pooler / classifier 的相关层强行抓包下来。
+        if k in trainable_keys or "active_mask" in k or "lora_" in k or "classifier" in k or "pooler" in k:
+            ret[k] = v.detach().cpu()
+    return ret
+
+
 def _save_checkpoint_pt(
     path: str,
     inner: nn.Module,
@@ -843,7 +870,7 @@ def _save_checkpoint_pt(
         "global_step": global_step,
         "epoch": epoch,
         "best_val_accuracy": best_val,
-        "model": _state_dict_cpu(inner),
+        "model": _extract_tunable_state_dict(inner),
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": lr_scheduler.state_dict(),
     }
@@ -871,10 +898,12 @@ def _save_final_artifact(
         meta["task_name"] = task_name
     with open(os.path.join(final_dir, "training_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
-    if hasattr(inner, "save_pretrained"):
+    if method_name in ["lora", "adalora", "lora-ga"] and hasattr(inner, "save_pretrained"):
         inner.save_pretrained(final_dir)
     else:
-        torch.save(_state_dict_cpu(inner), os.path.join(final_dir, "model_state.pt"))
+        # 手动注入的方法(SORA/EvoRank)虽然基座有 save_pretrained 但会全量保存，这里强制拦截并仅保存过滤后的微调权重至 .pt 文件
+        tunable_sd = _extract_tunable_state_dict(inner)
+        torch.save(tunable_sd, os.path.join(final_dir, "model_state.pt"))
     if tokenizer is not None:
         tokenizer.save_pretrained(final_dir)
 
@@ -1757,6 +1786,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb_project", type=str, default="evorank-benchmark")
     parser.add_argument("--lambda_c", type=float, default=0.0)
     parser.add_argument("--complexity_mode", type=str, default="rank_sum", choices=["rank_sum", "size_aware"])
+    parser.add_argument(
+        "--evorank_r_max",
+        type=int,
+        default=16,
+        help="EvoRank 每层秩超空间上限 R_max（与论文默认 16 一致）",
+    )
+    parser.add_argument(
+        "--evo_alpha_u",
+        type=float,
+        default=1.0,
+        help="EvoRank 容量组合 u_ℓ = α·g̃_ℓ + β·s̃̄_ℓ 中 α（见论文式 217）",
+    )
+    parser.add_argument(
+        "--evo_beta_u",
+        type=float,
+        default=1.0,
+        help="EvoRank 容量组合 u_ℓ 中 β",
+    )
     parser.add_argument("--lambda_pop", type=int, default=None)
     parser.add_argument("--population_strategy", type=str, default="all", choices=["all", "random"])
     parser.add_argument("--seed", type=int, default=42)
@@ -1896,6 +1943,9 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         target_modules_override=args.target_modules,
                         lora_ga_use_rslora=args.lora_ga_use_rslora,
                         lora_ga_stable_gamma=current_lora_ga_stable_gamma,
+                        evorank_r_max=args.evorank_r_max,
+                        evorank_alpha_u=args.evo_alpha_u,
+                        evorank_beta_u=args.evo_beta_u,
                     )
                     checkpoint_root: Optional[str] = None
                     if not args.no_output_dir:

@@ -201,15 +201,6 @@ def train_evo_lora_step(
     logits = model(inputs)
     train_loss = loss_fn(logits, targets)
     train_loss.backward()
-    # 反向传播后立即缓存每层统计量，后续 controller 只读缓存避免重复计算。
-    for layer in controller.layers.values():
-        layer.cache_statistics_from_current_gradients()
-
-    # 梯度裁剪（在 optimizer.step 之前）
-    if max_grad_norm is not None and max_grad_norm > 0:
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad], max_grad_norm
-        )
 
     result: Dict[str, Any] = {
         "train_loss": float(train_loss.detach().item()),
@@ -219,15 +210,30 @@ def train_evo_lora_step(
         "best_mutation": None,
     }
 
+    should_evolve = (
+        step >= warmup_steps and T_es > 0 and step % T_es == 0
+    )
+    did_cache_stats = False
+    if should_evolve:
+        # 在梯度裁剪之前缓存 g_ℓ 与分量分数，对应 ∂L/∂ΔW（与论文一致）；裁剪会改变范数口径。
+        # cache_statistics_from_current_gradients 内对 g_ℓ 与各分量评分只各算一次并写入缓存，供 update_statistics 复用。
+        for layer in controller.layers.values():
+            layer.cache_statistics_from_current_gradients()
+        did_cache_stats = True
+
+    # 梯度裁剪在反传后、优化器步之前执行。
+    if max_grad_norm is not None and max_grad_norm > 0:
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.requires_grad], max_grad_norm
+        )
+
     # 1) Warmup：严格跳过结构演化，避免 Step 早期零梯度陷阱污染统计。
     if step < warmup_steps:
         optimizer.step()
         return result
 
-    # 2) 每隔 T_es 步触发一次外环结构演化。
-    should_evolve = (T_es > 0) and (step % T_es == 0)
+    # 2) 外环结构演化（统计已在裁剪前写入 layer 缓存）。
     if should_evolve:
-        # 必须在 optimizer.step() 之前调用，保证 LoRA 梯度仍可用于评分。
         controller.update_statistics()
         # DDP 下为避免统计量在各卡之间出现微小差异，进一步对 EMA 统计做全局一致化。
         if dist.is_available() and dist.is_initialized():
@@ -323,4 +329,7 @@ def train_evo_lora_step(
 
     # 3) 参数更新始终发生在本步末尾，保证训练主干稳定推进。
     optimizer.step()
+    if did_cache_stats:
+        for layer in controller.layers.values():
+            layer.clear_statistics_cache()
     return result

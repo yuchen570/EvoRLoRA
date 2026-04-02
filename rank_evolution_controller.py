@@ -119,6 +119,9 @@ class RankEvolutionController:
         H_g: int = 2,
         H_p: int = 3,
         cooldown_steps: int = 2,
+        # 与论文动态阈值小节capacity score一致：u_ℓ = α_g · g̃_ℓ + β_s · s̃̄_ℓ（层间 min-max 归一化）
+        alpha_u: float = 1.0,
+        beta_u: float = 1.0,
         # ===== ES 候选限流（避免 Reallocate 组合爆炸）=====
         max_expand_candidates: Optional[int] = None,
         max_prune_candidates: Optional[int] = None,
@@ -137,7 +140,9 @@ class RankEvolutionController:
         self.H_g = H_g
         self.H_p = H_p
         self.cooldown_steps = cooldown_steps
-        
+        self.alpha_u = float(alpha_u)
+        self.beta_u = float(beta_u)
+
         device = next(iter(self.layers.values())).lora_A.weight.device
         
         # 内部状态变量
@@ -183,24 +188,42 @@ class RankEvolutionController:
                 pass
 
     def update_statistics(self):
-        """收集当前层的需求评分与重要性评分，并使用 EMA 平滑累加。"""
+        """收集 g_ℓ、组件重要性，组合成 u_ℓ（论文式 217）并对 s_{ℓ,i} 做 EMA。"""
+        raw_g: Dict[str, float] = {}
+        raw_bar_s: Dict[str, float] = {}
+        curr_s_by_name: Dict[str, torch.Tensor] = {}
+
         for name, layer in self.layers.items():
-            # Demand Score u_l
-            curr_u = layer.compute_demand_score(use_cached=True)
+            g_val = layer.compute_demand_score(use_cached=True)
+            curr_s = layer.compute_component_importance(use_cached=True)
+            curr_s_by_name[name] = curr_s
+            active = layer.active_mask
+            raw_g[name] = g_val
+            if active.any():
+                raw_bar_s[name] = float(curr_s[active].mean().item())
+            else:
+                raw_bar_s[name] = 0.0
+
+        g_max = max(raw_g.values())
+        s_max = max(raw_bar_s.values())
+        eps = 1e-12
+
+        for name, layer in self.layers.items():
+            g_t = raw_g[name] / (g_max + eps)
+            s_t = raw_bar_s[name] / (s_max + eps)
+            curr_u = self.alpha_u * g_t + self.beta_u * s_t
             if not self._is_initialized:
                 self.ema_u[name] = curr_u
             else:
                 self.ema_u[name] = self.rho * self.ema_u[name] + (1 - self.rho) * curr_u
-                
-            # Importance Score s_{l,i}
-            curr_s = layer.compute_component_importance(use_cached=True)
-            # 只有活跃组件的评分才有效累加
+
+            curr_s = curr_s_by_name[name]
             active = layer.active_mask
             if not self._is_initialized:
                 self.ema_s[name][active] = curr_s[active]
             else:
                 self.ema_s[name][active] = self.rho * self.ema_s[name][active] + (1 - self.rho) * curr_s[active]
-                
+
         self._is_initialized = True
 
     def compute_thresholds(self) -> Tuple[float, float]:
