@@ -28,7 +28,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
   --methods lora adalora evorank lora-ga sora \
-  --task_list cola sst2 mrpc qqp stsb mnli qnli wnli \
+  --task_list mnli sst2 cola qqp qnli mrpc stsb \
   --model_list microsoft/deberta-v3-base \
   --target_rank 8 \
   --lora_alpha 16 \

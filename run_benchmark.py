@@ -228,7 +228,7 @@ def setup_data_and_model(
 
         collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
 
-        val_loader_eval_full: Optional[DataLoader] = None
+        val_loader_eval_full: Optional[Union[DataLoader, Dict[str, DataLoader]]] = None
         if ddp_enabled and world_size > 1:
             train_sampler = DistributedSampler(
                 tokenized[train_split],
@@ -254,12 +254,21 @@ def setup_data_and_model(
                 tokenized[val_split], batch_size=batch_size, sampler=val_sampler, collate_fn=collator
             )
             # GLUE 官方主指标（MCC/F1 等）需全验证集；与 NLG 一致，仅 rank0 用该 loader 做评估。
-            val_loader_eval_full = DataLoader(
-                tokenized[val_split], batch_size=batch_size, shuffle=False, collate_fn=collator
-            )
+            if task_name == "mnli":
+                val_m_loader = DataLoader(tokenized["validation_matched"], batch_size=batch_size, shuffle=False, collate_fn=collator)
+                val_mm_loader = DataLoader(tokenized["validation_mismatched"], batch_size=batch_size, shuffle=False, collate_fn=collator)
+                val_loader_eval_full = {"matched": val_m_loader, "mismatched": val_mm_loader}
+            else:
+                val_loader_eval_full = DataLoader(tokenized[val_split], batch_size=batch_size, shuffle=False, collate_fn=collator)
         else:
             train_loader = DataLoader(tokenized[train_split], batch_size=batch_size, shuffle=True, collate_fn=collator)
             val_loader = DataLoader(tokenized[val_split], batch_size=batch_size, shuffle=False, collate_fn=collator)
+            if task_name == "mnli":
+                val_m_loader = DataLoader(tokenized["validation_matched"], batch_size=batch_size, shuffle=False, collate_fn=collator)
+                val_mm_loader = DataLoader(tokenized["validation_mismatched"], batch_size=batch_size, shuffle=False, collate_fn=collator)
+                val_loader_eval_full = {"matched": val_m_loader, "mismatched": val_mm_loader}
+            else:
+                val_loader_eval_full = val_loader
 
         if task_name == "stsb":
             base_model = AutoModelForSequenceClassification.from_pretrained(
@@ -1422,9 +1431,19 @@ def run_training_loop(
             if is_main_process:
                 ev_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
                 eval_model = _unwrap_training_module(model)
-                y_pred, y_true = collect_nlu_predictions(eval_model, ev_loader, device, regression=regression)
-                val_metric = compute_glue_primary_metric(task_name, y_pred, y_true)
-                metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred, y_true)
+                if isinstance(ev_loader, dict):
+                    y_pred_m, y_true_m = collect_nlu_predictions(eval_model, ev_loader["matched"], device, regression=regression)
+                    y_pred_mm, y_true_mm = collect_nlu_predictions(eval_model, ev_loader["mismatched"], device, regression=regression)
+                    val_metric_m = compute_glue_primary_metric(task_name, y_pred_m, y_true_m)
+                    val_metric_mm = compute_glue_primary_metric(task_name, y_pred_mm, y_true_mm)
+                    val_metric = (val_metric_m + val_metric_mm) / 2.0
+                    metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred_m, y_true_m)
+                    metrics_dict_val["accuracy_m"] = val_metric_m
+                    metrics_dict_val["accuracy_mm"] = val_metric_mm
+                else:
+                    y_pred, y_true = collect_nlu_predictions(eval_model, ev_loader, device, regression=regression)
+                    val_metric = compute_glue_primary_metric(task_name, y_pred, y_true)
+                    metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred, y_true)
                 if method_name in {"lora", "evorank"} and task_name in {"cola", "rte"} and epoch in {0, epochs - 1}:
                     pred_list = [int(x) for x in y_pred.reshape(-1).tolist()]
                     true_list = [int(x) for x in y_true.reshape(-1).tolist()]
@@ -1718,6 +1737,8 @@ def run_training_loop(
         
         "matthews_corrcoef": best_val_metrics.get("matthews_corrcoef", "") if task_type == "nlu" else "",
         "accuracy": best_val_metrics.get("accuracy", "") if task_type == "nlu" else "",
+        "accuracy_m": best_val_metrics.get("accuracy_m", "") if task_type == "nlu" else "",
+        "accuracy_mm": best_val_metrics.get("accuracy_mm", "") if task_type == "nlu" else "",
         "f1": best_val_metrics.get("f1", "") if task_type == "nlu" else "",
         "pearson_spearman_mean": best_val_metrics.get("pearson_spearman_mean", "") if task_type == "nlu" else "",
         "pearson": best_val_metrics.get("pearson", "") if task_type == "nlu" else "",
@@ -2036,7 +2057,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
                 # 多种子聚合：追加均值/标准差汇总行
                 if args.is_main_process and len(seed_results) > 1:
-                    metric_keys = ["matthews_corrcoef", "accuracy", "f1", "pearson_spearman_mean", "pearson", "spearman", "rouge1", "rouge2", "rougeL"]
+                    metric_keys = ["matthews_corrcoef", "accuracy", "accuracy_m", "accuracy_mm", "f1", "pearson_spearman_mean", "pearson", "spearman", "rouge1", "rouge2", "rougeL"]
                     
                     mean_row = dict(seed_results[0])
                     std_row = dict(seed_results[0])
@@ -2078,6 +2099,8 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "trainable_params",
                     "matthews_corrcoef",
                     "accuracy",
+                    "accuracy_m",
+                    "accuracy_mm",
                     "f1",
                     "pearson_spearman_mean",
                     "pearson",
