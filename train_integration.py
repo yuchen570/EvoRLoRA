@@ -24,7 +24,7 @@ class _PaddingTrialMutation(ModuleMutation):
 
 class EvoRankLoRAWrapper(nn.Module):
     """
-    将冻结的原线性层与可演化 LoRA 旁路组合在一起。
+    将冻结的原线性层与可演化 LoRA 旁路组合（论文 Eq. 81: W' = W + ΔW）。
     前向输出: base_layer(x) + lora_layer(x)
     """
 
@@ -135,11 +135,20 @@ def train_evo_lora_step(
     max_grad_norm: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    双时间尺度训练模板：
-    - Inner loop: 每步都做参数梯度下降（optimizer.step）
-    - Outer loop: 每隔 T_es 步做一次结构演化（ES trial/commit）
+    论文 Alg. 1：双时间尺度训练步。
 
-    该函数只演示单步的执行顺序，外层可在 epoch/datalaoder 中反复调用。
+    Inner loop（Alg. 1 line 4–6）：每步对 active LoRA 参数做梯度下降。
+    Outer loop（Alg. 1 line 7–12, Alg. 2）：每 T_es 步做结构演化：
+      1. 缓存 g_ℓ 与 s^red（Eq. 138, 150）——在 clip_grad_norm 之前
+      2. EMA + 阈值 + 计数器（Alg. 2 全流程）
+      3. 生成候选 N(z_t)（Sec 3.4 三类变异）
+      4. 逐候选 apply → D_val eval → undo（Alg. 1 line 9–10）
+      5. Elitist selection（Eq. 167）：z_{t+1} = argmax R(z)
+         - R(z') = -L_val(Θ;z') - λ_c C(z')  …Eq. 163
+         - C(z): rank_sum（Eq. 127）或 size_aware（Eq. 131）
+      6. no-op（z_t）始终参与竞选，保证 R 单调不减（Theorem 4.4）
+
+    Warmup（Alg. 2 line 2–3, Sec 3.7 line 268）：前 10% steps 仅做参数更新。
     """
     def _iter_val_batches(
         batch_or_batches: Optional[
@@ -170,9 +179,12 @@ def train_evo_lora_step(
                 ctrl.cooldowns[name] = ctrl.cooldowns[name].to(layer_device)
 
     def _compute_complexity(ctrl: RankEvolutionController, mode: str) -> float:
+        """论文 Eq. 127 / 131：结构复杂度 C(z)。"""
         if mode == "rank_sum":
+            # Eq. 127: C(z) = Σ_ℓ r_ℓ
             return float(sum(layer.get_active_rank() for layer in ctrl.layers.values()))
         if mode == "size_aware":
+            # Eq. 131: C(z) = Σ_ℓ (d_ℓ + k_ℓ) r_ℓ
             return float(
                 sum((layer.in_features + layer.out_features) * layer.get_active_rank() for layer in ctrl.layers.values())
             )
@@ -227,12 +239,12 @@ def train_evo_lora_step(
             [p for p in model.parameters() if p.requires_grad], max_grad_norm
         )
 
-    # 1) Warmup：严格跳过结构演化，避免 Step 早期零梯度陷阱污染统计。
+    # 1) Warmup（论文 Alg. 2 line 2–3, Sec 3.7: 前 10% steps 禁止结构演化）
     if step < warmup_steps:
         optimizer.step()
         return result
 
-    # 2) 外环结构演化（统计已在裁剪前写入 layer 缓存）。
+    # 2) 外环结构演化（论文 Alg. 1 line 7–12; 统计已在裁剪前写入 layer 缓存）
     if should_evolve:
         controller.update_statistics()
         # DDP 下为避免统计量在各卡之间出现微小差异，进一步对 EMA 统计做全局一致化。
@@ -273,7 +285,7 @@ def train_evo_lora_step(
 
             rewards: List[Tuple[float, Optional[ModuleMutation]]] = []
             with torch.no_grad():
-                # no-op 候选：与论文 elitist 选择一致，当前结构也参与竞选
+                # 论文 Eq. 167 elitist selection: z_t (no-op) 始终在候选集中
                 base_eval_losses: List[torch.Tensor] = []
                 for val_inputs, val_targets in val_batches:
                     val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
@@ -285,8 +297,9 @@ def train_evo_lora_step(
                     reduced_base = base_eval_loss.clone()
                     dist.all_reduce(reduced_base, op=dist.ReduceOp.SUM)
                     base_eval_loss = reduced_base / dist.get_world_size()
+                # 论文 Eq. 163: R(z) = -L_val(Θ; z) - λ_c · C(z)
                 base_reward = -float(base_eval_loss.item()) - lambda_c * _compute_complexity(controller, complexity_mode)
-                rewards.append((base_reward, None))
+                rewards.append((base_reward, None))  # no-op reward
 
                 for mutation in mutations:
                     if isinstance(mutation, _PaddingTrialMutation):
@@ -318,8 +331,9 @@ def train_evo_lora_step(
                 model.train()
 
             if rewards:
+                # 论文 Eq. 167: z_{t+1} = argmax_{z ∈ {z_t} ∪ N(z_t)} R(z)
+                # Theorem 4.4 保证 R(z_{t+1}) ≥ R(z_t)（单调不减）
                 best_reward, best_mutation = max(rewards, key=lambda x: x[0])
-                # 仅当变异优于 no-op 时才提交，严格遵循 elitist selection
                 if best_mutation is not None:
                     controller.commit_mutation(best_mutation)
                 # ES 轮次结束后，主动回收未提交候选的缓存引用，降低潜在显存滞留风险。
@@ -327,7 +341,7 @@ def train_evo_lora_step(
                 result["best_reward"] = best_reward
                 result["best_mutation"] = "noop" if best_mutation is None else best_mutation.__class__.__name__
 
-    # 3) 参数更新始终发生在本步末尾，保证训练主干稳定推进。
+    # 3) 参数更新（论文 Alg. 1 line 5–6: 每步对 active Θ 做梯度下降）
     optimizer.step()
     if did_cache_stats:
         for layer in controller.layers.values():

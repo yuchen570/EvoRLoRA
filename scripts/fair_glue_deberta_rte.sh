@@ -5,6 +5,7 @@
 # RTE 是极小数据集 (2.5k 训练样本)。
 # 实测在统一大 lr (1.2e-3) 下 LoRA 会早期出现 NaN，导致验证恒定预测。
 # 这里改为跨方法统一且稳定的 lr=2e-4 做公平横向对比。
+# EvoRank: --expand_init_mode gradient（仅 evorank 生效）
 # ============================================================================
 mkdir -p logs runs artifacts
 
@@ -30,6 +31,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29510 \
   --lora_ga_stable_gamma 16 \
   --sora_sparse_lambda 10 \
   --sora_sparse_lambda_2 3e-4 \
+  --expand_init_mode gradient \
   --seed_list 0 21 42 81 100 \
   --log_dir runs/fair_glue_deberta_rte_ddp \
   --output_dir artifacts \

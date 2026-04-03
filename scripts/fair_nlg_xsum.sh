@@ -6,6 +6,7 @@
 #   - AdaLoRA (run_bart_xsum.sh): lr=5e-4, epochs=25, per_device_bsz=8,
 #     lora_alpha=32, target_modules=q_proj,k_proj,v_proj,out_proj,fc1,fc2,
 #     warmup=3000 steps (对应约 warmup_ratio≈0.06)
+# EvoRank: --expand_init_mode gradient（仅 evorank 生效）
 # ============================================================================
 mkdir -p logs runs artifacts
 
@@ -35,6 +36,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29530 \
   --lora_ga_stable_gamma 16 \
   --sora_sparse_lambda 10 \
   --sora_sparse_lambda_2 3e-4 \
+  --expand_init_mode gradient \
   --seed 42 \
   --log_dir runs/fair_nlg_xsum_ddp \
   --output_dir artifacts \

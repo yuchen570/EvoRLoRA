@@ -2,24 +2,33 @@ import math
 import torch
 import torch.nn as nn
 import warnings
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 class EvoRankLoRALayer(nn.Module):
     """
-    EvoRank-LoRA 的核心可演化秩层。
-    
-    论文机制实现:
-    1. 秩超空间 (Rank Super-Space): 维护最大秩为 r_max 的 A 和 B 矩阵。
-    2. 掩码控制 (Mask Control): 使用二进制掩码激活部分秩-1组件, 未激活部分不参与前向计算。
-    3. 缩放平滑 (Scaling & Smoothing): 遵循 rsLoRA (lora_alpha / sqrt(r)), 并在扩张/缩减时进行权重补偿。 
-    4. 高效评价 (Trace Trick): 避免实例化高显存占用的梯度矩阵 G = dL/dW_l, 利用 A.grad 和 B.grad 进行评分。
-    
-    注意: 本层保持"无状态"(Stateless)，仅负责响应外部控制。
-    EMA历史、计数器 H_g/H_p、冷却期控制应由外部 Controller 负责。
-    
-    警告 (Zero-Gradient Trap): 由于 lora_B 零初始化，训练 Step 0 时 grad_A = B^T @ G 必为零，
-    此时调用 compute_component_importance 会返回全零评分。外部 Controller 必须严格执行
-    论文规定的 Warmup 机制（前 10% steps 禁止剪枝/扩张），等 B 充分更新后才能评分。
+    EvoRank-LoRA 的核心可演化秩层（论文 Sec 3.3 Rank Super-Space Parameterization）。
+
+    论文公式对应：
+      Eq. 100:  ΔW_ℓ = Σ_{i=1}^{R_max} m_{ℓ,i} b_{ℓ,i} a_{ℓ,i}^T
+      Eq. 104:  ΔW_ℓ = B_ℓ M_ℓ A_ℓ   （M = diag(m_1, ..., m_{R_max})）
+      Eq. 116:  r_ℓ = Σ m_{ℓ,i}      （有效秩 = active_mask.sum()）
+      Eq. 138:  g_ℓ = ||∂L/∂ΔW_ℓ||_F  （层需求信号）
+      Eq. 142:  s_{ℓ,i} = ||b_{ℓ,i}|| ||a_{ℓ,i}||  （组件重要性）
+      Eq. 146:  u_ℓ = α g_ℓ + β (1/r_ℓ) Σ s_{ℓ,i}  （容量评分）
+      Eq. 150:  s^red_{ℓ,i} = α₁||b||·||a|| + α₂|⟨G, b a^T⟩|  （剪枝评分）
+      Prop 3.2: 最优 rank-1 扩张方向 = G 的主左右奇异向量
+
+    实现说明：
+    1. 秩超空间：lora_A (r_max × in), lora_B (out × r_max)，掩码选择活跃组件。
+    2. 缩放：采用 rsLoRA (α/√r)——论文原文 ΔW = BA 无缩放，此处为工程兼容
+       添加并在 expand/reduce 时做补偿（乘 √(r_new/r_old)），保持 ΔW 输出连续。
+    3. 高效评价：避免实例化 G = ∂L/∂ΔW (out × in 巨矩阵)，利用 A.grad 和 B.grad
+       的 trace trick 计算 g_ℓ 和 s^red_{ℓ,i}。
+    4. 本层保持无状态；EMA/计数器/冷却期由 RankEvolutionController 管理。
+
+    警告 (Zero-Gradient Trap): 由于 lora_B 零初始化，训练 Step 0 时 grad_A = B^T @ G
+    必为零。外部 Controller 必须遵循论文 Sec 3.7（line 268）的 Warmup（前 10% steps
+    禁止剪枝/扩张），等 B 充分更新后才能评分。
     """
     
     def __init__(
@@ -64,6 +73,7 @@ class EvoRankLoRALayer(nn.Module):
         self._cached_demand_score: Optional[float] = None
         self._cached_prune_scores: Optional[torch.Tensor] = None
         self._cached_expand_bar_s: Optional[float] = None
+        self._cached_grad_direction: Optional[Tuple[torch.Tensor, torch.Tensor, float]] = None
         
     def reset_parameters(self):
         """标准 LoRA 初始化：A Kaiming, B Zero"""
@@ -79,8 +89,11 @@ class EvoRankLoRALayer(nn.Module):
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        前向传播计算:
-        仅提取 current active components，避免在零组件上进行冗余矩阵乘法。
+        前向传播（论文 Eq. 100–104）：
+          ΔW_ℓ = Σ_{i: m_i=1} b_i a_i^T  →  等价于 B_active @ A_active
+          output = x · ΔW^T · s       （s = α/√r, rsLoRA 缩放）
+
+        实现：仅提取 active_mask=1 的行/列做矩阵乘，不实例化 R_max 维完整乘积。
         """
         active_indices = self.get_active_indices()
         
@@ -104,20 +117,44 @@ class EvoRankLoRALayer(nn.Module):
         return out * scaling
 
     @torch.no_grad()
-    def activate_component(self, index: int):
+    def activate_component(
+        self,
+        index: int,
+        init_mode: str = "zero",
+        grad_direction: Optional[Tuple[torch.Tensor, torch.Tensor, float]] = None,
+    ):
         """
         激活 (Expand) 一个秩-1组件，并进行补偿归一化。
+
+        init_mode:
+            "zero"     -- B 列清零（安全 cold start，默认）
+            "gradient" -- 论文 Proposition 3.2：B 列和 A 行设为 ∂L/∂ΔW 的主奇异方向
+        grad_direction:
+            (u1, v1, sigma1) 元组，由 compute_gradient_rank1_direction() 提供。
         """
         if self.active_mask[index]:
-            return # 已激活
+            return
 
         prev_rank = self.get_active_rank()
         new_rank = prev_rank + 1
-        
+
         self.active_mask[index] = True
 
-        # 论文 Practical Remarks：新分量可零初始化；B 列为零时该秩-1 通路初输出为 0，梯度仍经 A 与图回传。
-        nn.init.zeros_(self.lora_B.weight[:, index])
+        if init_mode == "gradient" and grad_direction is not None:
+            u1, v1, _sigma1 = grad_direction
+            # 用现有活跃 B 列的平均范数作为参考尺度，取 1% 作为新分量幅度
+            old_indices = [i for i, m in enumerate(self.active_mask.tolist()) if m and i != index]
+            if old_indices:
+                idx_old = torch.as_tensor(old_indices, device=self.lora_B.weight.device, dtype=torch.long)
+                avg_b_norm = torch.norm(self.lora_B.weight[:, idx_old].float(), dim=0).mean().item()
+                init_scale = 0.01 * max(avg_b_norm, 1e-6)
+            else:
+                init_scale = 0.01
+            # u1 指向 G 的主左奇异方向；取负号使 b·a^T 朝 -G 方向（降低 loss）
+            self.lora_B.weight.data[:, index] = (-u1 * init_scale).to(self.lora_B.weight.dtype)
+            self.lora_A.weight.data[index, :] = v1.to(self.lora_A.weight.dtype)
+        else:
+            nn.init.zeros_(self.lora_B.weight[:, index])
         
         # Double Scaling 防护：应用补偿因子
         # 缩放因子从 alpha/sqrt(prev_rank) 降为 alpha/sqrt(new_rank)，
@@ -133,8 +170,14 @@ class EvoRankLoRALayer(nn.Module):
     @torch.no_grad()
     def deactivate_component(self, index: int):
         """
-        休眠 (Prune) 一个秩-1组件。
-        权重不清零，支持未来重激活时的权重继承 (Weight Inheritance)。
+        休眠 (Prune) 一个秩-1组件（论文 Sec 3.4 Reduction）。
+
+        Theorem 3.3（Eq. 406–411）给出移除 j-th 组件的 loss 上界：
+          L(ΔW^{-j}) - L(ΔW) ≤ |⟨∇L, b_j a_j^T⟩| + (β/2)||b_j||²||a_j||²
+        代码中 s^red 即为该上界的无 β 近似（Eq. 150），controller 据此判定哪些组件可裁。
+
+        权重不清零，支持未来重激活时的权重继承（论文 Sec 3.6 "Inactive components
+        keep their stored weights, which enables weight inheritance if they are reactivated"）。
         """
         if not self.active_mask[index]:
             return # 已休眠
@@ -168,22 +211,114 @@ class EvoRankLoRALayer(nn.Module):
         self._cached_demand_score = None
         self._cached_prune_scores = None
         self._cached_expand_bar_s = None
+        self._cached_grad_direction = None
 
     @torch.no_grad()
     def cache_statistics_from_current_gradients(self, alpha1: float = 1.0, alpha2: float = 0.1):
         """
-        backward 后一次性缓存 g_ℓ、s^red（剪枝）和 \\bar s（扩张容量），
+        backward 后一次性缓存 g_ℓ、s^red（剪枝）、\\bar s（扩张容量）和梯度主方向，
         避免 controller 读取时重复计算。
         """
         self._cached_demand_score = self.compute_demand_score()
         self._cached_prune_scores = self._compute_prune_scores_raw(alpha1, alpha2)
         self._cached_expand_bar_s = self._compute_expand_bar_s_raw()
+        self._cached_grad_direction = self._compute_gradient_rank1_direction()
 
-    # ---- expand 路径：s_{ℓ,i} = ||b||·||a||（纯范数，论文式 142） ----
+    # ------ 梯度引导的 rank-1 扩张方向 (论文 Proposition 3.2) ------
+
+    @staticmethod
+    def _power_iteration_rank1(
+        N: torch.Tensor, M: torch.Tensor, num_iters: int = 5,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
+        """
+        论文 Proposition 3.2（Eq. 381–388）：最优 rank-1 扩张方向。
+
+        求 G ≈ N @ M 的主奇异三元组 (u₁, v₁, σ₁)，满足
+          max_{||a||=||b||=1} ⟨-G, b a^T⟩ = σ₁(G)
+        其中 u₁, v₁ 分别为 G 的主左、右奇异向量。
+
+        实现：power iteration（交替 Gv → u, G^Tu → v），每轮仅需
+        O(r·(out+in)) 运算，不构造 (out, in) 的完整 G 矩阵。
+        N: (out, r), M: (r, in); G = N @ M: (out, in)
+        Returns (u1, v1, sigma1) or None on degenerate input.
+        """
+        in_dim = M.size(1)
+        v = torch.randn(in_dim, device=N.device, dtype=N.dtype)
+        v = v / (v.norm() + 1e-12)
+
+        for _ in range(num_iters):
+            Mv = M @ v              # (r,)
+            u = N @ Mv               # (out,)
+            u_norm = u.norm()
+            if u_norm < 1e-12:
+                return None
+            u = u / u_norm
+
+            Ntu = N.T @ u            # (r,)
+            v = M.T @ Ntu            # (in,)
+            v_norm = v.norm()
+            if v_norm < 1e-12:
+                return None
+            v = v / v_norm
+
+        Mv = M @ v
+        sigma_signed = float(torch.dot(u, N @ Mv).item())
+        if sigma_signed < 0:
+            u = -u
+        return u, v, abs(sigma_signed)
+
+    @torch.no_grad()
+    def _compute_gradient_rank1_direction(
+        self,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
+        """
+        论文 Proposition 3.2：计算近似 G = ∂L/∂ΔW 的主 rank-1 奇异方向。
+        复用 compute_demand_score 的 (A^TA+εI)^{-1}A^T 重建，然后做 power iteration。
+        """
+        if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
+            return None
+
+        active_idx = self.get_active_indices()
+        if len(active_idx) == 0:
+            return None
+
+        s = float(self.get_scaling_factor(len(active_idx)))
+        if s == 0.0:
+            return None
+
+        idx_t = torch.as_tensor(active_idx, device=self.lora_A.weight.device, dtype=torch.long)
+        gb = self.lora_B.weight.grad.index_select(1, idx_t).float()
+        a = self.lora_A.weight.index_select(0, idx_t).float()
+
+        N = gb / s                    # (out, r)
+        at = a.T                      # (in, r)
+        ata = at.T @ at               # (r, r)
+        M = torch.linalg.solve(
+            ata + 1e-6 * torch.eye(ata.size(0), device=ata.device, dtype=ata.dtype),
+            at.T,
+        )                             # (r, in)
+
+        return self._power_iteration_rank1(N, M)
+
+    @torch.no_grad()
+    def compute_gradient_rank1_direction(
+        self, use_cached: bool = False,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
+        """获取（可缓存的）梯度主 rank-1 方向，供 ExpandMutation 使用。"""
+        if use_cached and self._cached_grad_direction is not None:
+            return self._cached_grad_direction
+        return self._compute_gradient_rank1_direction()
+
+    # ---- expand 路径：s_{ℓ,i} = ||b||·||a||（论文 Eq. 142） ----
     @torch.no_grad()
     def _compute_expand_bar_s_raw(self) -> float:
         """
-        扩张容量项 \\bar{s}_ℓ = (1/max(r_ℓ,1)) Σ_{i:active} ||b_{ℓ,i}||·||a_{ℓ,i}||。
+        扩张容量项（论文 Eq. 142 + 146）：
+          s_{ℓ,i} = ||b_{ℓ,i}||₂ · ||a_{ℓ,i}||₂           …Eq. 142
+          s̄_ℓ = (1/max(r_ℓ,1)) Σ_{i:active} s_{ℓ,i}       …Eq. 146 中第二项
+
+        该值进入 u_ℓ = α g̃_ℓ + β s̃̄_ℓ（Eq. 217），经 max-scaling 归一化后
+        做 EMA 和分位数阈值比较。
         """
         active_idx = self.get_active_indices()
         if not active_idx:
@@ -195,16 +330,29 @@ class EvoRankLoRALayer(nn.Module):
 
     @torch.no_grad()
     def compute_expand_capacity_bar_s(self, use_cached: bool = False) -> float:
-        """u_ℓ 中的纯范数容量均值（论文式 146），经 controller 归一化后组合为 u_ℓ。"""
+        """u_ℓ 中的纯范数容量均值 s̄_ℓ（论文 Eq. 146），经 controller 归一化后组合为 u_ℓ（Eq. 217）。"""
         if use_cached and self._cached_expand_bar_s is not None:
             return self._cached_expand_bar_s
         return self._compute_expand_bar_s_raw()
 
-    # ---- prune 路径：s^red_{ℓ,i} = α₁||b||·||a|| + α₂|⟨G, ba⊤⟩|（论文式 150） ----
+    # ---- prune 路径（论文 Eq. 150 + Theorem 3.3） ----
     @torch.no_grad()
     def _compute_prune_scores_raw(self, alpha1: float, alpha2: float) -> torch.Tensor:
         """
-        s^red_{ℓ,i} = α₁‖b_{ℓ,i}‖‖a_{ℓ,i}‖ + α₂|⟨∂L/∂ΔW_ℓ, b_{ℓ,i}a_{ℓ,i}⊤⟩|。
+        剪枝重要性评分（论文 Eq. 150）：
+          s^red_{ℓ,i} = α₁ ||b_{ℓ,i}|| · ||a_{ℓ,i}|| + α₂ |⟨∂L/∂ΔW_ℓ, b_{ℓ,i} a_{ℓ,i}^T⟩|
+
+        与 Theorem 3.3（Eq. 406–411）的联系：
+          移除组件 j 的 loss 增量上界为 |⟨∇L, b_j a_j^T⟩| + (β/2)||b_j||²||a_j||²，
+          s^red 中的两项分别近似该上界的一阶项和范数项（取线性组合替代二次范数更新步幅）。
+          分数小的组件对 loss 扰动小，优先候选剪枝。
+
+        梯度交互项的计算推导（避免构造 G ∈ R^{out×in}）：
+          前向：ΔW = s · B A，故 ∂L/∂A = s · B^T G（G = ∂L/∂ΔW）
+          ⟨G, b_i a_i^T⟩ = Σ_j (b_i^T G)_j · a_{ij}
+                          = (1/s) Σ_j grad_A[i,j] · A[i,j]
+          因此 grad_interaction[i] = |Σ_j grad_A[i,j] · A[i,j]| / s
+
         仅活跃位有值，未激活位为 0。
         """
         if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
@@ -237,7 +385,10 @@ class EvoRankLoRALayer(nn.Module):
         alpha2: float = 0.1,
         use_cached: bool = False,
     ) -> torch.Tensor:
-        """s^red_{ℓ,i}（论文式 150），供剪枝 EMA 与分位数阈值使用。"""
+        """
+        s^red_{ℓ,i}（论文 Eq. 150），供 controller 做 EMA（Eq. 234–237）与
+        分位数阈值 τ_prune（Eq. 254–264）比较使用。
+        """
         if use_cached and self._cached_prune_scores is not None:
             return self._cached_prune_scores
         return self._compute_prune_scores_raw(alpha1, alpha2)
@@ -255,11 +406,16 @@ class EvoRankLoRALayer(nn.Module):
     @torch.no_grad()
     def compute_demand_score(self, use_cached: bool = False) -> float:
         """
-        层需求信号 g_ℓ = ||∂L/∂(ΔW_ℓ)||_F（与论文式 (137) 一致）。
+        层需求信号 g_ℓ ≈ ||∂L/∂(ΔW_ℓ)||_F（论文式 138 的投影近似）。
 
-        前向为 ΔW = s · B_active A_active（仅活跃秩），故 ∂L/∂B = s G A^T、∂L/∂A = s B^T G，
-        由 G A^T = (∂L/∂B)/s 得 G = (∂L/∂B/s) pinv(A^T)，且
-        ||G||_F^2 = tr(N^T N M M^T)，其中 N = ∂L/∂B/s，M = pinv(A^T)，只需 O(r^2) 与 r×k 的 pinv。
+        注意：此实现计算的是真实 ||G||_F 的 **下界 (Lower Bound)**，而非精确值。
+        原因：pinv(A^T) 给出的是最小范数解，等价于将 G 投影到 A 的行空间上；
+        真实梯度矩阵 G 中正交于 A 行空间的分量被丢弃。在不使用 forward/backward
+        hooks 截获激活值的前提下，这是仅凭参数梯度所能做到的最优近似。
+
+        推导：前向为 ΔW = s · B_active A_active，故 ∂L/∂B = s G A^T、∂L/∂A = s B^T G，
+        由 G A^T = (∂L/∂B)/s 得 G_proj = (∂L/∂B/s) pinv(A^T)，且
+        ||G_proj||_F^2 = tr(N^T N M M^T)，其中 N = ∂L/∂B/s，M = pinv(A^T)。
         """
         if use_cached and self._cached_demand_score is not None:
             return self._cached_demand_score
@@ -281,8 +437,14 @@ class EvoRankLoRALayer(nn.Module):
         gb = self.lora_B.weight.grad.index_select(1, idx_t).float()
         a = self.lora_A.weight.index_select(0, idx_t).float()
         n = gb / s
-        at = a.T
-        m = torch.linalg.pinv(at)
+        at = a.T  # (in_features, r_active)
+        # 正则化正规方程替代 SVD 伪逆，避免 pinv 底层 SVD 的瞬间显存峰值：
+        # A^+ = (A^T A + εI)^{-1} A^T，其中 A^T A 仅为 (r, r) 极小矩阵。
+        ata = at.T @ at  # (r, r)
+        m = torch.linalg.solve(
+            ata + 1e-6 * torch.eye(ata.size(0), device=ata.device, dtype=ata.dtype),
+            at.T,
+        )  # (r, in_features)
         s_mtx = n.T @ n
         t_mtx = m @ m.T
         gf_sq = torch.trace(s_mtx @ t_mtx).clamp(min=0.0)
@@ -290,7 +452,7 @@ class EvoRankLoRALayer(nn.Module):
 
     def merge(self, W: nn.Parameter):
         """
-        合并回基础模型权重。
+        合并回基础模型权重（论文 Eq. 81: W' = W + ΔW）。
         W: 形状为 (out_features, in_features)
         """
         if self.get_active_rank() == 0:

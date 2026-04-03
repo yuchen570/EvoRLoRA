@@ -72,8 +72,6 @@ class SparseAdamW(torch.optim.AdamW):
                 for p in group["params"]:
                     if p.grad is None:
                         continue
-                    # Soft-thresholding (proximal operator of L1 norm)
-                    p.data[p.data > self.sparse_lambda] -= self.sparse_lambda
-                    p.data[p.data < -self.sparse_lambda] += self.sparse_lambda
-                    p.data[p.data.abs() < self.sparse_lambda] = 0.0
+                    # Soft-thresholding: θ ← sign(θ) · max(|θ| - λ, 0)
+                    p.data = torch.sign(p.data) * torch.clamp(p.data.abs() - self.sparse_lambda, min=0.0)
         return loss

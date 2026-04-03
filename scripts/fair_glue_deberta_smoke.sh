@@ -1,6 +1,7 @@
 #!/bin/bash
 # ============================================================================
 # 冒烟测试: SST-2 × DeBERTa-v3-base × 全方法 (50 步快速验证)
+# EvoRank: --expand_init_mode gradient（仅 evorank 生效，与 README 全对比冒烟一致）
 # ============================================================================
 mkdir -p logs runs artifacts
 
@@ -26,6 +27,7 @@ python run_benchmark.py \
   --sora_sparse_lambda 1e-3 \
   --sora_sparse_lambda_2 1e-4 \
   --sora_lambda_warmup_steps 50 \
+  --expand_init_mode gradient \
   --seed 42 \
   --log_dir runs/fair_smoke \
   --output_dir artifacts \

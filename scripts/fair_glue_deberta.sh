@@ -19,6 +19,8 @@
 #   --lambda_pop   每轮 ES 里最多评估的结构候选数（不含始终参与的 no-op）；
 #                  配合默认 --population_strategy all 时取 generate_mutations 列表前 N 个。
 #                  省略或设为 <=0 表示不截断（评估全部候选）。曾用 2 可省墙钟，但易漏掉更优剪枝/重分配。
+#   --expand_init_mode  仅 evorank：zero=B 列 cold start；gradient=论文 Prop 3.2 梯度主方向初始化。
+#                       同台五法可统一写上，其它方法忽略。
 # ============================================================================
 mkdir -p logs runs artifacts
 
@@ -44,6 +46,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --lora_ga_stable_gamma 16 \
   --sora_sparse_lambda 10 \
   --sora_sparse_lambda_2 3e-4 \
+  --expand_init_mode gradient \
   --seed_list 0 21 42 81 100 \
   --log_dir runs/fair_glue_deberta_ddp \
   --output_dir artifacts \

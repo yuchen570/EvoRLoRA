@@ -540,6 +540,7 @@ def peft_factory(
                 "r_max": er_max,
                 "alpha_u": float(evorank_alpha_u),
                 "beta_u": float(evorank_beta_u),
+                "expand_init_mode": getattr(args, "expand_init_mode", "zero"),
             },
         )
         # EvoRank 手动注入后，需要显式解冻任务头（与 HF PEFT 在 SEQ_CLS 下的行为对齐）。
@@ -1789,7 +1790,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_dir", type=str, default="runs/benchmark")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="evorank-benchmark")
-    parser.add_argument("--lambda_c", type=float, default=0.0)
+    parser.add_argument(
+        "--lambda_c",
+        type=float,
+        default=0.0,
+        help="EvoRank ES 结构奖励中的复杂度惩罚系数：R = -L_val - lambda_c * C(z)。"
+             "典型 CE loss 在 0.5~2.0 量级，rank_sum 模式下总秩可达数百，size_aware 模式下可达数十万，"
+             "因此建议设为 1e-4 ~ 1e-6 量级。默认 0.0 表示纯 loss 比较（无正则）。",
+    )
     parser.add_argument("--complexity_mode", type=str, default="rank_sum", choices=["rank_sum", "size_aware"])
     parser.add_argument(
         "--evorank_r_max",
@@ -1808,6 +1816,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="EvoRank 容量组合 u_ℓ 中 β",
+    )
+    parser.add_argument(
+        "--expand_init_mode",
+        type=str,
+        default="zero",
+        choices=["zero", "gradient"],
+        help="EvoRank 扩张初始化策略。"
+             "'zero': B 列清零（安全 cold start）；"
+             "'gradient': 论文 Proposition 3.2——基于 ∂L/∂ΔW 的主奇异方向初始化新分量，"
+             "通过 power iteration 高效计算，不构造完整梯度矩阵。",
     )
     parser.add_argument("--lambda_pop", type=int, default=None)
     parser.add_argument("--population_strategy", type=str, default="all", choices=["all", "random"])

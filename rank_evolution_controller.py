@@ -11,10 +11,14 @@ from evo_rank_lora import EvoRankLoRALayer
 
 class ModuleMutation(ABC):
     """
-    变异动作的基类 (Command 模式)。
-    隔离了外部 ES 的验证集探索 (Trial) 与最终落实 (Commit)。
-    - apply(): 临时修改模型参数以计算 Reward。
-    - undo(): 完全回滚刚才的参数修改。
+    变异动作基类（论文 Sec 3.4 ES-Based Structure Evolution, Alg. 1 line 9–10）。
+
+    三种变异对应论文 Sec 3.4 的三种 mutation type:
+      - ExpandMutation:     激活一个新 rank-1 组件
+      - PruneMutation:      休眠一个低重要性组件
+      - ReallocateMutation: 跨层 reduce + expand
+
+    Command 模式隔离 Trial（apply → eval → undo）与 Commit（apply → 永久生效）。
     """
     @abstractmethod
     def apply(self):
@@ -30,18 +34,30 @@ class ModuleMutation(ABC):
         pass
 
 class ExpandMutation(ModuleMutation):
-    def __init__(self, layer_name: str, layer: EvoRankLoRALayer, index: int):
+    def __init__(
+        self,
+        layer_name: str,
+        layer: EvoRankLoRALayer,
+        index: int,
+        init_mode: str = "zero",
+        grad_direction=None,
+    ):
         self.layer_name = layer_name
         self.layer = layer
         self.index = index
-        # 缓存扩张前的 A 和 B 的克隆 (为了完全精确地 undo compensate 的效果)
+        self.init_mode = init_mode
+        self.grad_direction = grad_direction
         self.cached_A = None
         self.cached_B = None
         
     def apply(self):
         self.cached_A = self.layer.lora_A.weight.data.clone()
         self.cached_B = self.layer.lora_B.weight.data.clone()
-        self.layer.activate_component(self.index)
+        self.layer.activate_component(
+            self.index,
+            init_mode=self.init_mode,
+            grad_direction=self.grad_direction,
+        )
         
     def undo(self):
         if self.cached_A is not None and self.cached_B is not None:
@@ -99,13 +115,17 @@ class ReallocateMutation(ModuleMutation):
 
 class RankEvolutionController:
     """
-    控制整个模型维度演化的核心大脑。
-    分为严格的执行阶段：
-    1. update_statistics(): 仅收集 EMA 分数
-    2. compute_thresholds(): 只算分位数阈值
-    3. tick_evolution_state(): 推进时间和计数器
-    4. generate_mutations(): 快照提取动作闭包 (Command对象)
-    5. commit_mutation(): 全局永久生效，处理 Rolling Candidacy
+    演化结构控制器（论文 Alg. 2 Dynamic Thresholding, Sec 3.7）。
+
+    实现论文中结构演化的全部状态管理：
+      1. update_statistics(): 计算 u_ℓ（Eq. 217）与 s^red_{ℓ,i}（Eq. 150），做 EMA（Eq. 228–237）
+      2. compute_thresholds(): 百分位阈值 τ_grow（Eq. 241–244）、τ_prune（Eq. 254–257）
+      3. tick_evolution_state(): 持久计数器 c^grow_ℓ / c^prune_{ℓ,i}（Alg. 2 line 8–22）+ cooldown
+      4. generate_mutations(): 达标候选收集（Sec 3.4 三类变异），送外层 ES
+      5. commit_mutation(): elitist 选中的赢家永久生效（Eq. 167, Theorem 4.4）
+
+    默认超参（论文 Sec 3.7 line 268）：
+      ρ=0.9, p_g=0.8, p_p=0.1, H_g=2, H_p=3, cooldown=2, r_min=2, r_max=16
     """
     
     def __init__(
@@ -119,7 +139,7 @@ class RankEvolutionController:
         H_g: int = 2,
         H_p: int = 3,
         cooldown_steps: int = 2,
-        # 与论文动态阈值小节capacity score一致：u_ℓ = α_g · g̃_ℓ + β_s · s̃̄_ℓ（层间 min-max 归一化）
+        # 与论文动态阈值小节capacity score一致：u_ℓ = α_g · g̃_ℓ + β_s · s̃̄_ℓ（层间 max-scaling 归一化，即 x/x_max）
         alpha_u: float = 1.0,
         beta_u: float = 1.0,
         # ===== ES 候选限流（避免 Reallocate 组合爆炸）=====
@@ -127,6 +147,7 @@ class RankEvolutionController:
         max_prune_candidates: Optional[int] = None,
         max_reallocate_candidates: Optional[int] = None,
         reallocate_strategy: str = "topk_cross",
+        expand_init_mode: str = "zero",
     ):
         if not lora_layers:
             raise ValueError("lora_layers 不能为空字典")
@@ -162,6 +183,9 @@ class RankEvolutionController:
         self.max_prune_candidates = max_prune_candidates
         self.max_reallocate_candidates = max_reallocate_candidates
         self.reallocate_strategy = reallocate_strategy
+        if expand_init_mode not in ("zero", "gradient"):
+            raise ValueError(f"expand_init_mode 须为 'zero' 或 'gradient'，收到: {expand_init_mode}")
+        self.expand_init_mode = expand_init_mode
 
     def cleanup_uncommitted_mutations(
         self,
@@ -189,11 +213,23 @@ class RankEvolutionController:
 
     def update_statistics(self):
         """
-        收集：
-        - g_ℓ（层需求，论文式 138）
-        - \\bar{s}_ℓ = (1/r_ℓ) Σ ||b||·||a||（纯范数，扩张容量，式 146）
-        - s^red_{ℓ,i} = α₁||b||·||a|| + α₂|⟨G,ba⊤⟩|（剪枝能量，式 150）
-        归一化后 u_ℓ = α \\tilde g_ℓ + β \\tilde{\\bar s}_ℓ；s^red 做 EMA 供 τ_prune。
+        论文 Alg. 2 line 6–13：收集统计并做 EMA 更新。
+
+        Step 1 — 原始信号（逐层）：
+          g_ℓ = ||∂L/∂ΔW_ℓ||_F             …Eq. 138（投影近似下界）
+          s̄_ℓ = (1/r_ℓ) Σ_{active} s_{ℓ,i} …Eq. 146（s_{ℓ,i} = ||b||·||a||, Eq. 142）
+          s^red_{ℓ,i}                       …Eq. 150（含梯度交互项）
+
+        Step 2 — 层间归一化（max-scaling: x/x_max，保持零映射到零）：
+          g̃_ℓ = g_ℓ / max_ℓ(g_ℓ)
+          s̃̄_ℓ = s̄_ℓ / max_ℓ(s̄_ℓ)
+
+        Step 3 — 容量评分（论文 Eq. 217）：
+          u_ℓ = α · g̃_ℓ + β · s̃̄_ℓ
+
+        Step 4 — EMA 平滑（论文 Eq. 228–237）：
+          û_ℓ^(t) = ρ · û_ℓ^(t-1) + (1-ρ) · u_ℓ^(t)
+          ŝ_{ℓ,i}^(t) = ρ · ŝ_{ℓ,i}^(t-1) + (1-ρ) · s^red_{ℓ,i}^(t)
         """
         raw_g: Dict[str, float] = {}
         raw_bar_s: Dict[str, float] = {}
@@ -229,12 +265,23 @@ class RankEvolutionController:
         self._is_initialized = True
 
     def compute_thresholds(self) -> Tuple[float, float]:
-        """计算全网统一的扩张与修剪阈值。"""
+        """
+        论文 Eq. 241–257：百分位动态阈值。
+
+        扩张阈值（Eq. 241–244）：
+          τ_grow = Percentile({û_ℓ}_ℓ, p_g)        （p_g=0.8 即 80th percentile）
+          层 ℓ 满足 û_ℓ > τ_grow 且 r_ℓ < r_max 时，扩张计数+1
+
+        修剪阈值（Eq. 254–257）：
+          τ_prune = Percentile({ŝ_{ℓ,i}: m=1, 非冷却}, p_p)  （p_p=0.1 即 10th percentile）
+          组件 (ℓ,i) 满足 ŝ < τ_prune 且 r_ℓ > r_min 时，修剪计数+1
+        """
         if not self._is_initialized:
             return float('inf'), float('-inf')
             
-        # 扩张阈值 tau_grow
-        all_u = torch.tensor(list(self.ema_u.values()), dtype=torch.float32)
+        # 扩张阈值 tau_grow（统一在模型设备上计算，避免 CPU/GPU 设备间隙）
+        device = next(iter(self.layers.values())).lora_A.weight.device
+        all_u = torch.tensor(list(self.ema_u.values()), dtype=torch.float32, device=device)
         if all_u.numel() > 0:
             tau_grow = torch.quantile(all_u, self.p_g).item()
         else:
@@ -258,7 +305,18 @@ class RankEvolutionController:
 
     def tick_evolution_state(self, tau_grow: float, tau_prune: float):
         """
-        [独立时间线步进] 推进计数器和冷却机制，发生永久全局状态变更的唯一入口（除了 commit）。
+        论文 Alg. 2 line 8–23：推进持久计数器与冷却期。
+
+        扩张计数 c^grow_ℓ（Alg. 2 line 8–12）：
+          if û_ℓ > τ_grow and r_ℓ < r_max: c += 1, else c = 0
+          达到 H_g 连续次后成为扩张候选
+
+        修剪计数 c^prune_{ℓ,i}（Alg. 2 line 14–20）：
+          if ŝ_{ℓ,i} < τ_prune and r_ℓ > r_min and not cooldown: c += 1, else c = 0
+          达到 H_p 连续次后成为修剪候选
+
+        冷却期（Alg. 2 line 23, 论文 Sec 3.7 line 266）：
+          扩张后新组件冷却 cooldown_steps 次结构更新，防止立即被剪
         """
         for name, layer in self.layers.items():
             act_rank = layer.get_active_rank()
@@ -291,8 +349,14 @@ class RankEvolutionController:
 
     def generate_mutations(self) -> List[ModuleMutation]:
         """
-        纯粹收集候选，不改任何计数或状态。
-        返回所有达标候选，让外层 ES 在验证集上决策赢家。
+        论文 Alg. 1 line 8–9 / Sec 3.4：生成候选结构变异集 N(z_t)。
+
+        三种 mutation type（Sec 3.4）：
+          1. Expansion:    c^grow_ℓ ≥ H_g → 激活该层一个未激活组件
+          2. Reduction:    c^prune_{ℓ,i} ≥ H_p → 休眠组件 (ℓ,i)
+          3. Reallocation: 一层 reduce + 另一层 expand（近似保预算）
+
+        纯粹收集候选，不改任何计数或状态；由外层 ES 在 D_val 上决策赢家。
         """
         mutations: List[ModuleMutation] = []
 
@@ -304,8 +368,16 @@ class RankEvolutionController:
             inactive_indices = layer.get_inactive_indices()
             if not inactive_indices:
                 continue
-            # 保持一个稳定策略：优先激活最小未激活索引
-            e_mut = ExpandMutation(name, layer, inactive_indices[0])
+            grad_dir = (
+                layer.compute_gradient_rank1_direction(use_cached=True)
+                if self.expand_init_mode == "gradient"
+                else None
+            )
+            e_mut = ExpandMutation(
+                name, layer, inactive_indices[0],
+                init_mode=self.expand_init_mode,
+                grad_direction=grad_dir,
+            )
             expand_candidates.append((float(self.ema_u[name]), e_mut))
 
         expand_candidates.sort(key=lambda x: x[0], reverse=True)
@@ -354,7 +426,11 @@ class RankEvolutionController:
                 mutations.append(
                     ReallocateMutation(
                         PruneMutation(p_mut.layer_name, p_mut.layer, p_mut.index),
-                        ExpandMutation(e_mut.layer_name, e_mut.layer, e_mut.index),
+                        ExpandMutation(
+                            e_mut.layer_name, e_mut.layer, e_mut.index,
+                            init_mode=e_mut.init_mode,
+                            grad_direction=e_mut.grad_direction,
+                        ),
                     )
                 )
                 reallocate_count += 1
@@ -363,9 +439,15 @@ class RankEvolutionController:
 
     def commit_mutation(self, mutation: ModuleMutation):
         """
-        [全局唯一永久生效口]
-        ES 在几组动作中完成了 eval -> undo 的试探并选出了这个 mutation。
-        正式落实参数变化，并仅针对赢家 清零计数器 与 施加冷却，
+        论文 Eq. 167 elitist selection 的落实端：
+
+          z_{t+1} = argmax_{z ∈ {z_t} ∪ N(z_t)} R(z)
+
+        由 Theorem 4.4（Eq. 463–464）保证 R(z_{t+1}) ≥ R(z_t)——
+        结构目标 J(z) = -R(z) 单调不增。
+
+        ES trial 完成 apply → eval → undo 后选出此 mutation 为赢家。
+        正式落实参数变化，仅针对赢家清零计数器与施加冷却（Alg. 2 line 13–14, 22–23），
         落选者状态完整保留以参与下周期的 Rolling Candidacy。
         """
         # Reallocate 需要一次性 apply，然后只重置其涉及子动作的计数器。
