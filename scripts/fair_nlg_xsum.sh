@@ -35,7 +35,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29530 \
   --lora_ga_batches 8 \
   --lora_ga_stable_gamma 16 \
   --sora_sparse_lambda 10 \
-  --sora_sparse_lambda_2 3e-4 \
+  --sora_sparse_lambda_2 1e-4 \
   --expand_init_mode gradient \
   --seed 42 \
   --log_dir runs/fair_nlg_xsum_ddp \

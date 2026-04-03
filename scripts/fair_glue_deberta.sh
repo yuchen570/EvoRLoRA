@@ -45,7 +45,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --lora_ga_batches 8 \
   --lora_ga_stable_gamma 16 \
   --sora_sparse_lambda 10 \
-  --sora_sparse_lambda_2 3e-4 \
+  --sora_sparse_lambda_2 1e-4 \
   --expand_init_mode gradient \
   --seed_list 0 21 42 81 100 \
   --log_dir runs/fair_glue_deberta_ddp \

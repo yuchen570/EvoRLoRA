@@ -520,10 +520,9 @@ def peft_factory(
             _adalora_field_names = set()
         if "orth_reg_weight" in _adalora_field_names:
             tgt_orth = float(adalora_orth_reg_weight)
-            if planned_steps < 10000:
-                # 对极小数据集移除正交惩罚，采用极小值 1e-8 以满足 PEFT 底层不能 <=0 的硬性断言要求
-                tgt_orth = 1e-8
-            
+            # 原版 AdaLoRA 论文在小数据集 (CoLA/RTE) 上使用 reg_orth_coef=0.1~0.3，
+            # 正交正则对 SVD 秩稳定性至关重要，不应因数据集小而强制关闭。
+            # 仅兜底 PEFT 底层 assert orth_reg_weight > 0 的硬性要求。
             if tgt_orth <= 0:
                 print("Warning: PEFT AdaLoRA requires orth_reg_weight > 0. Clamping to 1e-8 to avoid crash.")
                 tgt_orth = 1e-8
