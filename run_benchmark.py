@@ -1,6 +1,7 @@
 import argparse
 import copy
 import csv
+import datetime
 import json
 import os
 import time
@@ -1948,8 +1949,9 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
             if planned_total_steps < 10000:
                 if current_sora_sparse_lambda_2 >= 1e-3:
                     current_sora_sparse_lambda_2 = 1e-4
-                if current_lora_ga_batches < 32:
-                    current_lora_ga_batches = min(32, len(train_loader) if len(train_loader) > 0 else 32)
+                # 注意: 不再自动将 lora_ga_batches 拉到 32。
+                # 60 个 Linear × 32 batch 的单卡 SVD 计算会超过 NCCL 默认 600s 超时。
+                # 原始 LoRA-GA 论文使用 4~8 batch 即可获得稳定的梯度方向估计。
                 if current_lora_ga_stable_gamma is None:
                     pass
 
@@ -2144,7 +2146,10 @@ if __name__ == "__main__":
 
     try:
         if args.ddp_enabled and not dist.is_initialized():
-            dist.init_process_group(backend=args.ddp_backend)
+            dist.init_process_group(
+                backend=args.ddp_backend,
+                timeout=datetime.timedelta(seconds=1800),  # LoRA-GA 单卡 SVD 初始化耗时长，默认 600s 不够
+            )
 
         torch.manual_seed(args.seed)
         if torch.cuda.is_available():

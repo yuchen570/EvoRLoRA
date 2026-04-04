@@ -33,8 +33,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29530 \
   --adalora_delta_t 100 \
   --adalora_orth_reg_weight 0.1 \
   --lora_ga_batches 8 \
-  --lora_ga_stable_gamma 16 \
-  --sora_sparse_lambda 10 \
+  --sora_sparse_lambda 1e-3 \
   --sora_sparse_lambda_2 1e-4 \
   --expand_init_mode gradient \
   --seed 42 \
