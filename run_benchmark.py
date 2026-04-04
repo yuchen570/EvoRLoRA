@@ -2161,7 +2161,7 @@ if __name__ == "__main__":
                     )
             print("\n=== Benchmark Summary ===")
             print(
-                f"{'task':<8} {'backbone':<16} {'method':<12} {'best_metric':<12} "
+                f"{'task':<8} {'backbone':<16} {'seed':<6} {'method':<12} {'best_metric':<12} "
                 f"{'peak_mem_mb':<12} {'avg_rank':<10} {'time_sec':<10}"
             )
             for r in results:
@@ -2173,14 +2173,20 @@ if __name__ == "__main__":
                 if best_val == "" or best_val == "N/A":
                     best_val = 0.0
 
+                pm = r.get('peak_memory_mb', 0.0)
+                pm_fmt = f"{float(pm):<12.2f}" if pm != "" else f"{pm:<12}"
+                tt = r.get('total_train_time_sec', 0.0)
+                tt_fmt = f"{float(tt):<10.2f}" if tt != "" else f"{tt:<10}"
+
                 print(
                     f"{r.get('task', args.task_name):<8} "
                     f"{r.get('backbone', args.model_name):<16} "
+                    f"{str(r.get('seed', '')):<6} "
                     f"{r['method']:<12} "
                     f"{float(best_val):<12.4f} "
-                    f"{r.get('peak_memory_mb', 0.0):<12.2f} "
+                    f"{pm_fmt} "
                     f"{ar_fmt:<10} "
-                    f"{r.get('total_train_time_sec', 0.0):<10.2f}"
+                    f"{tt_fmt}"
                 )
     finally:
         if args.ddp_enabled and dist.is_available() and dist.is_initialized():
