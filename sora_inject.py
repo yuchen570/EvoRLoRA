@@ -1,4 +1,4 @@
-"""SoRA-style sparse gate LoRA branch."""
+"""SoRA 风格的稀疏门控 LoRA 分支。"""
 from __future__ import annotations
 import math
 from typing import List
@@ -51,27 +51,67 @@ class SparseAdamW(torch.optim.AdamW):
     """
     近端梯度 (Proximal Gradient) 的 AdamW，用于 SoRA gate 参数。
 
-    在标准 AdamW 更新后，应用 Soft-Thresholding 对参数执行硬裁剪：
-        θ ← sign(θ) · max(|θ| - λ, 0)
-
-    这保证了门控参数可以达到精确的数学零值（稀疏性保障），相比仅在 Loss 上加 L1 惩罚的
-    次梯度方法（Subgradient），近端梯度方法产生的解有更好的稀疏结构。
+    完全复现原始 SoRA src/sparse_optimizer.py 的行为：
+    - 继承 transformers.AdamW 风格，支持 correct_bias 参数（bias correction 开关）
+    - 自己实现完整的 AdamW 更新循环（不依赖 super().step()），与原始实现结构一致
+    - 软阈值只对有梯度的参数应用（p.grad is None 时跳过）
+    - 阈值直接使用 sparse_lambda（不乘以 lr），与 sparse_optimizer.py 一致
 
     参考：TsinghuaC3I/SoRA (EMNLP 2023) src/sparse_optimizer.py
     """
 
-    def __init__(self, params, sparse_lambda: float = 1e-3, **kwargs):
+    def __init__(self, params, sparse_lambda: float = 1e-3, correct_bias: bool = True, **kwargs):
         super().__init__(params, **kwargs)
         self.sparse_lambda = sparse_lambda
+        self.correct_bias = correct_bias
 
-    @torch.no_grad()
     def step(self, closure=None):
-        loss = super().step(closure)
-        if self.sparse_lambda > 0:
-            for group in self.param_groups:
-                for p in group["params"]:
-                    if p.grad is None:
-                        continue
-                    # Soft-thresholding: θ ← sign(θ) · max(|θ| - λ, 0)
-                    p.data = torch.sign(p.data) * torch.clamp(p.data.abs() - self.sparse_lambda, min=0.0)
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError("Adam does not support sparse gradients, please consider SparseAdam instead")
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p.data)
+                    state["exp_avg_sq"] = torch.zeros_like(p.data)
+
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                beta1, beta2 = group["betas"]
+                state["step"] += 1
+
+                exp_avg.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                denom = exp_avg_sq.sqrt().add_(group["eps"])
+
+                step_size = group["lr"]
+                # correct_bias: bias correction，对应 transformers.AdamW 的 correct_bias 参数
+                if self.correct_bias:
+                    bias_correction1 = 1.0 - beta1 ** state["step"]
+                    bias_correction2 = 1.0 - beta2 ** state["step"]
+                    step_size = step_size * math.sqrt(bias_correction2) / bias_correction1
+
+                # gate 参数不需要 weight decay（原始注释："params with sparsity regularization do not need weight decay"）
+                to_add = torch.div(exp_avg, denom) * (-step_size)
+                if group["weight_decay"] > 0.0:
+                    to_add = to_add + (-group["lr"] * group["weight_decay"]) * p.data
+                p.data.add_(to_add)
+
+                # Soft-thresholding: θ ← sign(θ) · max(|θ| - λ, 0)
+                # 阈值直接使用 sparse_lambda（不乘以 lr），与原始 sparse_optimizer.py 一致
+                if self.sparse_lambda > 0:
+                    p.data[p.data > self.sparse_lambda] -= self.sparse_lambda
+                    p.data[p.data < -self.sparse_lambda] += self.sparse_lambda
+                    p.data[p.data.abs() < self.sparse_lambda] = 0.0
+
         return loss

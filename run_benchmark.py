@@ -1245,7 +1245,7 @@ def run_training_loop(
                     gate_numel = sum(
                         p.numel() for n, p in model.named_parameters() if n.endswith(".gate")
                     )
-                    loss = loss + lam * l1_penalty / max(gate_numel, 1)
+                    loss = loss + lam * l1_penalty / max(gate_numel, 1)        
                 loss.backward()
                 grad_norm_total: Optional[float] = None
                 if max_grad_norm is not None and max_grad_norm > 0:

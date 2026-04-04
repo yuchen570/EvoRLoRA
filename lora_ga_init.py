@@ -1,4 +1,4 @@
-"""LoRA-GA style init for PEFT LoRA (gradient SVD). See https://arxiv.org/abs/2407.05000"""
+"""PEFT LoRA 的 LoRA-GA 风格初始化（梯度 SVD）。参见 https://arxiv.org/abs/2407.05000"""
 from __future__ import annotations
 import copy
 import math
@@ -35,7 +35,14 @@ def _iter_limited_batches(loader, max_batches):
             break
         yield batch
 
-def estimate_lora_ga_init_tensors(model, data_loader, target_modules, lora_r, lora_ga_batches, task_type, device, loss_fn=None, stable_gamma=None):
+def estimate_lora_ga_init_tensors(model, data_loader, target_modules, lora_r, lora_ga_batches, task_type, device, loss_fn=None, stable_gamma=None, direction="ArB2r"):
+    """
+    通过在批次上累加梯度来估计 LoRA-GA 初始化张量。
+
+    参数：
+        direction: SVD 方向策略，可选 "ArBr"、"A2rBr"、"ArB2r"、"random"。
+                   匹配原始 LoRA-GA 实现（默认："ArB2r"）。
+    """
     if lora_ga_batches < 1:
         raise ValueError("lora_ga_batches >= 1")
     targets = _collect_target_linears(model, target_modules)
@@ -47,50 +54,80 @@ def estimate_lora_ga_init_tensors(model, data_loader, target_modules, lora_r, lo
             loss_fn = nn.CrossEntropyLoss()
         if isinstance(loss_fn, nn.Module):
             loss_fn = loss_fn.to(device)
-    result = {}
+
+    for p in model.parameters():
+        p.requires_grad = False
+
+    grad_sums = {}
     for full_name, linear in targets:
-        for p in model.parameters():
-            p.requires_grad = False
-        w = linear.weight
-        w.requires_grad = True
-        grad_sum = torch.zeros_like(w, device=device, dtype=w.dtype)
-        n_used = 0
-        for batch in _iter_limited_batches(data_loader, lora_ga_batches):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            model.zero_grad(set_to_none=True)
-            if task_type == "nlu":
-                loss = _forward_loss_nlu(model, batch, loss_fn)
-            elif task_type == "nlg":
-                loss = _forward_loss_nlg(model, batch)
-            else:
-                raise ValueError(task_type)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_([w], max_norm=1.0)
+        linear.weight.requires_grad = True
+        grad_sums[full_name] = torch.zeros_like(linear.weight, device=device, dtype=linear.weight.dtype)
+
+    n_used = 0
+    for batch in _iter_limited_batches(data_loader, lora_ga_batches):
+        batch = {k: v.to(device) for k, v in batch.items()}
+        model.zero_grad(set_to_none=True)
+        if task_type == "nlu":
+            loss = _forward_loss_nlu(model, batch, loss_fn)
+        elif task_type == "nlg":
+            loss = _forward_loss_nlg(model, batch)
+        else:
+            raise ValueError(task_type)
+        loss.backward()
+        # 累加梯度，不进行裁剪（原始 LoRA-GA 在此处不进行裁剪）
+        for full_name, linear in targets:
+            w = linear.weight
             if w.grad is None:
                 raise RuntimeError("LoRA-GA: no grad for " + full_name)
-            grad_sum += w.grad.detach()
-            n_used += 1
+            grad_sums[full_name] += w.grad.detach()
             w.grad = None
-        w.requires_grad = False
-        if n_used == 0:
-            raise RuntimeError("LoRA-GA: empty loader")
-        G = (grad_sum / float(n_used)).detach().cpu().float()
-        U, S, Vh = torch.linalg.svd(G, full_matrices=False)
-        r = min(lora_r, S.numel())
-        if r < 1:
-            raise RuntimeError("LoRA-GA: r < 1")
-        if stable_gamma is not None:
-            # SVD stable initialization according to official LoRA-GA (dumps S to prevent gradient noise)
-            gamma = float(stable_gamma)
-            m, _ = G.shape  # output features dimension
-            scale = (m ** 0.25) / (gamma ** 0.5)
-            lora_B = (U[:, :r] * scale).to(dtype=w.dtype)
-            lora_A = (Vh[:r, :] * scale).to(dtype=w.dtype)
+        n_used += 1
+
+    if n_used == 0:
+        raise RuntimeError("LoRA-GA: empty loader")
+
+    result = {}
+    for full_name, linear in targets:
+        linear.weight.requires_grad = False
+        G = (grad_sums[full_name] / float(n_used)).detach().cpu().float()
+        # 使用 svd_lowrank 以匹配原始 LoRA-GA (q = min(4*r, min(shape)), niter=4)
+        q_svd = min(4 * lora_r, min(G.shape))
+        U, S, V = torch.svd_lowrank(G, q=q_svd, niter=4)
+        V = V.T  # V 现在是 (n, q) -> 转置为 (q, n) 以进行行索引
+
+        # 方向选择：完全匹配原始 LoRA-GA layer.py
+        if direction == "ArBr":
+            B = U[:, 0: 2 * lora_r: 2]
+            A = V[1: 2 * lora_r: 2, :]
+        elif direction == "A2rBr":
+            B = U[:, :lora_r]
+            A = V[lora_r: 2 * lora_r, :]
+        elif direction == "ArB2r":
+            B = U[:, lora_r: 2 * lora_r]
+            A = V[:lora_r, :]
+        elif direction == "random":
+            import random
+            random_list = random.sample(range(2 * lora_r), 2 * lora_r)
+            indexes_A = random_list[:lora_r]
+            indexes_B = random_list[lora_r:]
+            B = U[:, indexes_B]
+            A = V[indexes_A, :]
         else:
-            # Fallback to standard SVD weighting if scaling isn't specified
-            sqrt_s = torch.sqrt(torch.clamp(S[:r], min=0.0))
-            lora_B = (U[:, :r] * sqrt_s.unsqueeze(0)).to(dtype=w.dtype)
-            lora_A = (sqrt_s.unsqueeze(1) * Vh[:r, :]).to(dtype=w.dtype)
+            raise ValueError(f"Unknown direction: {direction}")
+
+        if stable_gamma is not None:
+            # stable 缩放：完全匹配原始 LoRA-GA stable 分支
+            # B = B * m**0.25 / gamma**0.5,  A = A * m**0.25 / gamma**0.5
+            gamma = float(stable_gamma)
+            m = G.shape[0]  # out_features（梯度矩阵的行数）
+            scale = m ** 0.25 / gamma ** 0.5
+            lora_B = (B * scale).to(dtype=linear.weight.dtype)
+            lora_A = (A * scale).to(dtype=linear.weight.dtype)
+        else:
+            # 备选方案：按奇异值的平方根加权
+            sqrt_s = torch.sqrt(torch.clamp(S[:lora_r], min=0.0))
+            lora_B = (B * sqrt_s.unsqueeze(0)).to(dtype=linear.weight.dtype)
+            lora_A = (sqrt_s.unsqueeze(1) * A).to(dtype=linear.weight.dtype)
         result[full_name] = (lora_A.contiguous(), lora_B.contiguous())
     model.zero_grad(set_to_none=True)
     return result
@@ -127,7 +164,7 @@ def apply_lora_ga_init_to_peft(peft_model, init_by_key, target_device):
         la.weight.data.copy_(A_cpu.to(device=target_device, dtype=la.weight.dtype))
         lb.weight.data.copy_(B_cpu.to(device=target_device, dtype=lb.weight.dtype))
         
-        # --- Base Weight Compensation (Essential to prevent representation collapse) ---
+        # --- 基础权重补偿（防止表示崩溃的关键步骤） ---
         if hasattr(module, "base_layer") and hasattr(module.base_layer, "weight"):
             base_weight = module.base_layer.weight
             scaling = 1.0
@@ -161,14 +198,14 @@ def build_train_loader_no_sampler(train_loader):
         pin_memory=getattr(train_loader, "pin_memory", False), drop_last=False,
     )
 
-def run_lora_ga_init_pipeline(base_model, train_loader, target_modules, lora_r, lora_ga_batches, task_type, device, is_main_process, ddp_enabled, loss_fn=None, stable_gamma=None):
+def run_lora_ga_init_pipeline(base_model, train_loader, target_modules, lora_r, lora_ga_batches, task_type, device, is_main_process, ddp_enabled, loss_fn=None, stable_gamma=None, direction="ArB2r"):
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         dist.barrier()
     payload = None
     if is_main_process:
         dl = build_train_loader_no_sampler(train_loader)
         est_model = copy.deepcopy(base_model)
-        payload = estimate_lora_ga_init_tensors(est_model, dl, target_modules, lora_r, lora_ga_batches, task_type, device, loss_fn, stable_gamma=stable_gamma)
+        payload = estimate_lora_ga_init_tensors(est_model, dl, target_modules, lora_r, lora_ga_batches, task_type, device, loss_fn, stable_gamma=stable_gamma, direction=direction)
         del est_model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
