@@ -6,7 +6,7 @@ import json
 import os
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,6 +51,21 @@ def _linear_warmup_decay_lr_lambda(num_warmup_steps: int, num_training_steps: in
             0.0,
             float(num_training_steps - step) / float(max(1, num_training_steps - num_warmup_steps)),
         )
+
+    return lr_lambda
+
+
+def _cosine_warmup_decay_lr_lambda(num_warmup_steps: int, num_training_steps: int):
+    """带 warmup 的 cosine 衰减（与 HF 常见公式一致，末尾收敛到 0）。"""
+
+    def lr_lambda(step: int) -> float:
+        if step < num_warmup_steps:
+            return float(step + 1) / float(max(1, num_warmup_steps))
+        if num_training_steps <= num_warmup_steps:
+            return 1.0
+        progress = float(step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return lr_lambda
 
@@ -1050,6 +1065,7 @@ def run_training_loop(
     head_lr: Optional[float] = None,
     weight_decay: float = 0.01,
     warmup_ratio: float = 0.1,
+    lr_scheduler_type: str = "linear",
     T_es: int = 200,
     mini_val_k: int = 8,
     max_train_steps: Optional[int] = None,
@@ -1214,15 +1230,18 @@ def run_training_loop(
     # LoRA+GLUE：在已知易发散区间逐步打点，便于确认首个 NaN 出现在哪一步（不仅依赖硬编码的 99）。
     lora_glue_step_trace = method_name in {"lora", "evorank"} and task_name in {"cola", "rte"}
     lora_glue_early_steps = frozenset({1, 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 39})
-    lr_scheduler = LambdaLR(
-        optimizer,
-        _linear_warmup_decay_lr_lambda(warmup_steps, total_train_steps),
-        last_epoch=-1,
-    )
+    if lr_scheduler_type == "linear":
+        lr_lambda_fn = _linear_warmup_decay_lr_lambda(warmup_steps, total_train_steps)
+    elif lr_scheduler_type == "cosine":
+        lr_lambda_fn = _cosine_warmup_decay_lr_lambda(warmup_steps, total_train_steps)
+    else:
+        raise ValueError(f"未知 lr_scheduler_type: {lr_scheduler_type}")
+
+    lr_scheduler = LambdaLR(optimizer, lr_lambda_fn, last_epoch=-1)
     if sparse_optimizer is not None:
         sparse_lr_scheduler = LambdaLR(
             sparse_optimizer,
-            _linear_warmup_decay_lr_lambda(warmup_steps, total_train_steps),
+            lr_lambda_fn,
             last_epoch=-1,
         )
     else:
@@ -1260,6 +1279,8 @@ def run_training_loop(
     ema_beta = 0.95
     rouge1_val: float = 0.0
     rouge2_val: float = 0.0
+    lora_ga_health_records: List[Dict[str, float]] = []
+    evorank_es_records: List[Dict[str, float]] = []
 
     for epoch in range(epochs):
         model.train()
@@ -1295,6 +1316,29 @@ def run_training_loop(
                 avg_active_rank = float(
                     sum(layer.get_active_rank() for layer in controller.layers.values()) / max(len(controller.layers), 1)
                 )
+                if out.get("did_evolution") and out.get("best_reward") is not None:
+                    d_val = out.get("es_delta_val_loss")
+                    d_comp = out.get("es_delta_complexity")
+                    if d_val is not None and d_comp is not None:
+                        evorank_es_records.append(
+                            {
+                                "step": float(global_step),
+                                "delta_val_loss": float(d_val),
+                                "delta_complexity": float(d_comp),
+                            }
+                        )
+                        if is_main_process:
+                            print(
+                                f"[evorank][es] step={global_step} mutation={out.get('best_mutation')} "
+                                f"delta_val_loss={float(d_val):+.6f} delta_complexity={float(d_comp):+.2f} "
+                                f"base_val_loss={float(out.get('es_base_val_loss')):.6f} "
+                                f"selected_val_loss={float(out.get('es_selected_val_loss')):.6f} "
+                                f"base_complexity={float(out.get('es_base_complexity')):.2f} "
+                                f"selected_complexity={float(out.get('es_selected_complexity')):.2f}"
+                            )
+                        if writer is not None:
+                            writer.add_scalar("evorank/es_delta_val_loss", float(d_val), global_step)
+                            writer.add_scalar("evorank/es_delta_complexity", float(d_comp), global_step)
             else:
                 optimizer.zero_grad(set_to_none=True)
                 if sparse_optimizer is not None:
@@ -1318,6 +1362,53 @@ def run_training_loop(
                         p.numel() for n, p in model.named_parameters() if n.endswith(".gate")
                     )
                     loss = loss + lam * l1_penalty / max(gate_numel, 1)        
+                if method_name == "lora-ga" and global_step < 200:
+                    logit_entropy = float("nan")
+                    if logits.dim() >= 2 and logits.size(-1) > 1:
+                        probs = torch.softmax(logits.detach().float(), dim=-1)
+                        logit_entropy = float(
+                            (-(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1).mean()).item()
+                        )
+                    head_weight_norm = float("nan")
+                    for n, p in model.named_parameters():
+                        if (
+                            p.requires_grad
+                            and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])
+                            and n.endswith(".weight")
+                        ):
+                            head_weight_norm = float(p.detach().float().norm().item())
+                            break
+                    rec = {
+                        "step": float(global_step),
+                        "train_loss": float(loss.detach().item()),
+                        "logit_entropy": logit_entropy,
+                        "head_weight_norm": head_weight_norm,
+                    }
+                    lora_ga_health_records.append(rec)
+                    if writer is not None:
+                        writer.add_scalar("lora_ga_health/train_loss", rec["train_loss"], global_step)
+                        if not math.isnan(rec["logit_entropy"]):
+                            writer.add_scalar("lora_ga_health/logit_entropy", rec["logit_entropy"], global_step)
+                        if not math.isnan(rec["head_weight_norm"]):
+                            writer.add_scalar("lora_ga_health/head_weight_norm", rec["head_weight_norm"], global_step)
+                    if is_main_process and (global_step % 20 == 0 or global_step == 199):
+                        print(
+                            f"[lora-ga][health] step={global_step} train_loss={rec['train_loss']:.6f} "
+                            f"logit_entropy={rec['logit_entropy']:.6f} head_weight_norm={rec['head_weight_norm']:.6f}"
+                        )
+                        _debug_log(
+                            run_id=f"{task_name}-{method_name}-seed{random_seed}-health",
+                            hypothesis_id="H-LG",
+                            location="run_benchmark.py:lora_ga_health",
+                            message="early_training_health",
+                            data={
+                                "task": task_name,
+                                "global_step": int(global_step),
+                                "train_loss": rec["train_loss"],
+                                "logit_entropy": rec["logit_entropy"],
+                                "head_weight_norm": rec["head_weight_norm"],
+                            },
+                        )
                 loss.backward()
                 grad_norm_total: Optional[float] = None
                 if max_grad_norm is not None and max_grad_norm > 0:
@@ -1806,14 +1897,44 @@ def run_training_loop(
     except Exception:
         final_avg_active_rank = "N/A"
 
+    def _mean_numeric(records: List[Dict[str, float]], key: str) -> Optional[float]:
+        vals: List[float] = []
+        for rec in records:
+            v = rec.get(key)
+            if v is None:
+                continue
+            if isinstance(v, float) and math.isnan(v):
+                continue
+            vals.append(float(v))
+        if not vals:
+            return None
+        return float(sum(vals) / len(vals))
+
+    lora_ga_health_loss_mean = _mean_numeric(lora_ga_health_records, "train_loss")
+    lora_ga_health_entropy_mean = _mean_numeric(lora_ga_health_records, "logit_entropy")
+    lora_ga_health_head_norm_mean = _mean_numeric(lora_ga_health_records, "head_weight_norm")
+    evorank_delta_val_loss_mean = _mean_numeric(evorank_es_records, "delta_val_loss")
+    evorank_delta_complexity_mean = _mean_numeric(evorank_es_records, "delta_complexity")
+    evorank_es_events = len(evorank_es_records)
+    lora_ga_health_events = len(lora_ga_health_records)
+
     result = {
         "method": method_name,
         "total_train_time_sec": total_time,
         "peak_memory_mb": peak_mem_mb,
         "avg_active_rank": final_avg_active_rank,
+        "warmup_ratio": warmup_ratio,
+        "lr_scheduler_type": lr_scheduler_type,
         "artifact_dir": artifact_dir_str,
         "final_dir": final_dir_str,
         "val_metric_key": val_metric_key_str,
+        "evorank_es_events": evorank_es_events if method_name == "evorank" else "",
+        "evorank_avg_delta_val_loss": evorank_delta_val_loss_mean if method_name == "evorank" else "",
+        "evorank_avg_delta_complexity": evorank_delta_complexity_mean if method_name == "evorank" else "",
+        "lora_ga_health_events": lora_ga_health_events if method_name == "lora-ga" else "",
+        "lora_ga_health_train_loss_mean": lora_ga_health_loss_mean if method_name == "lora-ga" else "",
+        "lora_ga_health_logit_entropy_mean": lora_ga_health_entropy_mean if method_name == "lora-ga" else "",
+        "lora_ga_health_head_norm_mean": lora_ga_health_head_norm_mean if method_name == "lora-ga" else "",
         
         "matthews_corrcoef": best_val_metrics.get("matthews_corrcoef", "") if task_type == "nlu" else "",
         "accuracy": best_val_metrics.get("accuracy", "") if task_type == "nlu" else "",
@@ -1967,6 +2088,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_lora_ga_use_rslora", dest="lora_ga_use_rslora", action="store_false", help="LoRA-GA：关闭 rsLoRA 缩放（消融用）")
     parser.set_defaults(lora_ga_use_rslora=True)
     parser.add_argument("--lora_ga_stable_gamma", type=float, default=16.0, help="LoRA-GA：stable init gamma 值。NLU/GLUE 默认 16；可按任务显式覆盖")
+    parser.add_argument(
+        "--lora_ga_use_official_scheduler",
+        action="store_true",
+        help="LoRA-GA 诊断开关：使用官方风格训练调度（warmup=0.03 + cosine）。默认关闭，以保持公平主表统一调度。",
+    )
+    parser.add_argument(
+        "--lora_ga_official_warmup_ratio",
+        type=float,
+        default=0.03,
+        help="LoRA-GA 官方调度分支的 warmup_ratio（默认 0.03）。",
+    )
+    parser.add_argument(
+        "--lora_ga_official_scheduler_type",
+        type=str,
+        default="cosine",
+        choices=["linear", "cosine"],
+        help="LoRA-GA 官方调度分支的学习率调度类型（默认 cosine）。",
+    )
     parser.add_argument("--sora_sparse_lambda", type=float, default=1e-3, help="SoRA：gate L1 惩罚系数")
     parser.add_argument("--sora_lambda_warmup_steps", type=int, default=0, help="SoRA：前若干步将 sparse_lambda 从 0 线性升到设定值；0 表示关闭")
     parser.add_argument("--sora_sparse_lambda_2", type=float, default=3e-4, help="SoRA：gate 近端梯度硬裁剪阈值（Proximal Gradient / Soft-Thresholding），对标官方 SparseAdamW")
@@ -2057,6 +2196,11 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
             for method in args.methods:
                 seed_results: List[Dict[str, Any]] = []
+                method_warmup_ratio = float(args.warmup_ratio)
+                method_lr_scheduler_type = "linear"
+                if method == "lora-ga" and bool(args.lora_ga_use_official_scheduler):
+                    method_warmup_ratio = float(args.lora_ga_official_warmup_ratio)
+                    method_lr_scheduler_type = str(args.lora_ga_official_scheduler_type)
                 for seed in seeds:
                     torch.manual_seed(seed)
                     if torch.cuda.is_available():
@@ -2121,7 +2265,8 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         lr=args.lr,
                         head_lr=args.head_lr,
                         weight_decay=args.weight_decay,
-                        warmup_ratio=args.warmup_ratio,
+                        warmup_ratio=method_warmup_ratio,
+                        lr_scheduler_type=method_lr_scheduler_type,
                         T_es=args.T_es,
                         mini_val_k=args.mini_val_k,
                         max_train_steps=args.max_train_steps,
@@ -2194,6 +2339,15 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         row["peak_memory_mb"] = ""
                         row["total_train_time_sec"] = ""
                         row["avg_active_rank"] = ""
+                        row["warmup_ratio"] = ""
+                        row["lr_scheduler_type"] = ""
+                        row["evorank_es_events"] = ""
+                        row["evorank_avg_delta_val_loss"] = ""
+                        row["evorank_avg_delta_complexity"] = ""
+                        row["lora_ga_health_events"] = ""
+                        row["lora_ga_health_train_loss_mean"] = ""
+                        row["lora_ga_health_logit_entropy_mean"] = ""
+                        row["lora_ga_health_head_norm_mean"] = ""
                     all_results.extend([mean_row, std_row])
 
     if args.is_main_process:
@@ -2220,6 +2374,15 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "rougeL",
                     "peak_memory_mb",
                     "avg_active_rank",
+                    "warmup_ratio",
+                    "lr_scheduler_type",
+                    "evorank_es_events",
+                    "evorank_avg_delta_val_loss",
+                    "evorank_avg_delta_complexity",
+                    "lora_ga_health_events",
+                    "lora_ga_health_train_loss_mean",
+                    "lora_ga_health_logit_entropy_mean",
+                    "lora_ga_health_head_norm_mean",
                     "total_train_time_sec",
                     "artifact_dir",
                     "final_dir",

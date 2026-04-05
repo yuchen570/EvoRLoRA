@@ -2,13 +2,12 @@
 # ============================================================================
 # 公平对比: RTE 单任务 × DeBERTa-v3-base × 全方法
 # ----------------------------------------------------------------------------
-# 统一对齐 SoRA 官方 schedule-dense 脚本:
-#   lr=1.2e-3, bsz=32, epoch=50, max_length=320,
-#   sparse_lambda=1e-3, sparse_lambda_2=0,
-#   lambda_schedule=linear, max_lambda=7e-4, lambda_num=7, seed=48
+# 主表协议（统一公平）:
+#   - 单阶段、同预算、同主超参
+#   - SoRA 默认走 no-schedule（避免 schedule-dense 的额外阶段训练破坏等预算可比性）
 #
 # 公平原则:
-#   - 训练超参按 SoRA 官方 RTE schedule-dense 配置统一
+#   - 训练超参统一，不启用方法特有“额外阶段训练”
 #   - 不再显式传 --target_modules，让各方法走各自论文/官方实现的默认注入协议
 # EvoRank: --expand_init_mode gradient（仅 evorank 生效）
 # ============================================================================
@@ -33,10 +32,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29510 \
   --adalora_orth_reg_weight 0.1 \
   --lora_ga_batches 8 \
   --sora_sparse_lambda 1e-3 \
-  --sora_sparse_lambda_2 0 \
-  --sora_lambda_schedule linear \
-  --sora_max_lambda 7e-4 \
-  --sora_lambda_num 7 \
+  --sora_sparse_lambda_2 3e-4 \
   --lambda_c 0.001 \
   --expand_init_mode gradient \
   --evo_max_reallocate_candidates 8 \
@@ -46,4 +42,4 @@ nohup torchrun --nproc_per_node=2 --master_port=29510 \
   --export_csv results_fair_glue_deberta_rte_ddp.csv \
   > logs/fair_glue_deberta_rte_ddp.out 2>&1 &
 
-echo "Started fair RTE comparison. Check logs/fair_glue_deberta_rte_ddp.out"
+echo "Started fair RTE comparison (main table protocol: no-schedule). Check logs/fair_glue_deberta_rte_ddp.out"

@@ -257,6 +257,12 @@ def train_evo_lora_step(
         "num_mutations": 0,
         "best_reward": None,
         "best_mutation": None,
+        "es_base_val_loss": None,
+        "es_base_complexity": None,
+        "es_selected_val_loss": None,
+        "es_selected_complexity": None,
+        "es_delta_val_loss": None,
+        "es_delta_complexity": None,
     }
 
     should_evolve = (
@@ -320,7 +326,7 @@ def train_evo_lora_step(
             was_training = model.training
             model.eval()
 
-            rewards: List[Tuple[float, Optional[ModuleMutation]]] = []
+            rewards: List[Tuple[float, Optional[ModuleMutation], float, float]] = []
             with torch.no_grad():
                 base_eval_losses: List[torch.Tensor] = []
                 for val_inputs, val_targets in val_batches:
@@ -333,11 +339,15 @@ def train_evo_lora_step(
                     reduced_base = base_eval_loss.clone()
                     dist.all_reduce(reduced_base, op=dist.ReduceOp.SUM)
                     base_eval_loss = reduced_base / dist.get_world_size()
+                base_eval_loss_f = float(base_eval_loss.item())
+                base_complexity = _compute_complexity(controller, complexity_mode)
+                result["es_base_val_loss"] = base_eval_loss_f
+                result["es_base_complexity"] = base_complexity
                 if include_noop_candidate:
                     # 论文 Eq. 167 elitist selection: z_t (no-op) 始终在候选集中
                     # 论文 Eq. 163: R(z) = -L_val(Θ; z) - λ_c · C(z)
-                    base_reward = -float(base_eval_loss.item()) - lambda_c * _compute_complexity(controller, complexity_mode)
-                    rewards.append((base_reward, None))  # no-op reward
+                    base_reward = -base_eval_loss_f - lambda_c * base_complexity
+                    rewards.append((base_reward, None, base_eval_loss_f, base_complexity))  # no-op reward
 
                 for mutation in mutations:
                     if isinstance(mutation, _PaddingTrialMutation):
@@ -360,8 +370,10 @@ def train_evo_lora_step(
                         dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
                         eval_loss = reduced / dist.get_world_size()
 
-                    reward = -float(eval_loss.item()) - lambda_c * _compute_complexity(controller, complexity_mode)
-                    rewards.append((reward, committed_candidate))
+                    eval_loss_f = float(eval_loss.item())
+                    candidate_complexity = _compute_complexity(controller, complexity_mode)
+                    reward = -eval_loss_f - lambda_c * candidate_complexity
+                    rewards.append((reward, committed_candidate, eval_loss_f, candidate_complexity))
                     if not isinstance(mutation, _PaddingTrialMutation):
                         mutation.undo()
 
@@ -371,7 +383,7 @@ def train_evo_lora_step(
             if rewards:
                 # 论文 Eq. 167: z_{t+1} = argmax_{z ∈ {z_t} ∪ N(z_t)} R(z)
                 # Theorem 4.4 保证 R(z_{t+1}) ≥ R(z_t)（单调不减）
-                best_reward, best_mutation = max(rewards, key=lambda x: x[0])
+                best_reward, best_mutation, best_eval_loss_f, best_complexity = max(rewards, key=lambda x: x[0])
                 if best_mutation is not None:
                     controller.commit_mutation(best_mutation)
                     _reset_optimizer_state_for_mutation(optimizer, best_mutation)
@@ -379,6 +391,12 @@ def train_evo_lora_step(
                 controller.cleanup_uncommitted_mutations(mutations, committed=best_mutation)
                 result["best_reward"] = best_reward
                 result["best_mutation"] = "noop" if best_mutation is None else best_mutation.__class__.__name__
+                result["es_selected_val_loss"] = best_eval_loss_f
+                result["es_selected_complexity"] = best_complexity
+                if result["es_base_val_loss"] is not None:
+                    result["es_delta_val_loss"] = float(best_eval_loss_f) - float(result["es_base_val_loss"])
+                if result["es_base_complexity"] is not None:
+                    result["es_delta_complexity"] = float(best_complexity) - float(result["es_base_complexity"])
 
     # 3) 参数更新（论文 Alg. 1 line 5–6: 每步对 active Θ 做梯度下降）
     optimizer.step()

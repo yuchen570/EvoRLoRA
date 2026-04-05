@@ -44,7 +44,17 @@ def inject_sora(model: nn.Module, target_modules: List[str], r: int, lora_alpha:
         wrapped = SoRALinear(base_linear, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout).to(base_linear.weight.device)
         _set_module_by_path(model, name, wrapped)
     for name, param in model.named_parameters():
-        if "classifier" in name or "score" in name or "lm_head" in name or name == "shared" or "pooler" in name:
+        lname = name.lower()
+        if (
+            "classifier" in lname
+            or "score" in lname
+            or "lm_head" in lname
+            or lname == "shared"
+            or "pooler" in lname
+            or "layernorm" in lname
+            or "layer_norm" in lname
+            or "final_layer_norm" in lname
+        ):
             param.requires_grad = True
 
 
