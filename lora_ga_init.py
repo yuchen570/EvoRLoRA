@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 def _collect_target_linears(model, target_modules):
     out = []
@@ -35,7 +36,20 @@ def _iter_limited_batches(loader, max_batches):
             break
         yield batch
 
-def estimate_lora_ga_init_tensors(model, data_loader, target_modules, lora_r, lora_ga_batches, task_type, device, loss_fn=None, stable_gamma=None, direction="ArB2r"):
+def estimate_lora_ga_init_tensors(
+    model,
+    data_loader,
+    target_modules,
+    lora_r,
+    lora_ga_batches,
+    task_type,
+    device,
+    loss_fn=None,
+    stable_gamma=None,
+    direction="ArB2r",
+    aggregate_across_ranks: bool = False,
+    svd_on_this_rank: bool = True,
+):
     """
     通过在批次上累加梯度来估计 LoRA-GA 初始化张量。
 
@@ -85,6 +99,22 @@ def estimate_lora_ga_init_tensors(model, data_loader, target_modules, lora_r, lo
 
     if n_used == 0:
         raise RuntimeError("LoRA-GA: empty loader")
+
+    # 对齐官方 LoRA-GA 多进程路径：各 rank 本地估计后做 all_reduce 聚合。
+    if aggregate_across_ranks and dist.is_available() and dist.is_initialized():
+        n_used_t = torch.tensor(float(n_used), device=device, dtype=torch.float32)
+        dist.all_reduce(n_used_t, op=dist.ReduceOp.SUM)
+        n_used_global = float(n_used_t.item())
+        if n_used_global <= 0:
+            raise RuntimeError("LoRA-GA: global n_used == 0 after all_reduce")
+        for full_name in grad_sums:
+            dist.all_reduce(grad_sums[full_name], op=dist.ReduceOp.SUM)
+        n_used = n_used_global
+
+    if not svd_on_this_rank:
+        # 非主 rank 不做 SVD，等待主 rank 广播初始化结果。
+        model.zero_grad(set_to_none=True)
+        return None
 
     result = {}
     for full_name, linear in targets:
@@ -191,25 +221,65 @@ def broadcast_lora_ga_payload(payload, src=0):
     assert out is not None
     return {k: (v[0].clone(), v[1].clone()) for k, v in out.items()}
 
-def build_train_loader_no_sampler(train_loader):
+def build_lora_ga_estimation_loader(train_loader, ddp_enabled: bool):
+    if ddp_enabled and dist.is_available() and dist.is_initialized():
+        sampler = DistributedSampler(
+            train_loader.dataset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            shuffle=False,
+            drop_last=False,
+        )
+        return DataLoader(
+            train_loader.dataset,
+            batch_size=train_loader.batch_size,
+            sampler=sampler,
+            collate_fn=train_loader.collate_fn,
+            num_workers=getattr(train_loader, "num_workers", 0),
+            pin_memory=getattr(train_loader, "pin_memory", False),
+            drop_last=False,
+        )
     return DataLoader(
-        train_loader.dataset, batch_size=train_loader.batch_size, shuffle=False,
-        collate_fn=train_loader.collate_fn, num_workers=getattr(train_loader, "num_workers", 0),
-        pin_memory=getattr(train_loader, "pin_memory", False), drop_last=False,
+        train_loader.dataset,
+        batch_size=train_loader.batch_size,
+        shuffle=False,
+        collate_fn=train_loader.collate_fn,
+        num_workers=getattr(train_loader, "num_workers", 0),
+        pin_memory=getattr(train_loader, "pin_memory", False),
+        drop_last=False,
     )
 
 def run_lora_ga_init_pipeline(base_model, train_loader, target_modules, lora_r, lora_ga_batches, task_type, device, is_main_process, ddp_enabled, loss_fn=None, stable_gamma=None, direction="ArB2r"):
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         dist.barrier()
     payload = None
-    if is_main_process:
-        dl = build_train_loader_no_sampler(train_loader)
-        est_model = copy.deepcopy(base_model)
-        payload = estimate_lora_ga_init_tensors(est_model, dl, target_modules, lora_r, lora_ga_batches, task_type, device, loss_fn, stable_gamma=stable_gamma, direction=direction)
-        del est_model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    out = broadcast_lora_ga_payload(payload, src=0)
+    dl = build_lora_ga_estimation_loader(train_loader, ddp_enabled=ddp_enabled)
+    est_model = copy.deepcopy(base_model)
+    payload = estimate_lora_ga_init_tensors(
+        est_model,
+        dl,
+        target_modules,
+        lora_r,
+        lora_ga_batches,
+        task_type,
+        device,
+        loss_fn,
+        stable_gamma=stable_gamma,
+        direction=direction,
+        aggregate_across_ranks=bool(ddp_enabled and dist.is_available() and dist.is_initialized()),
+        # 为避免把 LoRA-GA 的重计算都压到 rank0，
+        # DDP 下各 rank 在 all_reduce 后都执行同等 SVD 计算。
+        svd_on_this_rank=True,
+    )
+    del est_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if ddp_enabled and dist.is_available() and dist.is_initialized():
+        # 各 rank 已完成同口径聚合 + SVD，直接使用本地结果，避免额外把任务集中到 rank0。
+        assert payload is not None
+        out = {k: (v[0].clone(), v[1].clone()) for k, v in payload.items()}
+    else:
+        out = broadcast_lora_ga_payload(payload, src=0)
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         dist.barrier()
     return out

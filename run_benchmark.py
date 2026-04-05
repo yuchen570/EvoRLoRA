@@ -5,7 +5,7 @@ import datetime
 import json
 import os
 import time
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import math
 import torch
 import torch.nn as nn
@@ -14,7 +14,7 @@ import torch.distributed as dist
 from datasets import load_dataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from transformers import (
@@ -189,6 +189,143 @@ def extract_features_and_labels(
     return features, labels
 
 
+def _ddp_is_active() -> bool:
+    return bool(dist.is_available() and dist.is_initialized())
+
+
+def _all_gather_object(local_obj: Any) -> List[Any]:
+    if not _ddp_is_active():
+        return [local_obj]
+    world = dist.get_world_size()
+    gathered: List[Any] = [None for _ in range(world)]
+    dist.all_gather_object(gathered, local_obj)
+    return gathered
+
+
+class _DistributedEvalSampler(Sampler[int]):
+    """无重复、无补齐的顺序分片 sampler，用于 DDP 评估阶段。"""
+
+    def __init__(self, dataset, num_replicas: int, rank: int) -> None:
+        self.dataset = dataset
+        self.num_replicas = max(int(num_replicas), 1)
+        self.rank = int(rank)
+        if self.rank < 0 or self.rank >= self.num_replicas:
+            raise ValueError(f"invalid rank={self.rank}, num_replicas={self.num_replicas}")
+
+    def __iter__(self):
+        total = len(self.dataset)
+        return iter(range(self.rank, total, self.num_replicas))
+
+    def __len__(self) -> int:
+        total = len(self.dataset)
+        if total <= self.rank:
+            return 0
+        return (total - self.rank + self.num_replicas - 1) // self.num_replicas
+
+
+def _collect_nlu_predictions_distributed(
+    model: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+    regression: bool,
+    ddp_enabled: bool,
+    is_main_process: bool,
+) -> Tuple[List[float], List[float]]:
+    y_pred, y_true = collect_nlu_predictions(model, data_loader, device, regression=regression)
+    pred_list = y_pred.reshape(-1).tolist()
+    true_list = y_true.reshape(-1).tolist()
+    if not ddp_enabled or not _ddp_is_active():
+        return pred_list, true_list
+    payload = {"pred": pred_list, "true": true_list}
+    gathered = _all_gather_object(payload)
+    if not is_main_process:
+        return [], []
+    merged_pred: List[float] = []
+    merged_true: List[float] = []
+    for item in gathered:
+        if not isinstance(item, dict):
+            continue
+        merged_pred.extend(item.get("pred", []))
+        merged_true.extend(item.get("true", []))
+    return merged_pred, merged_true
+
+
+@torch.no_grad()
+def _collect_nlg_text_pairs_local(
+    gen_model: nn.Module,
+    data_loader: DataLoader,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    generation_max_new_tokens: int,
+    sample_cap: int,
+) -> Tuple[List[str], List[str]]:
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    preds_text: List[str] = []
+    refs_text: List[str] = []
+    for vb in data_loader:
+        vb = batch_to_device(vb, device)
+        input_ids = vb["input_ids"]
+        attention_mask = vb.get("attention_mask", None)
+        labels = vb["labels"]
+
+        gen_kwargs: Dict[str, Any] = dict(input_ids=input_ids, max_new_tokens=generation_max_new_tokens)
+        if attention_mask is not None:
+            gen_kwargs["attention_mask"] = attention_mask
+        gen_ids = gen_model.generate(**gen_kwargs)
+        pred_batch = tokenizer.batch_decode(gen_ids.detach().cpu(), skip_special_tokens=True)
+
+        labels_ids = labels.clone()
+        labels_ids[labels_ids == -100] = pad_id
+        ref_batch = tokenizer.batch_decode(labels_ids.detach().cpu(), skip_special_tokens=True)
+
+        preds_text.extend(pred_batch)
+        refs_text.extend(ref_batch)
+        if len(preds_text) >= sample_cap:
+            break
+    if len(preds_text) > sample_cap:
+        preds_text = preds_text[:sample_cap]
+        refs_text = refs_text[:sample_cap]
+    return preds_text, refs_text
+
+
+def _collect_nlg_text_pairs_distributed(
+    gen_model: nn.Module,
+    data_loader: DataLoader,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    generation_max_new_tokens: int,
+    nlg_eval_max_samples: int,
+    ddp_enabled: bool,
+    is_main_process: bool,
+) -> Tuple[List[str], List[str]]:
+    if ddp_enabled and _ddp_is_active():
+        local_cap = max(1, int(math.ceil(float(nlg_eval_max_samples) / float(dist.get_world_size()))))
+    else:
+        local_cap = nlg_eval_max_samples
+    local_pred, local_ref = _collect_nlg_text_pairs_local(
+        gen_model=gen_model,
+        data_loader=data_loader,
+        tokenizer=tokenizer,
+        device=device,
+        generation_max_new_tokens=generation_max_new_tokens,
+        sample_cap=local_cap,
+    )
+    if not ddp_enabled or not _ddp_is_active():
+        return local_pred[:nlg_eval_max_samples], local_ref[:nlg_eval_max_samples]
+
+    gathered = _all_gather_object({"pred": local_pred, "ref": local_ref})
+    if not is_main_process:
+        return [], []
+    merged_pred: List[str] = []
+    merged_ref: List[str] = []
+    for item in gathered:
+        if not isinstance(item, dict):
+            continue
+        merged_pred.extend(item.get("pred", []))
+        merged_ref.extend(item.get("ref", []))
+    return merged_pred[:nlg_eval_max_samples], merged_ref[:nlg_eval_max_samples]
+
+
 def setup_data_and_model(
     task_name: str = "sst2",
     model_name: str = "roberta-base",
@@ -203,7 +340,7 @@ def setup_data_and_model(
     rank: int = 0,
     world_size: int = 1,
     seed: int = 42,
-) -> Tuple[DataLoader, DataLoader, Optional[DataLoader], nn.Module, AutoTokenizer]:
+) -> Tuple[DataLoader, DataLoader, Optional[Union[DataLoader, Dict[str, DataLoader]]], nn.Module, AutoTokenizer]:
     os.makedirs(dataset_cache_dir, exist_ok=True)
     os.makedirs(model_cache_dir, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=model_cache_dir)
@@ -254,7 +391,7 @@ def setup_data_and_model(
                 seed=seed,
                 drop_last=False,
             )
-            # 为了让 mini_val_k 的批次数在各卡上尽量一致，这里使用 drop_last=True。
+            # 训练内 mini-val（EvoRank trial）保持每卡步数一致，使用 drop_last=True。
             val_sampler = DistributedSampler(
                 tokenized[val_split],
                 num_replicas=world_size,
@@ -263,19 +400,47 @@ def setup_data_and_model(
                 seed=seed,
                 drop_last=True,
             )
+            # 评估指标使用不丢样本的分片验证集，后续 all_gather 聚合。
+            val_eval_sampler = _DistributedEvalSampler(
+                tokenized[val_split],
+                num_replicas=world_size,
+                rank=rank,
+            )
             train_loader = DataLoader(
                 tokenized[train_split], batch_size=batch_size, sampler=train_sampler, collate_fn=collator
             )
             val_loader = DataLoader(
                 tokenized[val_split], batch_size=batch_size, sampler=val_sampler, collate_fn=collator
             )
-            # GLUE 官方主指标（MCC/F1 等）需全验证集；与 NLG 一致，仅 rank0 用该 loader 做评估。
+            val_loader_eval = DataLoader(
+                tokenized[val_split], batch_size=batch_size, sampler=val_eval_sampler, collate_fn=collator
+            )
             if task_name == "mnli":
-                val_m_loader = DataLoader(tokenized["validation_matched"], batch_size=batch_size, shuffle=False, collate_fn=collator)
-                val_mm_loader = DataLoader(tokenized["validation_mismatched"], batch_size=batch_size, shuffle=False, collate_fn=collator)
+                val_m_sampler = _DistributedEvalSampler(
+                    tokenized["validation_matched"],
+                    num_replicas=world_size,
+                    rank=rank,
+                )
+                val_mm_sampler = _DistributedEvalSampler(
+                    tokenized["validation_mismatched"],
+                    num_replicas=world_size,
+                    rank=rank,
+                )
+                val_m_loader = DataLoader(
+                    tokenized["validation_matched"],
+                    batch_size=batch_size,
+                    sampler=val_m_sampler,
+                    collate_fn=collator,
+                )
+                val_mm_loader = DataLoader(
+                    tokenized["validation_mismatched"],
+                    batch_size=batch_size,
+                    sampler=val_mm_sampler,
+                    collate_fn=collator,
+                )
                 val_loader_eval_full = {"matched": val_m_loader, "mismatched": val_mm_loader}
             else:
-                val_loader_eval_full = DataLoader(tokenized[val_split], batch_size=batch_size, shuffle=False, collate_fn=collator)
+                val_loader_eval_full = val_loader_eval
         else:
             train_loader = DataLoader(tokenized[train_split], batch_size=batch_size, shuffle=True, collate_fn=collator)
             val_loader = DataLoader(tokenized[val_split], batch_size=batch_size, shuffle=False, collate_fn=collator)
@@ -380,15 +545,19 @@ def setup_data_and_model(
                 seed=seed,
                 drop_last=True,
             )
+            val_eval_sampler = _DistributedEvalSampler(
+                tokenized[val_split_name],
+                num_replicas=world_size,
+                rank=rank,
+            )
             train_loader = DataLoader(
                 tokenized["train"], batch_size=batch_size, sampler=train_sampler, collate_fn=collator
             )
             val_loader = DataLoader(
                 tokenized[val_split_name], batch_size=batch_size, sampler=val_sampler, collate_fn=collator
             )
-            # DDP 下验证集被切分；ROUGE 需在 rank0 上对完整验证集评估（他卡 barrier 等待）。
             val_loader_eval_full = DataLoader(
-                tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator
+                tokenized[val_split_name], batch_size=batch_size, sampler=val_eval_sampler, collate_fn=collator
             )
         else:
             train_loader = DataLoader(tokenized["train"], batch_size=batch_size, shuffle=True, collate_fn=collator)
@@ -1080,7 +1249,7 @@ def run_training_loop(
     lambda_pop: Optional[int] = None,
     population_strategy: str = "all",
     random_seed: Optional[int] = None,
-    val_loader_eval_full: Optional[DataLoader] = None,
+    val_loader_eval_full: Optional[Union[DataLoader, Dict[str, DataLoader]]] = None,
     sora_sparse_lambda: float = 1e-3,
     sora_sparse_lambda_2: float = 1e-3,
     sora_lambda_warmup_steps: int = 0,
@@ -1593,34 +1762,72 @@ def run_training_loop(
         if task_type == "nlu":
             if task_name is None:
                 raise ValueError("NLU（GLUE）评估需要传入 task_name")
-            if ddp_enabled and dist.is_available() and dist.is_initialized():
+            if ddp_enabled and _ddp_is_active():
                 dist.barrier()
             val_metric = 0.0
             mkey = glue_primary_metric_key(task_name)
             regression = nlu_is_glue_regression(task_name)
-            metrics_dict_val = {}
-            if is_main_process:
-                ev_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
-                eval_model = _unwrap_training_module(model)
-                if isinstance(ev_loader, dict):
-                    y_pred_m, y_true_m = collect_nlu_predictions(eval_model, ev_loader["matched"], device, regression=regression)
-                    y_pred_mm, y_true_mm = collect_nlu_predictions(eval_model, ev_loader["mismatched"], device, regression=regression)
+            metrics_dict_val: Dict[str, float] = {}
+            y_pred_main: List[float] = []
+            y_true_main: List[float] = []
+            ev_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
+            eval_model = _unwrap_training_module(model)
+            if isinstance(ev_loader, dict):
+                y_pred_m, y_true_m = _collect_nlu_predictions_distributed(
+                    eval_model,
+                    ev_loader["matched"],
+                    device,
+                    regression=regression,
+                    ddp_enabled=ddp_enabled,
+                    is_main_process=is_main_process,
+                )
+                y_pred_mm, y_true_mm = _collect_nlu_predictions_distributed(
+                    eval_model,
+                    ev_loader["mismatched"],
+                    device,
+                    regression=regression,
+                    ddp_enabled=ddp_enabled,
+                    is_main_process=is_main_process,
+                )
+                if is_main_process:
                     val_metric_m = compute_glue_primary_metric(task_name, y_pred_m, y_true_m)
                     val_metric_mm = compute_glue_primary_metric(task_name, y_pred_mm, y_true_mm)
                     val_metric = (val_metric_m + val_metric_mm) / 2.0
                     metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred_m, y_true_m)
                     metrics_dict_val["accuracy_m"] = val_metric_m
                     metrics_dict_val["accuracy_mm"] = val_metric_mm
-                else:
-                    y_pred, y_true = collect_nlu_predictions(eval_model, ev_loader, device, regression=regression)
-                    val_metric = compute_glue_primary_metric(task_name, y_pred, y_true)
-                    metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred, y_true)
+                    y_pred_main = y_pred_m
+                    y_true_main = y_true_m
+            else:
+                y_pred_local, y_true_local = _collect_nlu_predictions_distributed(
+                    eval_model,
+                    ev_loader,
+                    device,
+                    regression=regression,
+                    ddp_enabled=ddp_enabled,
+                    is_main_process=is_main_process,
+                )
+                if is_main_process:
+                    val_metric = compute_glue_primary_metric(task_name, y_pred_local, y_true_local)
+                    metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred_local, y_true_local)
+                    y_pred_main = y_pred_local
+                    y_true_main = y_true_local
+            if ddp_enabled and _ddp_is_active():
+                m_tensor = torch.tensor([val_metric if is_main_process else 0.0], device=device, dtype=torch.float64)
+                dist.broadcast(m_tensor, src=0)
+                val_metric = float(m_tensor.item())
+                dist.barrier()
+            if is_main_process:
+                if val_metric > best_val_acc:
+                    best_val_acc = val_metric
+                    best_val_metrics = metrics_dict_val
+                elif val_metric == best_val_acc and not best_val_metrics:
+                    best_val_metrics = metrics_dict_val
                 if method_name in {"lora", "evorank"} and task_name in {"cola", "rte"} and epoch in {0, epochs - 1}:
-                    pred_list = [int(x) for x in y_pred.reshape(-1).tolist()]
-                    true_list = [int(x) for x in y_true.reshape(-1).tolist()]
+                    pred_list = [int(x) for x in y_pred_main]
+                    true_list = [int(x) for x in y_true_main]
                     pred_dist = {str(k): int(sum(1 for x in pred_list if x == k)) for k in sorted(set(pred_list))}
                     true_dist = {str(k): int(sum(1 for x in true_list if x == k)) for k in sorted(set(true_list))}
-                    # region agent log
                     _debug_log(
                         run_id=f"{task_name}-{method_name}-seed{random_seed}-eval",
                         hypothesis_id="H3",
@@ -1638,19 +1845,6 @@ def run_training_loop(
                             "sample_true": true_list[:16],
                         },
                     )
-                    # endregion
-            if ddp_enabled and dist.is_available() and dist.is_initialized():
-                m_tensor = torch.tensor([val_metric], device=device, dtype=torch.float64)
-                dist.broadcast(m_tensor, src=0)
-                val_metric = float(m_tensor.item())
-                # DDP环境下，这里只广播主指标。字典仅由is_main_process维护！
-                dist.barrier()
-            if val_metric > best_val_acc:
-                best_val_acc = val_metric
-                best_val_metrics = metrics_dict_val
-            elif val_metric == best_val_acc and not best_val_metrics:
-                best_val_metrics = metrics_dict_val
-            if is_main_process:
                 print(
                     f"[{method_name}] epoch={epoch + 1}/{epochs} "
                     f"step={global_step} val_{mkey}={val_metric:.4f} best={best_val_acc:.4f}"
@@ -1677,11 +1871,33 @@ def run_training_loop(
         else:
             if tokenizer is None:
                 raise ValueError("task_type='nlg' 时必须传入 tokenizer")
-            # DDP 下用 barrier 对齐：rank0 在完整验证集上算 ROUGE，避免 DistributedSampler 子集有偏。
-            if ddp_enabled and dist.is_available() and dist.is_initialized():
+            if ddp_enabled and _ddp_is_active():
                 dist.barrier()
 
             val_metric = 0.0
+            rouge1_val = 0.0
+            rouge2_val = 0.0
+            eval_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
+            if isinstance(eval_loader, dict):
+                raise ValueError("NLG 评估不支持 dict 类型验证 loader")
+
+            # 生成阶段需要底层 seq2seq 模型（可能在 DictFeatureClassifier.inner 或 DDP.module.inner 中）
+            if isinstance(model, DDP):
+                inner = getattr(model.module, "inner", model.module)
+                gen_model = inner
+            else:
+                gen_model = getattr(model, "inner", model)
+
+            preds_text, refs_text = _collect_nlg_text_pairs_distributed(
+                gen_model=gen_model,
+                data_loader=eval_loader,
+                tokenizer=tokenizer,
+                device=device,
+                generation_max_new_tokens=generation_max_new_tokens,
+                nlg_eval_max_samples=nlg_eval_max_samples,
+                ddp_enabled=ddp_enabled,
+                is_main_process=is_main_process,
+            )
             if is_main_process:
                 try:
                     import evaluate  # type: ignore
@@ -1692,47 +1908,6 @@ def run_training_loop(
                     # 之前静默写 0 分，导致“全 0”难以定位原因；这里显式打印异常。
                     rouge_metric = None
                     print(f"[warn] evaluate.load('rouge') failed: {type(e).__name__}: {e!r}")
-
-                # 生成阶段需要底层 seq2seq 模型（可能在 DictFeatureClassifier.inner 或 DDP.module.inner 中）
-                if isinstance(model, DDP):
-                    inner = getattr(model.module, "inner", model.module)
-                    gen_model = inner
-                else:
-                    gen_model = getattr(model, "inner", model)
-
-                pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-
-                eval_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
-
-                preds_text: List[str] = []
-                refs_text: List[str] = []
-                sample_count = 0
-
-                with torch.no_grad():
-                    for vb in eval_loader:
-                        vb = batch_to_device(vb, device)
-                        input_ids = vb["input_ids"]
-                        attention_mask = vb.get("attention_mask", None)
-                        labels = vb["labels"]
-
-                        gen_kwargs = dict(input_ids=input_ids, max_new_tokens=generation_max_new_tokens)
-                        if attention_mask is not None:
-                            gen_kwargs["attention_mask"] = attention_mask
-                        gen_ids = gen_model.generate(**gen_kwargs)
-                        gen_ids_cpu = gen_ids.detach().cpu()
-                        pred_batch = tokenizer.batch_decode(gen_ids_cpu, skip_special_tokens=True)
-
-                        # labels 里 padding 会是 -100，需要还原为 pad_id 便于 decode
-                        labels_ids = labels.clone()
-                        labels_ids[labels_ids == -100] = pad_id
-                        labels_ids_cpu = labels_ids.detach().cpu()
-                        ref_batch = tokenizer.batch_decode(labels_ids_cpu, skip_special_tokens=True)
-
-                        preds_text.extend(pred_batch)
-                        refs_text.extend(ref_batch)
-                        sample_count += len(pred_batch)
-                        if sample_count >= nlg_eval_max_samples:
-                            break
 
                 if rouge_metric is None:
                     if is_main_process:
@@ -1794,7 +1969,7 @@ def run_training_loop(
                     wandb_log_dict["rank/avg"] = rank_info["summary"]["avg_rank"]
                     wandb_run.log(wandb_log_dict)
 
-            if ddp_enabled and dist.is_available() and dist.is_initialized():
+            if ddp_enabled and _ddp_is_active():
                 dist.barrier()
 
         if is_main_process and checkpoint_root:
@@ -2417,6 +2592,10 @@ if __name__ == "__main__":
     args.is_main_process = args.rank == 0
 
     try:
+        if args.ddp_enabled and torch.cuda.is_available():
+            # 在首次 collective（如 lora_ga 初始化前的 barrier）之前绑定本地 GPU，
+            # 避免 NCCL 提示 "devices used by this process are currently unknown"。
+            torch.cuda.set_device(args.local_rank)
         if args.ddp_enabled and not dist.is_initialized():
             dist.init_process_group(
                 backend=args.ddp_backend,
