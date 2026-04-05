@@ -410,27 +410,83 @@ def peft_factory(
     evorank_r_max: int = 16,
     evorank_alpha_u: float = 1.0,
     evorank_beta_u: float = 1.0,
+    evorank_rho: float = 0.9,
+    evorank_p_g: float = 0.8,
+    evorank_p_p: float = 0.1,
+    evorank_H_g: int = 2,
+    evorank_H_p: int = 3,
+    evorank_cooldown_steps: int = 2,
+    evorank_allow_reallocation: bool = True,
+    evorank_max_reallocate_candidates: int = 8,
 ) -> Tuple[nn.Module, Optional[RankEvolutionController], Dict[str, Any]]:
-    # --target_modules 优先；否则按模型类型自动推断
+    def _collect_all_linear_target_modules(m: nn.Module) -> List[str]:
+        excluded_fragments = (
+            "lm_head",
+            "classifier",
+            "score",
+            "pooler",
+            "embed",
+            "embedding",
+        )
+        names: List[str] = []
+        for full_name, module in m.named_modules():
+            if not isinstance(module, nn.Linear):
+                continue
+            lname = full_name.lower()
+            if any(tok in lname for tok in excluded_fragments):
+                continue
+            names.append(full_name)
+        if not names:
+            raise ValueError("未找到可用于 all-linear 注入的 Linear 模块")
+        return names
+
+    def _default_target_modules(method: str, model_type_name: str) -> List[str]:
+        if method == "lora-ga":
+            return _collect_all_linear_target_modules(model)
+
+        broad_layout = method in {"adalora", "sora"}
+        if "deberta" in model_type_name:
+            return (
+                ["query_proj", "key_proj", "value_proj", "intermediate.dense", "output.dense"]
+                if broad_layout
+                else ["query_proj", "key_proj", "value_proj"]
+            )
+        if "roberta" in model_type_name or "bert" in model_type_name:
+            return (
+                ["query", "key", "value", "intermediate.dense", "output.dense"]
+                if broad_layout
+                else ["query", "value"]
+            )
+        if "bart" in model_type_name:
+            return (
+                ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
+                if broad_layout
+                else ["q_proj", "v_proj"]
+            )
+        if "llama" in model_type_name or "mistral" in model_type_name:
+            return (
+                ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+                if broad_layout
+                else ["q_proj", "v_proj"]
+            )
+        if "t5" in model_type_name:
+            return (
+                ["q", "k", "v", "o", "wi", "wo"]
+                if broad_layout
+                else ["q", "v"]
+            )
+        return ["query", "key", "value", "intermediate.dense", "output.dense"] if broad_layout else ["query", "value"]
+
+    model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
+
+    # --target_modules 优先；否则按方法+模型类型选择默认协议
     if target_modules_override:
         target_modules = [m.strip() for m in target_modules_override.split(",") if m.strip()]
     else:
-        model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
-        if "deberta" in model_type:
-            target_modules = ["query_proj", "key_proj", "value_proj"]
-        elif "roberta" in model_type or "bert" in model_type:
-            target_modules = ["query", "value"]
-        elif "llama" in model_type or "mistral" in model_type:
-            target_modules = ["q_proj", "v_proj"]
-        elif "t5" in model_type:
-            target_modules = ["q", "v"]
-        else:
-            target_modules = ["query", "value"]
+        target_modules = _default_target_modules(method_name, model_type)
 
     # --lora_alpha 优先；否则回退到 2 * target_rank
     effective_alpha = float(lora_alpha) if lora_alpha is not None else float(2 * target_rank)
-
-    model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
 
     # DeBERTa + 标准 LoRA：对 FFN（intermediate/output）注 LoRA 时激活范数大，与 DisentangledAttention 组合在 DDP+GLUE 下可在数十步内 forward NaN（运行证据：step0 有限，首个密采样步已 NaN）。
     # 仅收紧 method=lora；AdaLoRA/LoRA-GA 等仍保留用户传入的 target_modules。
@@ -539,17 +595,19 @@ def peft_factory(
             target_modules=target_modules,
             layer_kwargs={"r_max": er_max, "r_init": target_rank, "lora_alpha": effective_alpha},
             controller_kwargs={
-                "rho": 0.9,
-                "p_g": 0.8,
-                "p_p": 0.1,
-                "H_g": 2,
-                "H_p": 3,
-                "cooldown_steps": 2,
+                "rho": float(evorank_rho),
+                "p_g": float(evorank_p_g),
+                "p_p": float(evorank_p_p),
+                "H_g": int(evorank_H_g),
+                "H_p": int(evorank_H_p),
+                "cooldown_steps": int(evorank_cooldown_steps),
                 "r_min": 2,
                 "r_max": er_max,
                 "alpha_u": float(evorank_alpha_u),
                 "beta_u": float(evorank_beta_u),
+                "allow_reallocation": bool(evorank_allow_reallocation),
                 "expand_init_mode": getattr(args, "expand_init_mode", "zero"),
+                "max_reallocate_candidates": int(evorank_max_reallocate_candidates) if int(evorank_max_reallocate_candidates) > 0 else None,
             },
         )
         # EvoRank 手动注入后，需要显式解冻任务头（与 HF PEFT 在 SEQ_CLS 下的行为对齐）。
@@ -565,6 +623,7 @@ def peft_factory(
             raise ValueError("method_name='lora-ga' 时必须传入 train_loader")
         ga_dev = lora_ga_device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         ga_loss_fn: Optional[nn.Module] = None
+        ga_stable_gamma = float(lora_ga_stable_gamma) if lora_ga_stable_gamma is not None else (16.0 if task_type == "nlu" else 64.0)
         if task_type == "nlu" and nlu_regression:
             ga_loss_fn = nn.MSELoss()
         init_by_key = run_lora_ga_init_pipeline(
@@ -578,7 +637,7 @@ def peft_factory(
             is_main_process=is_main_process,
             ddp_enabled=ddp_enabled,
             loss_fn=ga_loss_fn,
-            stable_gamma=lora_ga_stable_gamma,
+            stable_gamma=ga_stable_gamma,
         )
         config = LoraConfig(
             task_type=peft_task_type,
@@ -588,7 +647,7 @@ def peft_factory(
             target_modules=target_modules,
             modules_to_save=modules_to_save,
             bias="none",
-            use_rslora=lora_ga_use_rslora,
+            use_rslora=bool(lora_ga_use_rslora),
         )
         model = get_peft_model(model, config)
         tgt = next(model.parameters()).device
@@ -1020,6 +1079,7 @@ def run_training_loop(
     verify_n_samples: int = 2,
     max_grad_norm: Optional[float] = None,
     peft_meta: Optional[Dict[str, Any]] = None,
+    evo_include_noop_candidate: bool = True,
 ) -> Dict[str, Any]:
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         if not torch.cuda.is_available():
@@ -1057,7 +1117,15 @@ def run_training_loop(
             {"params": _non_gate_peft, "lr": lr},
             {"params": _non_gate_head, "lr": head_lr_val}
         ], weight_decay=sora_wd)
-        sparse_optimizer = SparseAdamW(_gate, lr=lr, sparse_lambda=sora_sparse_lambda_2, weight_decay=0.0)
+        sparse_optimizer = SparseAdamW(
+            _gate,
+            lr=lr,
+            sparse_lambda=sora_sparse_lambda_2,
+            lambda_schedule=sora_lambda_schedule,
+            max_lambda=sora_max_lambda,
+            lambda_num=sora_lambda_num,
+            weight_decay=0.0,
+        )
     else:
         _peft_params = [p for n, p in model.named_parameters() if p.requires_grad and not any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
         _head_params = [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
@@ -1134,6 +1202,14 @@ def run_training_loop(
 
     total_train_steps = max_train_steps if max_train_steps is not None else epochs * len(train_loader)
     warmup_steps = int(total_train_steps * warmup_ratio)
+    sora_schedule_stage_steps: Optional[int] = None
+    if (
+        method_name == "sora"
+        and sparse_optimizer is not None
+        and sora_lambda_schedule is not None
+        and int(sora_lambda_num) > 1
+    ):
+        sora_schedule_stage_steps = max(1, math.ceil(total_train_steps / int(sora_lambda_num)))
     debug_steps = {0, min(99, max(total_train_steps - 1, 0)), max(total_train_steps - 1, 0)}
     # LoRA+GLUE：在已知易发散区间逐步打点，便于确认首个 NaN 出现在哪一步（不仅依赖硬编码的 99）。
     lora_glue_step_trace = method_name in {"lora", "evorank"} and task_name in {"cola", "rte"}
@@ -1213,6 +1289,7 @@ def run_training_loop(
                     population_strategy=population_strategy,
                     random_seed=random_seed,
                     max_grad_norm=max_grad_norm,
+                    include_noop_candidate=evo_include_noop_candidate,
                 )
                 train_loss = float(out["train_loss"])
                 avg_active_rank = float(
@@ -1231,12 +1308,7 @@ def run_training_loop(
                         loss = loss + ow * compute_adalora_orthogonal_loss(inner)
                 if method_name == "sora":
                     lam = float(sora_sparse_lambda)
-                    if sora_lambda_schedule is not None:
-                        # schedule-dense 变体：按 schedule 动态调整 sparse_lambda
-                        if sora_lambda_schedule == "linear":
-                            num_steps = max(int(sora_lambda_num), 1)
-                            lam = float(sora_max_lambda) * min(1.0, float(global_step + 1) / float(num_steps))
-                    elif sora_lambda_warmup_steps > 0:
+                    if sora_lambda_schedule is None and sora_lambda_warmup_steps > 0:
                         lam *= min(1.0, float(global_step + 1) / float(sora_lambda_warmup_steps))
                     # 官方 SoRA：L1 Loss 除以 gate 总元素数做归一化
                     l1_penalty = sum(
@@ -1397,6 +1469,14 @@ def run_training_loop(
                 )
 
             global_step += 1
+            if (
+                method_name == "sora"
+                and sparse_optimizer is not None
+                and sora_schedule_stage_steps is not None
+                and global_step < total_train_steps
+                and global_step % sora_schedule_stage_steps == 0
+            ):
+                sparse_optimizer.step_lambda()
             if (
                 is_main_process
                 and checkpoint_root
@@ -1781,7 +1861,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="逗号分隔的注入模块后缀列表，如 'query,key,value,intermediate'。"
-             "未指定时按模型类型自动推断（DeBERTa→query_proj/key_proj/value_proj，RoBERTa/BERT→query/value，T5→q/v）。",
+             "未指定时按方法+模型类型自动选择默认协议：LoRA 走较窄默认，AdaLoRA/SoRA 走论文主线宽注入，LoRA-GA 走 all-linear。",
     )
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -1838,6 +1918,18 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="EvoRank 容量组合 u_ℓ 中 β",
     )
+    parser.add_argument("--evo_rho", type=float, default=0.9, help="EvoRank EMA 平滑系数 rho。设为 0 可消融 EMA 平滑")
+    parser.add_argument("--evo_p_g", type=float, default=0.8, help="EvoRank 扩张分位数阈值 p_g")
+    parser.add_argument("--evo_p_p", type=float, default=0.1, help="EvoRank 修剪分位数阈值 p_p")
+    parser.add_argument("--evo_H_g", type=int, default=2, help="EvoRank 扩张持久计数阈值 H_g。设为 1 可关闭持久化门槛")
+    parser.add_argument("--evo_H_p", type=int, default=3, help="EvoRank 修剪持久计数阈值 H_p。设为 1 可关闭持久化门槛")
+    parser.add_argument("--evo_cooldown_steps", type=int, default=2, help="EvoRank 扩张后冷却步数。设为 0 可关闭 cooldown")
+    parser.add_argument("--evo_allow_reallocation", dest="evo_allow_reallocation", action="store_true", help="EvoRank：启用跨层 reallocation（默认开启）")
+    parser.add_argument("--no_evo_allow_reallocation", dest="evo_allow_reallocation", action="store_false", help="EvoRank：关闭跨层 reallocation，只保留 grow / prune")
+    parser.set_defaults(evo_allow_reallocation=True)
+    parser.add_argument("--evo_include_noop_candidate", dest="evo_include_noop_candidate", action="store_true", help="EvoRank：ES 候选中包含 no-op 基线（默认开启）")
+    parser.add_argument("--no_evo_include_noop_candidate", dest="evo_include_noop_candidate", action="store_false", help="EvoRank：移除 no-op 候选，用于消融 validation-side safeguard")
+    parser.set_defaults(evo_include_noop_candidate=True)
     parser.add_argument(
         "--expand_init_mode",
         type=str,
@@ -1847,6 +1939,12 @@ def parse_args() -> argparse.Namespace:
              "'zero': B 列清零（安全 cold start）；"
              "'gradient': 论文 Proposition 3.2——基于 ∂L/∂ΔW 的主奇异方向初始化新分量，"
              "通过 power iteration 高效计算，不构造完整梯度矩阵。",
+    )
+    parser.add_argument(
+        "--evo_max_reallocate_candidates",
+        type=int,
+        default=8,
+        help="EvoRank 默认的跨层 reallocation 候选上限。候选按 top-k cross 顺序生成，并在达到该上限后停止。设为 0 或负数可关闭限流（允许组合爆炸消融）。",
     )
     parser.add_argument("--lambda_pop", type=int, default=None)
     parser.add_argument("--population_strategy", type=str, default="all", choices=["all", "random"])
@@ -1865,8 +1963,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ddp", action="store_true", help="是否启用 torchrun/DistributedDataParallel")
     parser.add_argument("--ddp_backend", type=str, default="nccl", help="DDP backend，通常是 nccl")
     parser.add_argument("--lora_ga_batches", type=int, default=8, help="LoRA-GA 梯度估计用的训练 batch 数（仅前若干个 batch）")
-    parser.add_argument("--lora_ga_use_rslora", action="store_true", help="LoRA-GA：启用 rsLoRA 缩放（lora_alpha/sqrt(r)），对标官方 reproduce 配置")
-    parser.add_argument("--lora_ga_stable_gamma", type=float, default=None, help="LoRA-GA：stable init gamma 值（官方默认 64）；指定后在 SVD 初始化时对奇异值做 gamma 归一化")
+    parser.add_argument("--lora_ga_use_rslora", dest="lora_ga_use_rslora", action="store_true", help="LoRA-GA：启用 rsLoRA 缩放（默认开启，对标官方主配方）")
+    parser.add_argument("--no_lora_ga_use_rslora", dest="lora_ga_use_rslora", action="store_false", help="LoRA-GA：关闭 rsLoRA 缩放（消融用）")
+    parser.set_defaults(lora_ga_use_rslora=True)
+    parser.add_argument("--lora_ga_stable_gamma", type=float, default=16.0, help="LoRA-GA：stable init gamma 值。NLU/GLUE 默认 16；可按任务显式覆盖")
     parser.add_argument("--sora_sparse_lambda", type=float, default=1e-3, help="SoRA：gate L1 惩罚系数")
     parser.add_argument("--sora_lambda_warmup_steps", type=int, default=0, help="SoRA：前若干步将 sparse_lambda 从 0 线性升到设定值；0 表示关闭")
     parser.add_argument("--sora_sparse_lambda_2", type=float, default=3e-4, help="SoRA：gate 近端梯度硬裁剪阈值（Proximal Gradient / Soft-Thresholding），对标官方 SparseAdamW")
@@ -1874,7 +1974,7 @@ def parse_args() -> argparse.Namespace:
         "--sora_lambda_schedule",
         type=str,
         default=None,
-        help="SoRA lambda 调度策略（如 'linear'）。None 表示固定值（no-schedule 主线）。",
+        help="SoRA 对 gate 近端阈值 lambda_2 的阶段式调度策略（如 'linear'）。None 表示固定阈值（no-schedule 主线）。",
     )
     parser.add_argument("--sora_max_lambda", type=float, default=10.0, help="SoRA lambda_schedule 的最大 lambda 值")
     parser.add_argument("--sora_lambda_num", type=int, default=5, help="SoRA lambda_schedule 的步数（线性升至 max_lambda 所需步数）")
@@ -1991,6 +2091,14 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         evorank_r_max=args.evorank_r_max,
                         evorank_alpha_u=args.evo_alpha_u,
                         evorank_beta_u=args.evo_beta_u,
+                        evorank_rho=args.evo_rho,
+                        evorank_p_g=args.evo_p_g,
+                        evorank_p_p=args.evo_p_p,
+                        evorank_H_g=args.evo_H_g,
+                        evorank_H_p=args.evo_H_p,
+                        evorank_cooldown_steps=args.evo_cooldown_steps,
+                        evorank_allow_reallocation=args.evo_allow_reallocation,
+                        evorank_max_reallocate_candidates=args.evo_max_reallocate_candidates,
                     )
                     checkpoint_root: Optional[str] = None
                     if not args.no_output_dir:
@@ -2043,6 +2151,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         verify_n_samples=args.verify_n_samples,
                         max_grad_norm=args.max_grad_norm,
                         peft_meta=meta,
+                        evo_include_noop_candidate=args.evo_include_noop_candidate,
                     )
                     res.update(
                         {

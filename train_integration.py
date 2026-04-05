@@ -6,7 +6,13 @@ import torch.nn as nn
 import torch.distributed as dist
 
 from evo_rank_lora import EvoRankLoRALayer
-from rank_evolution_controller import ModuleMutation, RankEvolutionController
+from rank_evolution_controller import (
+    ExpandMutation,
+    ModuleMutation,
+    PruneMutation,
+    RankEvolutionController,
+    ReallocateMutation,
+)
 
 
 class _PaddingTrialMutation(ModuleMutation):
@@ -133,6 +139,7 @@ def train_evo_lora_step(
     population_strategy: str = "all",
     random_seed: Optional[int] = None,
     max_grad_norm: Optional[float] = None,
+    include_noop_candidate: bool = True,
 ) -> Dict[str, Any]:
     """
     论文 Alg. 1：双时间尺度训练步。
@@ -203,6 +210,36 @@ def train_evo_lora_step(
             rng = random.Random(random_seed)
             return rng.sample(mutations, k=pop_size)
         raise ValueError(f"未知 population_strategy: {strategy}")
+
+    def _reset_optimizer_state_for_component(
+        opt: torch.optim.Optimizer,
+        layer: EvoRankLoRALayer,
+        index: int,
+    ) -> None:
+        def _zero_matching_state(param: nn.Parameter, selector) -> None:
+            state = opt.state.get(param, None)
+            if not state:
+                return
+            for value in state.values():
+                if torch.is_tensor(value) and value.shape == param.shape:
+                    selector(value)
+
+        _zero_matching_state(layer.lora_A.weight, lambda tensor: tensor[index, :].zero_())
+        _zero_matching_state(layer.lora_B.weight, lambda tensor: tensor[:, index].zero_())
+
+    def _reset_optimizer_state_for_mutation(
+        opt: torch.optim.Optimizer,
+        mutation: ModuleMutation,
+    ) -> None:
+        if isinstance(mutation, ExpandMutation):
+            _reset_optimizer_state_for_component(opt, mutation.layer, mutation.index)
+            return
+        if isinstance(mutation, PruneMutation):
+            _reset_optimizer_state_for_component(opt, mutation.layer, mutation.index)
+            return
+        if isinstance(mutation, ReallocateMutation):
+            _reset_optimizer_state_for_mutation(opt, mutation.prune_mut)
+            _reset_optimizer_state_for_mutation(opt, mutation.expand_mut)
 
     model.train()
     _sync_controller_state_device(controller)
@@ -285,7 +322,6 @@ def train_evo_lora_step(
 
             rewards: List[Tuple[float, Optional[ModuleMutation]]] = []
             with torch.no_grad():
-                # 论文 Eq. 167 elitist selection: z_t (no-op) 始终在候选集中
                 base_eval_losses: List[torch.Tensor] = []
                 for val_inputs, val_targets in val_batches:
                     val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
@@ -297,9 +333,11 @@ def train_evo_lora_step(
                     reduced_base = base_eval_loss.clone()
                     dist.all_reduce(reduced_base, op=dist.ReduceOp.SUM)
                     base_eval_loss = reduced_base / dist.get_world_size()
-                # 论文 Eq. 163: R(z) = -L_val(Θ; z) - λ_c · C(z)
-                base_reward = -float(base_eval_loss.item()) - lambda_c * _compute_complexity(controller, complexity_mode)
-                rewards.append((base_reward, None))  # no-op reward
+                if include_noop_candidate:
+                    # 论文 Eq. 167 elitist selection: z_t (no-op) 始终在候选集中
+                    # 论文 Eq. 163: R(z) = -L_val(Θ; z) - λ_c · C(z)
+                    base_reward = -float(base_eval_loss.item()) - lambda_c * _compute_complexity(controller, complexity_mode)
+                    rewards.append((base_reward, None))  # no-op reward
 
                 for mutation in mutations:
                     if isinstance(mutation, _PaddingTrialMutation):
@@ -336,6 +374,7 @@ def train_evo_lora_step(
                 best_reward, best_mutation = max(rewards, key=lambda x: x[0])
                 if best_mutation is not None:
                     controller.commit_mutation(best_mutation)
+                    _reset_optimizer_state_for_mutation(optimizer, best_mutation)
                 # ES 轮次结束后，主动回收未提交候选的缓存引用，降低潜在显存滞留风险。
                 controller.cleanup_uncommitted_mutations(mutations, committed=best_mutation)
                 result["best_reward"] = best_reward

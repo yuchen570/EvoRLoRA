@@ -57,7 +57,7 @@ The difficulty is that rank adaptation is discrete. Gradient descent can optimiz
 
 The method places each LoRA layer in a maximum-rank super-space and uses a binary mask to select the active rank-1 components. The inner loop updates the active LoRA parameters. The outer loop mutates the structure through expansion, reduction, and cross-layer reallocation, and retains only improving candidates. This yields a simple bidirectional mechanism that can grow capacity when needed and remove it when redundant.
 
-Our contributions are threefold. First, we propose an ES-based LoRA framework with dynamic bidirectional rank adaptation. Second, we introduce a rank super-space parameterization that supports online expansion and reduction with weight inheritance. Third, we provide theoretical support for the core operators and a submission-ready experimental protocol for evaluating the method.
+Our contributions are threefold. First, we propose an ES-based LoRA framework with dynamic bidirectional rank adaptation. Second, we introduce a rank super-space parameterization with output-stabilized rsLoRA scaling and structure-aware optimizer-state resets for online rank mutation. Third, we provide theoretical support for the core operators and a submission-ready experimental protocol for evaluating the method.
 
 
 \section{Related Work}
@@ -82,9 +82,9 @@ For a pre-trained weight matrix $W \in \mathbb{R}^{d \times k}$, standard LoRA l
 \end{equation}
 where
 \begin{equation}
-    \Delta W = BA,
+    \Delta W = \frac{\alpha}{\sqrt{r}}BA,
 \end{equation}
-with $B \in \mathbb{R}^{d \times r}$ and $A \in \mathbb{R}^{r \times k}$. Here $r$ denotes the LoRA rank. Conventional LoRA uses a fixed rank chosen before training and often shares that rank across all LoRA-injected layers.
+with $B \in \mathbb{R}^{d \times r}$ and $A \in \mathbb{R}^{r \times k}$. Here $r$ denotes the LoRA rank. Our implementation follows an rsLoRA-style parameterization in which the effective update is scaled by $\alpha/\sqrt{r}$ to stabilize output magnitude as the active rank changes. Conventional LoRA uses a fixed rank chosen before training and often shares that rank across all LoRA-injected layers.
 
 \subsection{Overview}
 \method replaces the fixed-rank design with alternating continuous and discrete updates:
@@ -97,11 +97,11 @@ Each LoRA layer is embedded in a maximum-rank super-space, and a binary mask sel
 \subsection{Rank Super-Space Parameterization}
 For the $\ell$-th LoRA layer, we write
 \begin{equation}
-    \Delta W_\ell = \sum_{i=1}^{\Rmax} m_{\ell,i} b_{\ell,i} a_{\ell,i}^{\top},
+    \Delta W_\ell = \frac{\alpha}{\sqrt{r_\ell}}\sum_{i=1}^{\Rmax} m_{\ell,i} b_{\ell,i} a_{\ell,i}^{\top},
 \end{equation}
 where $m_{\ell,i} \in \{0,1\}$ indicates whether the $i$-th rank-1 component is active. In matrix form,
 \begin{equation}
-    \Delta W_\ell = B_\ell M_\ell A_\ell,
+    \Delta W_\ell = \frac{\alpha}{\sqrt{r_\ell}} B_\ell M_\ell A_\ell,
 \end{equation}
 with
 \begin{equation}
@@ -115,7 +115,7 @@ The effective rank is
 \begin{equation}
     r_\ell = \sum_{i=1}^{\Rmax} m_{\ell,i}.
 \end{equation}
-This parameterization supports both expansion and reduction without rebuilding the module.
+This parameterization supports both expansion and reduction without rebuilding the module. To preserve the magnitude of the retained active update immediately after a structural mutation, the implementation applies a multiplicative compensation factor $\sqrt{r_{\mathrm{new}}/r_{\mathrm{old}}}$ to the surviving active components after each expansion or reduction step.
 
 \subsection{Optimization Objective}
 Let $z$ denote the collection of all structural masks and let $\Theta$ denote all continuous LoRA parameters. The validation-side structural objective is
@@ -133,24 +133,36 @@ or a size-aware cost,
 The inner loop optimizes $\Theta$ on training data, while the outer loop updates $z$ using the regularized validation reward.
 
 \subsection{Expansion and Reduction Criteria}
-We quantify whether a layer needs more rank using a demand signal
+We quantify whether a layer needs more rank using the idealized demand signal
 \begin{equation}
     g_\ell = \left\|\frac{\partial \mathcal{L}}{\partial \Delta W_\ell}\right\|_F.
 \end{equation}
-A large $g_\ell$ indicates that the current active low-rank space is likely insufficient. We also define a component importance score
+In practice, materializing the full $d_\ell \times k_\ell$ gradient matrix is prohibitively expensive. The implementation therefore uses the surrogate
+\begin{equation}
+    \underline{g}_\ell
+    =
+    \left\|
+    \Pi_{\mathrm{row}(A_\ell)}
+    \left(
+    \frac{\partial \mathcal{L}}{\partial \Delta W_\ell}
+    \right)
+    \right\|_F
+    \le g_\ell,
+\end{equation}
+which reconstructs the gradient only in the row space of the active $A_\ell$ factors via a pseudo-inverse and requires only small $r_\ell \times r_\ell$ linear solves rather than explicit dense gradient storage. Unless otherwise stated, the implementation-oriented sections use $\underline{g}_\ell$ for controller statistics and for gradient-guided expansion initialization. A large $\underline{g}_\ell$ indicates that the current active low-rank space is likely insufficient. We also define a component importance score
 \begin{equation}
     s_{\ell,i} = \|b_{\ell,i}\|_2\,\|a_{\ell,i}\|_2,
 \end{equation}
 and combine these into an expansion utility
 \begin{equation}
-    u_\ell = \alpha g_\ell + \beta \cdot \frac{1}{\max(r_\ell,1)}\sum_{i:m_{\ell,i}=1} s_{\ell,i}.
+    u_\ell = \alpha \underline{g}_\ell + \beta \cdot \frac{1}{\max(r_\ell,1)}\sum_{i:m_{\ell,i}=1} s_{\ell,i}.
 \end{equation}
 Large $u_\ell$ favors expansion. For reduction, we use
 \begin{equation}
     s^{\mathrm{red}}_{\ell,i} = \alpha_1\|b_{\ell,i}\|_2\|a_{\ell,i}\|_2 + \alpha_2\left|\left\langle \frac{\partial \mathcal{L}}{\partial \Delta W_\ell}, b_{\ell,i}a_{\ell,i}^{\top}\right\rangle\right|.
 \end{equation}
 Low-scoring active components are candidates for removal.
-+
+
 \subsection{ES-Based Structure Evolution}
 Given the current structure $z_t$, the ES samples a local neighborhood $\mathcal{N}(z_t)$ with three mutation types:
 \begin{itemize}[leftmargin=1.2em]
@@ -158,6 +170,7 @@ Given the current structure $z_t$, the ES samples a local neighborhood $\mathcal
     \item \textbf{Reduction:} deactivate a low-importance active component.
     \item \textbf{Reallocation:} reduce one layer and expand another, approximately preserving the global budget.
 \end{itemize}
+To avoid combinatorial explosion in cross-layer reallocation, the implementation uses a top-k cross strategy: expansion candidates are ordered by layer demand, pruning candidates are ordered by component importance, and only the first $K_{\mathrm{realloc}}$ cross-layer reallocation pairs are evaluated. Unless otherwise stated, we use $K_{\mathrm{realloc}} = 8$.
 Each candidate structure $z'$ receives reward
 \begin{equation}
     R(z') = -\mathcal{L}_{\mathrm{val}}(\Theta; z') - \lambda_c C(z').
@@ -180,7 +193,7 @@ so the structure changes only when a better candidate is found.
         \State Sample mini-batch from $\mathcal{D}_{\mathrm{tr}}$
         \State Update active LoRA parameters $\Theta$ by gradient descent under structure $z_t$
     \EndFor
-    \State Compute layer demand $g_\ell$ and component scores $s^{\mathrm{red}}_{\ell,i}$
+    \State Compute layer demand surrogate $\underline{g}_\ell$ and component scores $s^{\mathrm{red}}_{\ell,i}$
     \For{$j = 1,2,\dots,\lambda$}
         \State Sample candidate $z_t^{(j)}$ via expansion, reduction, or reallocation
         \State Evaluate reward $R\big(z_t^{(j)}\big)$ on $\mathcal{D}_{\mathrm{val}}$
@@ -196,7 +209,7 @@ so the structure changes only when a better candidate is found.
     \fbox{%
     \begin{minipage}{0.96\textwidth}
     \vspace{0.35em}
-    \textbf{Method figure layout suggestion.} The final camera-ready figure should contain four blocks arranged from left to right: \textbf{(1) LoRA rank super-space}, showing that each injected projection reserves $\Rmax$ rank-1 slots but activates only a subset; \textbf{(2) Inner-loop parameter update}, showing gradient descent over active LoRA components on training mini-batches; \textbf{(3) Statistics extraction}, showing the layer demand score $g_\ell$ and reduction score $s^{\mathrm{red}}_{\ell,i}$; and \textbf{(4) ES outer loop}, showing expansion, reduction, and reallocation mutations evaluated on a validation subset with elitist selection. A compact annotation beneath the figure can highlight that the method jointly optimizes continuous LoRA weights and discrete rank structure.
+    \textbf{Method figure layout suggestion.} The final camera-ready figure should contain four blocks arranged from left to right: \textbf{(1) LoRA rank super-space}, showing that each injected projection reserves $\Rmax$ rank-1 slots but activates only a subset; \textbf{(2) Inner-loop parameter update}, showing gradient descent over active LoRA components on training mini-batches; \textbf{(3) Statistics extraction}, showing the layer demand surrogate $\underline{g}_\ell$ and reduction score $s^{\mathrm{red}}_{\ell,i}$; and \textbf{(4) ES outer loop}, showing expansion, reduction, and reallocation mutations evaluated on a validation subset with elitist selection. A compact annotation beneath the figure can highlight that the method jointly optimizes continuous LoRA weights and discrete rank structure.
     \vspace{0.35em}
     \end{minipage}}
     \caption{Schematic of \method. The conceptual figure should emphasize the separation between gradient-based parameter learning and ES-based structure evolution. This placeholder box is intentionally text-only so the manuscript remains self-contained; it can later be replaced with a polished vector diagram without changing the caption or surrounding discussion.}
@@ -204,13 +217,17 @@ so the structure changes only when a better candidate is found.
 \end{figure*}
 
 \subsection{Practical Remarks}
-New components can be initialized near zero or from a gradient-informed rank-1 approximation. Inactive components keep their stored weights, which enables weight inheritance if they are reactivated. In practice, the outer loop can be run only every few inner updates.
+New components can be initialized near zero or from a gradient-informed rank-1 approximation. The latter follows Proposition~\ref{prop:best_rank1_direction} but avoids a costly full SVD by using power iteration to estimate the leading singular vectors of the projected gradient operator. When a previously inactive or pruned component is reactivated, its weights are re-initialized rather than inheriting historical values. The implementation also resets the optimizer state associated with that slot before subsequent updates, which avoids stale momentum from destabilizing the current training dynamics. In practice, the outer loop can be run only every few inner updates.
 
 
 \subsection{Dynamic Thresholding and Implementation Details}
 \label{subsec:impl_details}
 
-We do not use fixed absolute thresholds for rank expansion and rank reduction, since the magnitudes of layer-wise gradients and component importances vary substantially across layers, tasks, and training stages. Instead, \method uses relative and dynamically updated thresholds based on normalized statistics.
+We do not use fixed absolute thresholds for rank expansion and rank reduction, since the magnitudes of layer-wise gradients and component importances vary substantially across layers, tasks, and training stages. Instead, \method uses relative and dynamically updated thresholds based on normalized statistics. Specifically, we use max-scaling normalization,
+\begin{equation}
+    \tilde{x} = \frac{x}{\max(x)+\epsilon},
+\end{equation}
+which keeps all normalized scores non-negative and preserves the interpretability of the weighted combination.
 
 For each LoRA layer $\ell$, we define a capacity score
 \begin{equation}
@@ -254,7 +271,7 @@ Similarly, the reduction threshold is defined by the lower percentile of active 
 \begin{equation}
     \tau_{\mathrm{prune}}^{(t)}
     =
-    \mathrm{Percentile}\bigl(\{\hat{s}_{\ell,i}^{(t)}: m_{\ell,i}=1\},\, p_p\bigr),
+    \mathrm{Percentile}\bigl(\{\hat{s}_{\ell,i}^{(t)}: m_{\ell,i}=1 \text{ and } (\ell,i)\notin \mathcal{C}^{(t)}\},\, p_p\bigr),
 \end{equation}
 where $p_p$ is typically set to $10\%$. An active component is considered eligible for removal if
 \begin{equation}
@@ -263,18 +280,17 @@ where $p_p$ is typically set to $10\%$. An active component is considered eligib
     r_\ell > r_{\min}.
 \end{equation}
 
-To prevent oscillatory grow-prune behavior, we use three stabilizing mechanisms. First, structural evolution is disabled during an initial warmup stage. Second, a candidate expansion or reduction must satisfy the corresponding threshold for multiple consecutive structural updates before it is executed. Third, a cooldown period is imposed after expansion, during which newly activated components cannot be immediately removed.
+To prevent oscillatory grow-prune behavior, we use three stabilizing mechanisms. First, structural evolution is disabled during an initial warmup stage. This warmup addresses a zero-gradient trap caused by standard LoRA initialization: when $B_\ell$ is initialized at or near zero, the gradients of the corresponding $A_\ell$ rows are initially suppressed, which can make early structural statistics unreliable. Second, a candidate expansion or reduction must satisfy the corresponding threshold for multiple consecutive structural updates before it is executed. Third, a cooldown period is imposed after expansion, during which newly activated components cannot be immediately removed; unlike warmup, this mechanism protects freshly introduced components during later training.
 
 Unless otherwise stated, we apply structural evolution every 200 optimization steps, use an EMA factor of 0.9, set the growth and pruning percentiles to $80\%$ and $10\%$, respectively, and use a warmup stage covering the first $10\%$ of total training steps. We set the minimum and maximum per-layer ranks to $r_{\min}=2$ and $r_{\max}=16$, use persistence lengths $H_g=2$ and $H_p=3$, and apply a cooldown period of two structural updates after each expansion.
 
 \begin{algorithm}[t]
-\caption{Dynamic thresholding for rank expansion and reduction in \method}
+\caption{Dynamic thresholding and candidate identification in \method}
 \label{alg:dynamic_threshold}
 \footnotesize
 \begin{algorithmic}[1]
 \Require LoRA parameters $\Theta$, structure masks $z$, update interval $T_{\mathrm{es}}$, smoothing factor $\rho$, growth percentile $p_g$, pruning percentile $p_p$, minimum rank $r_{\min}$, maximum rank $r_{\max}$, warmup steps $T_{\mathrm{warm}}$
-\State Initialize EMA statistics $\hat{u}_\ell \leftarrow 0$ for all layers
-\State Initialize EMA statistics $\hat{s}_{\ell,i} \leftarrow 0$ for all rank-1 components
+\State Initialize EMA statistics from the first observed values of $u_\ell$ and $s_{\ell,i}$
 \State Initialize persistence counters $c^{\mathrm{grow}}_\ell \leftarrow 0$, $c^{\mathrm{prune}}_{\ell,i} \leftarrow 0$
 \State Initialize cooldown flags for newly expanded components
 \For{$t = 1, 2, \dots, T$}
@@ -292,7 +308,7 @@ Unless otherwise stated, we apply structural evolution every 200 optimization st
             \State Update EMA: $\hat{s}_{\ell,i} \leftarrow \rho \hat{s}_{\ell,i} + (1-\rho) s_{\ell,i}$
         \EndFor
         \State Compute expansion threshold $\tau_{\mathrm{grow}} = \mathrm{Percentile}(\{\hat{u}_\ell\}_{\ell=1}^{L}, p_g)$
-        \State Compute pruning threshold $\tau_{\mathrm{prune}} = \mathrm{Percentile}(\{\hat{s}_{\ell,i}: m_{\ell,i}=1\}, p_p)$
+        \State Compute pruning threshold $\tau_{\mathrm{prune}} = \mathrm{Percentile}(\{\hat{s}_{\ell,i}: m_{\ell,i}=1, (\ell,i)\notin\mathcal{C}\}, p_p)$
         \For{each layer $\ell$}
             \If{$\hat{u}_\ell > \tau_{\mathrm{grow}}$ and $r_\ell < r_{\max}$}
                 \State $c^{\mathrm{grow}}_\ell \leftarrow c^{\mathrm{grow}}_\ell + 1$
@@ -307,30 +323,21 @@ Unless otherwise stated, we apply structural evolution every 200 optimization st
                 \State $c^{\mathrm{prune}}_{\ell,i} \leftarrow 0$
             \EndIf
         \EndFor
-        \For{each layer $\ell$}
-            \If{$c^{\mathrm{grow}}_\ell \ge H_g$}
-                \State Activate one inactive rank-1 component in layer $\ell$
-                \State Reset $c^{\mathrm{grow}}_\ell \leftarrow 0$
-                \State Mark the new component as being in cooldown
-            \EndIf
-        \EndFor
-        \For{each active component $(\ell,i)$}
-            \If{$c^{\mathrm{prune}}_{\ell,i} \ge H_p$}
-                \State Deactivate component $(\ell,i)$
-                \State Reset $c^{\mathrm{prune}}_{\ell,i} \leftarrow 0$
-            \EndIf
-        \EndFor
+        \State Collect expansion candidates $\{ \ell : c^{\mathrm{grow}}_\ell \ge H_g \}$
+        \State Collect pruning candidates $\{ (\ell,i) : c^{\mathrm{prune}}_{\ell,i} \ge H_p \}$
+        \State Build ES trial mutations from expansion, reduction, and top-k cross reallocation candidates
+        \State Pass the candidate set to Algorithm~\ref{alg:main} for validation-side elitist selection
         \State Update cooldown status of expanded components
     \EndIf
 \EndFor
-\State \Return Updated LoRA parameters $\Theta$ and learned adaptive structure $z$
+\State \Return Updated statistics and candidate sets for ES-based structure selection
 \end{algorithmic}
 \end{algorithm}
 
 \section{Theoretical Analysis}
 \label{sec:theory}
 
-We analyze the LoRA update space under standard smoothness assumptions and focus on the three core operations of \method: expansion, reduction, and ES-based structure updates.
+We analyze the LoRA update space under standard smoothness assumptions and focus on the three core operations of \method: expansion, reduction, and ES-based structure updates. For notational simplicity, the theory below omits the implementation-side rsLoRA scaling factor and studies the corresponding unscaled low-rank update geometry; the implementation reinstates the scaling and compensation rules described in Section~\ref{sec:method}.
 
 \subsection{Preliminaries}
 For a single LoRA-injected layer, let
@@ -569,19 +576,23 @@ Table~\ref{tab:hparams} summarizes the implementation details reported in our de
         Maximum rank $\Rmax$ & 16 \\
         Initial rank $r_0$ & \TODO{} \\
         Minimum rank $r_{\min}$ & 2 \\
+        rsLoRA scaling rule & $\alpha / \sqrt{r_\ell}$ with mutation compensation $\sqrt{r_{\mathrm{new}}/r_{\mathrm{old}}}$ \\
         ES population size $\lambda$ & \TODO{} \\
         Structure update interval $T_{\mathrm{es}}$ & 200 optimization steps \\
         Warmup ratio & first 10\% of total steps \\
         EMA factor $\rho$ & 0.9 \\
+        Normalization rule & max-scaling $\tilde{x}=x/(\max(x)+\epsilon)$ \\
         Growth percentile $p_g$ & 80\% \\
         Pruning percentile $p_p$ & 10\% \\
         Grow / prune persistence & $H_g=2$, $H_p=3$ \\
         Cooldown after expansion & 2 structural updates \\
+        Reallocation strategy & top-k cross with $K_{\mathrm{realloc}}=8$ \\
+        Reactivation behavior & re-initialize component weights; reset optimizer state for the affected slot \\
         Reward definition & $-\mathcal{L}_{\mathrm{val}} - \lambda_c C(z)$ \\
         Validation subset size & \TODO{} \\
         Optimizer and LR & \TODO{} \\
         Batch size / epochs & \TODO{} \\
-        Expansion initialization & zero-init or gradient-informed \\
+        Expansion initialization & zero-init or gradient-informed via power iteration \\
         \bottomrule
     \end{tabularx}
 \end{table}

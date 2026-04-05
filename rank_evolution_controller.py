@@ -142,10 +142,11 @@ class RankEvolutionController:
         # 与论文动态阈值小节capacity score一致：u_ℓ = α_g · g̃_ℓ + β_s · s̃̄_ℓ（层间 max-scaling 归一化，即 x/x_max）
         alpha_u: float = 1.0,
         beta_u: float = 1.0,
+        allow_reallocation: bool = True,
         # ===== ES 候选限流（避免 Reallocate 组合爆炸）=====
         max_expand_candidates: Optional[int] = None,
         max_prune_candidates: Optional[int] = None,
-        max_reallocate_candidates: Optional[int] = None,
+        max_reallocate_candidates: Optional[int] = 8,
         reallocate_strategy: str = "topk_cross",
         expand_init_mode: str = "zero",
     ):
@@ -163,6 +164,7 @@ class RankEvolutionController:
         self.cooldown_steps = cooldown_steps
         self.alpha_u = float(alpha_u)
         self.beta_u = float(beta_u)
+        self.allow_reallocation = bool(allow_reallocation)
 
         device = next(iter(self.layers.values())).lora_A.weight.device
         
@@ -408,7 +410,7 @@ class RankEvolutionController:
         mutations.extend(prune_muts)
 
         # 4) Reallocate 候选：避免组合爆炸
-        if not expand_muts or not prune_muts:
+        if (not self.allow_reallocation) or (not expand_muts) or (not prune_muts):
             return mutations
 
         reallocate_count = 0

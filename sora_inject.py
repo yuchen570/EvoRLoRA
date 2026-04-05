@@ -2,6 +2,7 @@
 from __future__ import annotations
 import math
 from typing import List
+import numpy as np
 import torch
 import torch.nn as nn
 from train_integration import _set_module_by_path
@@ -60,10 +61,51 @@ class SparseAdamW(torch.optim.AdamW):
     参考：TsinghuaC3I/SoRA (EMNLP 2023) src/sparse_optimizer.py
     """
 
-    def __init__(self, params, sparse_lambda: float = 1e-3, correct_bias: bool = True, **kwargs):
+    def __init__(
+        self,
+        params,
+        sparse_lambda: float = 1e-3,
+        correct_bias: bool = True,
+        lambda_schedule: str | None = None,
+        max_lambda: float | None = None,
+        lambda_num: int | None = None,
+        **kwargs,
+    ):
         super().__init__(params, **kwargs)
         self.sparse_lambda = sparse_lambda
         self.correct_bias = correct_bias
+        self.lambda_schedule = lambda_schedule
+        self.lambda_idx = 0
+        self._build_lambda_list(max_lambda=max_lambda, lambda_num=lambda_num)
+
+    def _build_lambda_list(self, max_lambda: float | None, lambda_num: int | None) -> None:
+        if self.lambda_schedule is None:
+            self._lambdas = None
+            return
+        if isinstance(self.lambda_schedule, list):
+            self._lambdas = list(self.lambda_schedule)
+            return
+        if max_lambda is None or lambda_num is None:
+            raise ValueError("SoRA lambda schedule 需要同时提供 max_lambda 和 lambda_num")
+        if self.lambda_schedule == "linear":
+            self._lambdas = np.linspace(self.sparse_lambda, float(max_lambda), int(lambda_num)).tolist()
+        elif self.lambda_schedule == "log_linear":
+            self._lambdas = np.log(
+                np.linspace(np.exp(self.sparse_lambda), np.exp(float(max_lambda)), int(lambda_num))
+            ).tolist()
+        elif self.lambda_schedule == "exp_linear":
+            self._lambdas = np.exp(
+                np.linspace(np.log(self.sparse_lambda), np.log(float(max_lambda)), int(lambda_num))
+            ).tolist()
+        else:
+            raise NotImplementedError(f"未知 SoRA lambda_schedule: {self.lambda_schedule}")
+
+    def step_lambda(self) -> None:
+        if not self._lambdas:
+            return
+        if self.lambda_idx < len(self._lambdas) - 1:
+            self.lambda_idx += 1
+            self.sparse_lambda = float(self._lambdas[self.lambda_idx])
 
     def step(self, closure=None):
         loss = None
