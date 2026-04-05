@@ -28,6 +28,7 @@ python run_benchmark.py \
   --lora_ga_batches 8 \
   --sora_sparse_lambda 10 \
   --sora_sparse_lambda_2 3e-4 \
+  --lambda_c 0.001 \
   --expand_init_mode gradient \
   --evo_max_reallocate_candidates 8 \
   --seed 42 \

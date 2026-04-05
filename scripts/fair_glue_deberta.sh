@@ -43,6 +43,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --lora_ga_batches 8 \
   --sora_sparse_lambda 10 \
   --sora_sparse_lambda_2 3e-4 \
+  --lambda_c 0.001 \
   --expand_init_mode gradient \
   --evo_max_reallocate_candidates 8 \
   --seed_list 0 21 42 81 100 \

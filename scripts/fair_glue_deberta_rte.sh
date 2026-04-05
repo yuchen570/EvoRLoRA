@@ -37,6 +37,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29510 \
   --sora_lambda_schedule linear \
   --sora_max_lambda 7e-4 \
   --sora_lambda_num 7 \
+  --lambda_c 0.001 \
   --expand_init_mode gradient \
   --evo_max_reallocate_candidates 8 \
   --seed 48 \

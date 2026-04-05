@@ -36,7 +36,6 @@ COMMON_ARGS=(
   --max_grad_norm 0.1
   --T_es 200
   --mini_val_k 8
-  --lambda_c 0.001
   --complexity_mode rank_sum
   --lambda_pop 16
   --population_strategy all
@@ -67,8 +66,8 @@ run_case() {
   echo "=== [$(date '+%F %T')] Done ${case_name} ==="
 }
 
-run_case full 29600
-run_case no_complexity 29601 --lambda_c 0.0
+run_case full 29600 --lambda_c 0.001
+run_case no_complexity 29601
 run_case zero_init 29602 --expand_init_mode zero
 run_case no_ema 29603 --evo_rho 0.0
 run_case no_persist_cooldown 29604 --evo_H_g 1 --evo_H_p 1 --evo_cooldown_steps 0
