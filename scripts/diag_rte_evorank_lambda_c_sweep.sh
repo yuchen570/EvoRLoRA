@@ -32,6 +32,7 @@ run_case () {
     --lambda_c "${lam}" \
     --expand_init_mode gradient \
     --evo_max_reallocate_candidates 8 \
+    --verify_n_samples 0 \
     --seed 48 \
     --log_dir "runs/rte_evorank_lambda_sweep_${tag}" \
     --output_dir artifacts \

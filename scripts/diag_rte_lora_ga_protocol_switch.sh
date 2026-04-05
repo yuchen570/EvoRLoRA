@@ -25,6 +25,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29531 \
   --weight_decay 0.1 \
   --max_grad_norm 0.1 \
   --lora_ga_batches 8 \
+  --verify_n_samples 0 \
   --seed 48 \
   --log_dir runs/rte_lora_ga_uniform_schedule \
   --output_dir artifacts \
@@ -49,6 +50,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29532 \
   --lora_ga_use_official_scheduler \
   --lora_ga_official_warmup_ratio 0.03 \
   --lora_ga_official_scheduler_type cosine \
+  --verify_n_samples 0 \
   --seed 48 \
   --log_dir runs/rte_lora_ga_official_schedule \
   --output_dir artifacts \

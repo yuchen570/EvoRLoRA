@@ -36,6 +36,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29510 \
   --lambda_c 0.001 \
   --expand_init_mode gradient \
   --evo_max_reallocate_candidates 8 \
+  --verify_n_samples 0 \
   --seed 48 \
   --log_dir runs/fair_glue_deberta_rte_ddp \
   --output_dir artifacts \
