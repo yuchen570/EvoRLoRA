@@ -1,0 +1,666 @@
+\documentclass{article}
+\usepackage[preprint]{neurips_2026}
+\PassOptionsToPackage{numbers}{natbib}
+% \usepackage[margin=1in]{geometry}
+% \setlength{\columnsep}{0.25in}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{amsfonts}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{caption}
+\usepackage{makecell}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{assumption}{Assumption}
+\newtheorem{corollary}{Corollary}
+
+\newcommand{\method}{\textsc{EvoRank-LoRA}}
+\newcommand{\Rmax}{R_{\max}}
+\newcommand{\TODO}{\textit{TBD}}
+
+\title{\method: Evolutionary Bidirectional Rank Adaptation for Low-Rank Fine-Tuning}
+
+\author{%
+  Anonymous Authors \\
+  Anonymous Institution \\
+  \texttt{anonymous@anonymous.edu}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+LoRA is an effective parameter-efficient fine-tuning method, but it typically uses a fixed rank throughout training. This is restrictive: rank demand varies across layers and over time. We propose \method, which treats rank allocation as a discrete structural optimization problem and solves it with an evolution strategy (ES). Each LoRA layer is parameterized in a maximum-rank super-space, and a binary mask selects the active rank-1 components. Training alternates between gradient updates of the active LoRA weights and ES-based structure updates that expand, reduce, or reallocate rank across layers. We show that expansion enlarges the feasible update space, reduction incurs a controlled local loss increase under smoothness assumptions, elitist ES improves the regularized structural objective during structure selection, and the full alternating procedure converges to a block-wise local optimum under a standard two-timescale view. \method is simple, modular, and compatible with standard transformer fine-tuning pipelines.
+\end{abstract}
+
+\section{Introduction}
+Parameter-efficient fine-tuning (PEFT) adapts large pre-trained models by training only a small set of additional parameters. Among PEFT methods, LoRA is particularly effective: it freezes the backbone and learns low-rank updates for selected linear projections \citep{hu2022lora}. In practice, however, LoRA still relies on a manually chosen rank, and that rank is usually shared across all injected layers.
+
+A fixed rank is convenient but restrictive. Transformer layers do not contribute equally to adaptation, and their capacity requirements need not remain constant during training. A small rank may underfit important layers, while a large rank may waste parameters on layers that need little adaptation. This motivates a dynamic alternative in which rank is allocated where it is useful instead of being fixed in advance.
+
+The difficulty is that rank adaptation is discrete. Gradient descent can optimize the continuous LoRA weights, but it does not naturally decide when to activate a new rank-1 component, remove a redundant one, or move budget across layers. We address this with \method, which combines gradient-based LoRA training with an outer-loop evolution strategy (ES) over rank structure.
+
+The method places each LoRA layer in a maximum-rank super-space and uses a binary mask to select the active rank-1 components. The inner loop updates the active LoRA parameters. The outer loop mutates the structure through expansion, reduction, and cross-layer reallocation, and retains only improving candidates. This yields a simple bidirectional mechanism that can grow capacity when needed and remove it when redundant.
+
+Our contributions are threefold. First, we propose an ES-based LoRA framework with dynamic bidirectional rank adaptation. Second, we introduce a rank super-space parameterization that supports online expansion and reduction with weight inheritance. Third, we provide theoretical support for the core operators and a submission-ready experimental protocol for evaluating the method.
+
+
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{PEFT.}
+PEFT methods adapt frozen pre-trained models with a small number of trainable parameters, including adapters \citep{houlsby2019adapter}, prefix tuning \citep{li2021prefix}, prompt tuning \citep{lester2021power}, and IA$^3$ \citep{liu2022fewshot}. LoRA is a particularly simple and strong instance of this idea.
+
+\paragraph{LoRA variants.}
+LoRA represents weight updates as low-rank factors \citep{hu2022lora}. Follow-up work studies adaptive budget allocation \citep{zhang2023adalora}, weight decomposition \citep{liu2024dora}, and other structured variants. Our work is closest to adaptive-rank LoRA, but focuses on explicit discrete rank evolution during training.
+
+\paragraph{Structure adaptation and ES.}
+Dynamic structure adaptation is related to pruning, low-rank compression, and neural architecture search. Evolution strategies are attractive in this setting because they can optimize discrete design variables without gradients \citep{rechenberg1973evolutionsstrategie,schwefel1977numerische,salimans2017es,real2019regularized}. We use ES only for outer-loop rank-structure search, while continuous LoRA parameters are still trained by gradient descent.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Preliminaries: LoRA}
+For a pre-trained weight matrix $W \in \mathbb{R}^{d \times k}$, standard LoRA learns a low-rank update
+\begin{equation}
+    W' = W + \Delta W,
+\end{equation}
+where
+\begin{equation}
+    \Delta W = BA,
+\end{equation}
+with $B \in \mathbb{R}^{d \times r}$ and $A \in \mathbb{R}^{r \times k}$. Here $r$ denotes the LoRA rank. Conventional LoRA uses a fixed rank chosen before training and often shares that rank across all LoRA-injected layers.
+
+\subsection{Overview}
+\method replaces the fixed-rank design with alternating continuous and discrete updates:
+\begin{enumerate}[leftmargin=1.2em]
+    \item \textbf{Parameter step:} update the active LoRA factors by gradient descent.
+    \item \textbf{Structure step:} mutate and select the rank structure with ES.
+\end{enumerate}
+Each LoRA layer is embedded in a maximum-rank super-space, and a binary mask selects the active rank-1 components.
+
+\subsection{Rank Super-Space Parameterization}
+For the $\ell$-th LoRA layer, we write
+\begin{equation}
+    \Delta W_\ell = \sum_{i=1}^{\Rmax} m_{\ell,i} b_{\ell,i} a_{\ell,i}^{\top},
+\end{equation}
+where $m_{\ell,i} \in \{0,1\}$ indicates whether the $i$-th rank-1 component is active. In matrix form,
+\begin{equation}
+    \Delta W_\ell = B_\ell M_\ell A_\ell,
+\end{equation}
+with
+\begin{equation}
+\begin{aligned}
+    B_\ell &\in \mathbb{R}^{d_\ell \times \Rmax}, \\
+    A_\ell &\in \mathbb{R}^{\Rmax \times k_\ell}, \\
+    M_\ell &= \mathrm{diag}(m_{\ell,1}, \dots, m_{\ell,\Rmax}).
+\end{aligned}
+\end{equation}
+The effective rank is
+\begin{equation}
+    r_\ell = \sum_{i=1}^{\Rmax} m_{\ell,i}.
+\end{equation}
+This parameterization supports both expansion and reduction without rebuilding the module.
+
+\subsection{Optimization Objective}
+Let $z$ denote the collection of all structural masks and let $\Theta$ denote all continuous LoRA parameters. The validation-side structural objective is
+\begin{equation}
+    \mathcal{J}(z) = \mathcal{L}_{\mathrm{val}}(\Theta; z) + \lambda_c C(z),
+\end{equation}
+where $C(z)$ is a complexity term such as total active rank,
+\begin{equation}
+    C(z) = \sum_{\ell=1}^{L} r_\ell,
+\end{equation}
+or a size-aware cost,
+\begin{equation}
+    C(z) = \sum_{\ell=1}^{L}(d_\ell + k_\ell)r_\ell.
+\end{equation}
+The inner loop optimizes $\Theta$ on training data, while the outer loop updates $z$ using the regularized validation reward.
+
+\subsection{Expansion and Reduction Criteria}
+We quantify whether a layer needs more rank using a demand signal
+\begin{equation}
+    g_\ell = \left\|\frac{\partial \mathcal{L}}{\partial \Delta W_\ell}\right\|_F.
+\end{equation}
+A large $g_\ell$ indicates that the current active low-rank space is likely insufficient. We also define a component importance score
+\begin{equation}
+    s_{\ell,i} = \|b_{\ell,i}\|_2\,\|a_{\ell,i}\|_2,
+\end{equation}
+and combine these into an expansion utility
+\begin{equation}
+    u_\ell = \alpha g_\ell + \beta \cdot \frac{1}{\max(r_\ell,1)}\sum_{i:m_{\ell,i}=1} s_{\ell,i}.
+\end{equation}
+Large $u_\ell$ favors expansion. For reduction, we use
+\begin{equation}
+    s^{\mathrm{red}}_{\ell,i} = \alpha_1\|b_{\ell,i}\|_2\|a_{\ell,i}\|_2 + \alpha_2\left|\left\langle \frac{\partial \mathcal{L}}{\partial \Delta W_\ell}, b_{\ell,i}a_{\ell,i}^{\top}\right\rangle\right|.
+\end{equation}
+Low-scoring active components are candidates for removal.
++
+\subsection{ES-Based Structure Evolution}
+Given the current structure $z_t$, the ES samples a local neighborhood $\mathcal{N}(z_t)$ with three mutation types:
+\begin{itemize}[leftmargin=1.2em]
+    \item \textbf{Expansion:} activate a new rank-1 component in a high-demand layer.
+    \item \textbf{Reduction:} deactivate a low-importance active component.
+    \item \textbf{Reallocation:} reduce one layer and expand another, approximately preserving the global budget.
+\end{itemize}
+Each candidate structure $z'$ receives reward
+\begin{equation}
+    R(z') = -\mathcal{L}_{\mathrm{val}}(\Theta; z') - \lambda_c C(z').
+\end{equation}
+We use elitist selection,
+\begin{equation}
+    z_{t+1} = \arg\max_{z \in \{z_t\} \cup \mathcal{N}(z_t)} R(z),
+\end{equation}
+so the structure changes only when a better candidate is found.
+
+\begin{algorithm}[t]
+\caption{Training procedure of \method}
+\label{alg:main}
+\begin{algorithmic}[1]
+\Require Pre-trained model $W$, training set $\mathcal{D}_{\mathrm{tr}}$, validation subset $\mathcal{D}_{\mathrm{val}}$, maximum rank $\Rmax$, initial rank $r_0$, mutation population size $\lambda$, inner steps $K$
+\State Initialize LoRA super-space $\{A_\ell, B_\ell\}_{\ell=1}^L$ with maximum rank $\Rmax$
+\State Initialize structure $z_0$ by activating the first $r_0$ components in each LoRA layer
+\For{$t = 0,1,\dots,T-1$}
+    \For{$k = 1,2,\dots,K$}
+        \State Sample mini-batch from $\mathcal{D}_{\mathrm{tr}}$
+        \State Update active LoRA parameters $\Theta$ by gradient descent under structure $z_t$
+    \EndFor
+    \State Compute layer demand $g_\ell$ and component scores $s^{\mathrm{red}}_{\ell,i}$
+    \For{$j = 1,2,\dots,\lambda$}
+        \State Sample candidate $z_t^{(j)}$ via expansion, reduction, or reallocation
+        \State Evaluate reward $R\big(z_t^{(j)}\big)$ on $\mathcal{D}_{\mathrm{val}}$
+    \EndFor
+    \State Set $z_{t+1} = \arg\max_{z \in \{z_t, z_t^{(1)}, \dots, z_t^{(\lambda)}\}} R(z)$
+\EndFor
+\State \Return trained LoRA parameters $\Theta$ and learned structure $z_T$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{figure*}[t]
+    \centering
+    \fbox{%
+    \begin{minipage}{0.96\textwidth}
+    \vspace{0.35em}
+    \textbf{Method figure layout suggestion.} The final camera-ready figure should contain four blocks arranged from left to right: \textbf{(1) LoRA rank super-space}, showing that each injected projection reserves $\Rmax$ rank-1 slots but activates only a subset; \textbf{(2) Inner-loop parameter update}, showing gradient descent over active LoRA components on training mini-batches; \textbf{(3) Statistics extraction}, showing the layer demand score $g_\ell$ and reduction score $s^{\mathrm{red}}_{\ell,i}$; and \textbf{(4) ES outer loop}, showing expansion, reduction, and reallocation mutations evaluated on a validation subset with elitist selection. A compact annotation beneath the figure can highlight that the method jointly optimizes continuous LoRA weights and discrete rank structure.
+    \vspace{0.35em}
+    \end{minipage}}
+    \caption{Schematic of \method. The conceptual figure should emphasize the separation between gradient-based parameter learning and ES-based structure evolution. This placeholder box is intentionally text-only so the manuscript remains self-contained; it can later be replaced with a polished vector diagram without changing the caption or surrounding discussion.}
+    \label{fig:method}
+\end{figure*}
+
+\subsection{Practical Remarks}
+New components can be initialized near zero or from a gradient-informed rank-1 approximation. Inactive components keep their stored weights, which enables weight inheritance if they are reactivated. In practice, the outer loop can be run only every few inner updates.
+
+
+\subsection{Dynamic Thresholding and Implementation Details}
+\label{subsec:impl_details}
+
+We do not use fixed absolute thresholds for rank expansion and rank reduction, since the magnitudes of layer-wise gradients and component importances vary substantially across layers, tasks, and training stages. Instead, \method uses relative and dynamically updated thresholds based on normalized statistics.
+
+For each LoRA layer $\ell$, we define a capacity score
+\begin{equation}
+    u_\ell = \alpha \tilde{g}_\ell + \beta \widetilde{\bar{s}}_\ell,
+\end{equation}
+where $\tilde{g}_\ell$ is the normalized gradient-based demand score and $\widetilde{\bar{s}}_\ell$ is the normalized average importance of active rank-1 components. A large $u_\ell$ indicates that the current rank allocation of layer $\ell$ is likely insufficient.
+
+For each active rank-1 component $(\ell,i)$, we define an importance score
+\begin{equation}
+    s^{\mathrm{red}}_{\ell,i} = \alpha_1\|b_{\ell,i}\|_2\|a_{\ell,i}\|_2 + \alpha_2\left|\left\langle \frac{\partial \mathcal{L}}{\partial \Delta W_\ell}, b_{\ell,i}a_{\ell,i}^{\top}\right\rangle\right|,
+\end{equation}
+where small values of $s_{\ell,i}$ indicate potentially redundant components.
+
+To improve robustness, both scores are smoothed by an exponential moving average (EMA):
+\begin{equation}
+    \hat{u}_\ell^{(t)}
+    =
+    \rho \hat{u}_\ell^{(t-1)} + (1-\rho) u_\ell^{(t)},
+\end{equation}
+\begin{equation}
+    \hat{s}_{\ell,i}^{(t)}
+    =
+    \rho \hat{s}_{\ell,i}^{(t-1)} + (1-\rho) s_{\ell,i}^{(t)},
+\end{equation}
+where $\rho \in [0.8,0.95]$ is the smoothing factor.
+
+During each structural update, the expansion threshold is defined by the upper percentile of the layer-wise EMA scores:
+\begin{equation}
+    \tau_{\mathrm{grow}}^{(t)}
+    =
+    \mathrm{Percentile}\bigl(\{\hat{u}_\ell^{(t)}\}_{\ell=1}^{L},\, p_g\bigr),
+\end{equation}
+where $p_g$ is typically set to $80\%$. A layer is considered eligible for rank expansion if
+\begin{equation}
+    \hat{u}_\ell^{(t)} > \tau_{\mathrm{grow}}^{(t)}
+    \quad\text{and}\quad
+    r_\ell < r_{\max}.
+\end{equation}
+
+Similarly, the reduction threshold is defined by the lower percentile of active component scores:
+\begin{equation}
+    \tau_{\mathrm{prune}}^{(t)}
+    =
+    \mathrm{Percentile}\bigl(\{\hat{s}_{\ell,i}^{(t)}: m_{\ell,i}=1\},\, p_p\bigr),
+\end{equation}
+where $p_p$ is typically set to $10\%$. An active component is considered eligible for removal if
+\begin{equation}
+    \hat{s}_{\ell,i}^{(t)} < \tau_{\mathrm{prune}}^{(t)}
+    \quad\text{and}\quad
+    r_\ell > r_{\min}.
+\end{equation}
+
+To prevent oscillatory grow-prune behavior, we use three stabilizing mechanisms. First, structural evolution is disabled during an initial warmup stage. Second, a candidate expansion or reduction must satisfy the corresponding threshold for multiple consecutive structural updates before it is executed. Third, a cooldown period is imposed after expansion, during which newly activated components cannot be immediately removed.
+
+Unless otherwise stated, we apply structural evolution every 200 optimization steps, use an EMA factor of 0.9, set the growth and pruning percentiles to $80\%$ and $10\%$, respectively, and use a warmup stage covering the first $10\%$ of total training steps. We set the minimum and maximum per-layer ranks to $r_{\min}=2$ and $r_{\max}=16$, use persistence lengths $H_g=2$ and $H_p=3$, and apply a cooldown period of two structural updates after each expansion.
+
+\begin{algorithm}[t]
+\caption{Dynamic thresholding for rank expansion and reduction in \method}
+\label{alg:dynamic_threshold}
+\footnotesize
+\begin{algorithmic}[1]
+\Require LoRA parameters $\Theta$, structure masks $z$, update interval $T_{\mathrm{es}}$, smoothing factor $\rho$, growth percentile $p_g$, pruning percentile $p_p$, minimum rank $r_{\min}$, maximum rank $r_{\max}$, warmup steps $T_{\mathrm{warm}}$
+\State Initialize EMA statistics $\hat{u}_\ell \leftarrow 0$ for all layers
+\State Initialize EMA statistics $\hat{s}_{\ell,i} \leftarrow 0$ for all rank-1 components
+\State Initialize persistence counters $c^{\mathrm{grow}}_\ell \leftarrow 0$, $c^{\mathrm{prune}}_{\ell,i} \leftarrow 0$
+\State Initialize cooldown flags for newly expanded components
+\For{$t = 1, 2, \dots, T$}
+    \State Perform standard gradient-based optimization of active LoRA parameters
+    \If{$t \le T_{\mathrm{warm}}$}
+        \State \textbf{continue}
+    \EndIf
+    \If{$t \bmod T_{\mathrm{es}} = 0$}
+        \For{each LoRA layer $\ell$}
+            \State Compute capacity score $u_\ell$
+            \State Update EMA: $\hat{u}_\ell \leftarrow \rho \hat{u}_\ell + (1-\rho) u_\ell$
+        \EndFor
+        \For{each active component $(\ell,i)$}
+            \State Compute importance score $s_{\ell,i}$
+            \State Update EMA: $\hat{s}_{\ell,i} \leftarrow \rho \hat{s}_{\ell,i} + (1-\rho) s_{\ell,i}$
+        \EndFor
+        \State Compute expansion threshold $\tau_{\mathrm{grow}} = \mathrm{Percentile}(\{\hat{u}_\ell\}_{\ell=1}^{L}, p_g)$
+        \State Compute pruning threshold $\tau_{\mathrm{prune}} = \mathrm{Percentile}(\{\hat{s}_{\ell,i}: m_{\ell,i}=1\}, p_p)$
+        \For{each layer $\ell$}
+            \If{$\hat{u}_\ell > \tau_{\mathrm{grow}}$ and $r_\ell < r_{\max}$}
+                \State $c^{\mathrm{grow}}_\ell \leftarrow c^{\mathrm{grow}}_\ell + 1$
+            \Else
+                \State $c^{\mathrm{grow}}_\ell \leftarrow 0$
+            \EndIf
+        \EndFor
+        \For{each active component $(\ell,i)$}
+            \If{$\hat{s}_{\ell,i} < \tau_{\mathrm{prune}}$ and $r_\ell > r_{\min}$ and component $(\ell,i)$ is not in cooldown}
+                \State $c^{\mathrm{prune}}_{\ell,i} \leftarrow c^{\mathrm{prune}}_{\ell,i} + 1$
+            \Else
+                \State $c^{\mathrm{prune}}_{\ell,i} \leftarrow 0$
+            \EndIf
+        \EndFor
+        \For{each layer $\ell$}
+            \If{$c^{\mathrm{grow}}_\ell \ge H_g$}
+                \State Activate one inactive rank-1 component in layer $\ell$
+                \State Reset $c^{\mathrm{grow}}_\ell \leftarrow 0$
+                \State Mark the new component as being in cooldown
+            \EndIf
+        \EndFor
+        \For{each active component $(\ell,i)$}
+            \If{$c^{\mathrm{prune}}_{\ell,i} \ge H_p$}
+                \State Deactivate component $(\ell,i)$
+                \State Reset $c^{\mathrm{prune}}_{\ell,i} \leftarrow 0$
+            \EndIf
+        \EndFor
+        \State Update cooldown status of expanded components
+    \EndIf
+\EndFor
+\State \Return Updated LoRA parameters $\Theta$ and learned adaptive structure $z$
+\end{algorithmic}
+\end{algorithm}
+
+\section{Theoretical Analysis}
+\label{sec:theory}
+
+We analyze the LoRA update space under standard smoothness assumptions and focus on the three core operations of \method: expansion, reduction, and ES-based structure updates.
+
+\subsection{Preliminaries}
+For a single LoRA-injected layer, let
+\begin{equation}
+    \Delta W = \sum_{i=1}^{\Rmax} m_i b_i a_i^\top,
+\end{equation}
+where $m_i \in \{0,1\}$ indicates whether the $i$-th rank-1 component is active. Let
+\begin{equation}
+    r = \sum_{i=1}^{\Rmax} m_i
+\end{equation}
+be the effective rank. Let $\mathcal{L}(\Delta W)$ denote the objective as a function of the LoRA update for this layer with other parameters fixed.
+
+\begin{assumption}
+\label{ass:smoothness}
+The loss $\mathcal{L}(\Delta W)$ is $\beta$-smooth with respect to $\Delta W$, i.e., for any compatible matrices $X$ and $Y$,
+\begin{equation}
+\mathcal{L}(Y) \le \mathcal{L}(X) + \langle \nabla \mathcal{L}(X), Y-X \rangle + \frac{\beta}{2}\|Y-X\|_F^2.
+\end{equation}
+\end{assumption}
+
+\subsection{Effect of Rank Expansion}
+\begin{proposition}[Monotonicity with respect to rank expansion]
+\label{prop:rank_monotonicity}
+Let
+\begin{equation}
+    F_r^\star = \min_{\mathrm{rank}(\Delta W) \le r} F(\Delta W)
+\end{equation}
+for an arbitrary objective $F$. Then for any $r \ge 0$,
+\begin{equation}
+    F_{r+1}^\star \le F_r^\star.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+The feasible set for rank at most $r$ is a subset of the feasible set for rank at most $r+1$. Therefore, minimizing over the larger set cannot yield a worse optimum.
+\end{proof}
+
+This shows that rank expansion can only enlarge the feasible update space.
+
+\subsection{Optimal Direction of Rank Expansion}
+Suppose we add a new rank-1 component $\eta ba^\top$ with sufficiently small $\eta > 0$ and unit vectors $a$ and $b$. A first-order approximation gives
+\begin{equation}
+    \mathcal{L}(\Delta W + \eta ba^\top)
+    \approx
+    \mathcal{L}(\Delta W) + \eta\langle \nabla\mathcal{L}(\Delta W), ba^\top \rangle.
+\end{equation}
+
+\begin{proposition}[Best rank-1 expansion direction]
+\label{prop:best_rank1_direction}
+Let $G = \nabla \mathcal{L}(\Delta W)$. Then the solution to
+\begin{equation}
+    \max_{\|a\|_2 = \|b\|_2 = 1} \langle -G, ba^\top \rangle
+\end{equation}
+is given by the leading left and right singular vectors of $G$, and the maximum value equals $\sigma_1(G)$.
+\end{proposition}
+
+\begin{proof}
+The claim follows from the variational characterization of the spectral norm.
+\end{proof}
+
+Thus, the dominant gradient direction is a natural signal for expansion.
+
+\subsection{Error Bound for Rank Reduction}
+Consider removing the $j$-th active component so that
+\begin{equation}
+    \Delta W^{(-j)} = \Delta W - b_j a_j^\top.
+\end{equation}
+
+\begin{theorem}[Loss increase bound for removing one component]
+\label{thm:pruning_bound}
+Under Assumption~\ref{ass:smoothness},
+\begin{equation}
+\label{eq:pruning_bound}
+\begin{aligned}
+    \mathcal{L}(\Delta W^{(-j)}) - \mathcal{L}(\Delta W)
+    &\le \left|\langle \nabla\mathcal{L}(\Delta W), b_j a_j^\top \rangle\right| \\
+    &\quad + \frac{\beta}{2}\|b_j\|_2^2\|a_j\|_2^2.
+\end{aligned}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+Apply Assumption~\ref{ass:smoothness} with $X = \Delta W$ and $Y = \Delta W^{(-j)}$. Since $Y-X = -b_j a_j^\top$, we obtain
+\begin{equation}
+    \mathcal{L}(Y) - \mathcal{L}(X)
+    \le
+    -\langle \nabla\mathcal{L}(X), b_j a_j^\top \rangle
+    + \frac{\beta}{2}\|b_j a_j^\top\|_F^2.
+\end{equation}
+Using $\|b_j a_j^\top\|_F = \|b_j\|_2\|a_j\|_2$ and upper-bounding the linear term by its absolute value yields the result.
+\end{proof}
+
+This bound motivates removing components with small gradient interaction and small norm.
+
+\subsection{Spectral Interpretation of Reduction}
+\begin{proposition}[Best rank-$r$ approximation error]
+\label{prop:eckart_young}
+Let $\Delta W^\star$ have singular value decomposition
+\begin{equation}
+    \Delta W^\star = \sum_{i=1}^{q} \sigma_i u_i v_i^\top,
+    \qquad \sigma_1 \ge \sigma_2 \ge \cdots \ge \sigma_q \ge 0.
+\end{equation}
+Then
+\begin{equation}
+    \min_{\mathrm{rank}(X) \le r} \|\Delta W^\star - X\|_F^2
+    = \sum_{i=r+1}^{q} \sigma_i^2.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+This is the Eckart--Young--Mirsky theorem.
+\end{proof}
+
+A rapidly decaying spectrum therefore favors aggressive reduction.
+
+\subsection{Monotonic Improvement of ES-Based Structure Search}
+Define the structural reward
+\begin{equation}
+    R(z) = -\mathcal{L}_{\mathrm{val}}(\Theta; z) - \lambda_c C(z).
+\end{equation}
+The ES update uses elitist selection,
+\begin{equation}
+    z_{t+1} = \arg\max_{z \in \{z_t\}\cup\mathcal{N}(z_t)} R(z).
+\end{equation}
+
+\begin{theorem}[Monotonic reward improvement under elitist selection]
+\label{thm:elitist_monotonicity}
+Assume the continuous parameters $\Theta$ are fixed during the structural selection step. Then
+\begin{equation}
+    R(z_{t+1}) \ge R(z_t).
+\end{equation}
+Equivalently, the regularized structural objective $\mathcal{J}(z) = -R(z)$ is monotonically non-increasing during each structure update.
+\end{theorem}
+
+\begin{proof}
+Since $z_t$ is included in the candidate set, the selected maximizer cannot have smaller reward than the current structure.
+\end{proof}
+
+
+
+\subsection{Convergence Analysis}
+We focus on the natural notion of convergence for a mixed discrete--continuous procedure: block-wise local convergence under a two-timescale view.
+
+Let $z \in \mathcal{Z}$ denote the discrete rank structure and let $\Theta$ denote the continuous LoRA parameters. Consider the regularized objective
+\begin{equation}
+    F(\Theta, z) = \mathcal{L}(\Theta; z) + \lambda_c C(z),
+\end{equation}
+and define the value function
+\begin{equation}
+    \Phi(z) = \inf_{\Theta} F(\Theta, z).
+\end{equation}
+We make three standard assumptions: (i) the structure space $\mathcal{Z}$ is finite, (ii) for any fixed $z$, the inner optimization produces limit points that are first-order stationary points of $F(\Theta,z)$, and (iii) the outer ES step uses elitist selection and accepts only strict improvements in $\Phi(z)$ over the mutation neighborhood.
+
+\begin{theorem}[Finite stabilization of the outer structure]
+\label{thm:outer_stabilization}
+Under the assumptions above, every accepted outer-loop structure update strictly decreases $\Phi(z)$. Consequently, the sequence of accepted structures stabilizes after finitely many updates at some $z^\star \in \mathcal{Z}$ satisfying
+\begin{equation}
+    \Phi(z^\star) \le \Phi(z), \qquad \forall z \in \mathcal{N}(z^\star).
+\end{equation}
+That is, $z^\star$ is locally optimal in the mutation neighborhood.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Elitist strict-improvement selection makes $\Phi(z)$ decrease whenever the structure changes. Because $\mathcal{Z}$ is finite, there cannot be infinitely many strict decreases. Hence the accepted structure sequence must terminate at some $z^\star$. At termination, no neighbor yields a smaller value of $\Phi$, which is exactly neighborhood local optimality.
+\end{proof}
+
+The outer ES loop therefore cannot change the rank pattern indefinitely.
+
+\begin{theorem}[Block-wise local convergence]
+\label{thm:block_convergence}
+Under the same assumptions, every limit point $(\Theta^\star, z^\star)$ of the alternating optimization in \method is block-wise locally optimal in the following sense:
+\begin{enumerate}[leftmargin=1.2em]
+    \item $z^\star$ is locally optimal over the mutation neighborhood with respect to $\Phi(z)$;
+    \item $\Theta^\star$ is a first-order stationary point of $F(\Theta, z^\star)$.
+\end{enumerate}
+Equivalently, the algorithm converges to a point that is locally optimal with respect to discrete structure moves and stationary with respect to continuous parameter updates.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+By Theorem~\ref{thm:outer_stabilization}, the outer loop stabilizes after finitely many accepted structure changes. After that time, optimization proceeds with fixed structure $z^\star$ only. The assumed fixed-structure convergence guarantee then implies that every limit point of the inner sequence is a first-order stationary point of $F(\Theta, z^\star)$. Combining this stationary condition with the local optimality of $z^\star$ gives the claim.
+\end{proof}
+
+This theorem does not imply global optimality; it shows that structure updates eventually stop and the remaining optimization reduces to fixed-structure LoRA training.
+
+\begin{corollary}[Fixed-structure stationary-point convergence]
+\label{cor:fixed_structure_sgd}
+Suppose that for a fixed structure $z$, the objective $F(\Theta, z)$ is lower bounded and has Lipschitz-continuous gradients, and that stochastic gradients are unbiased with bounded variance. If the inner loop uses a Robbins--Monro step-size schedule, then
+\begin{equation}
+    \lim_{T \to \infty} \frac{1}{T} \sum_{t=1}^{T} \mathbb{E}\bigl[\|\nabla_{\Theta} F(\Theta_t, z)\|_2^2\bigr] = 0.
+\end{equation}
+Hence, once the outer structure has stabilized, the remaining optimization converges to a first-order stationary point in the standard non-convex stochastic optimization sense.
+\end{corollary}
+
+\begin{proof}[Proof sketch]
+After outer-loop stabilization, the problem reduces to stochastic optimization over the continuous variables $\Theta$ with fixed architecture. The claim then follows from the standard non-convex SGD convergence result under smoothness, bounded-variance noise, and diminishing step sizes.
+\end{proof}
+
+\paragraph{Interpretation.}
+The convergence result is intentionally local: the outer ES loop stabilizes in finitely many accepted steps, and the inner optimizer converges to a stationary point under the learned structure.
+
+\section{Experiments}
+\label{sec:exp}
+
+This section gives a compact experimental scaffold. All \TODO{} entries should be replaced with measured values.
+
+\subsection{Experimental Questions}
+We recommend four questions: (1) does bidirectional rank evolution outperform fixed-rank LoRA under comparable budgets; (2) does \method improve the performance--efficiency trade-off relative to AdaLoRA; (3) are both expansion and reduction necessary; and (4) does ES outperform random or greedy structure search.
+
+\subsection{Benchmarks and Backbones}
+A strong evaluation should include both discriminative and generative tasks.
+\paragraph{Language understanding.}
+Use GLUE-style classification tasks such as SST-2, QNLI, and MNLI.
+\paragraph{Sequence generation.}
+Use summarization or instruction-style generation tasks such as CNN/DailyMail and SAMSum.
+\paragraph{Backbones.}
+A representative setup is RoBERTa-base for understanding, T5-base for encoder--decoder generation, and one decoder-only model such as LLaMA-2-7B or Mistral-7B. Replace this with the exact models used.
+
+\subsection{Baselines}
+Recommended baselines are full fine-tuning, fixed-rank LoRA with $r \in \{4,8,16,32\}$, AdaLoRA, a random-mutation variant of \method, and a greedy variant without ES.
+
+\subsection{Evaluation Metrics}
+Report both task quality and efficiency, including accuracy/F1/Rouge-L/BLEU/perplexity as appropriate, along with trainable parameters, average effective rank, peak memory, and training-time overhead.
+
+\subsection{Implementation Details Template}
+Table~\ref{tab:hparams} summarizes the implementation details reported in our default configuration and highlights the settings that should still be specified task by task.
+
+\begin{table}[t]
+    \centering
+    \caption{Recommended implementation details to report. The dynamic-threshold settings below match the default configuration in Section~\ref{subsec:impl_details}. Replace remaining \TODO{} entries with task-specific settings.}
+    \label{tab:hparams}
+    \begin{tabularx}{\columnwidth}{>{\raggedright\arraybackslash}p{0.40\columnwidth}X}
+        \toprule
+        Item & Reported setting \\
+        \midrule
+        LoRA target modules & \TODO{} \\
+        Maximum rank $\Rmax$ & 16 \\
+        Initial rank $r_0$ & \TODO{} \\
+        Minimum rank $r_{\min}$ & 2 \\
+        ES population size $\lambda$ & \TODO{} \\
+        Structure update interval $T_{\mathrm{es}}$ & 200 optimization steps \\
+        Warmup ratio & first 10\% of total steps \\
+        EMA factor $\rho$ & 0.9 \\
+        Growth percentile $p_g$ & 80\% \\
+        Pruning percentile $p_p$ & 10\% \\
+        Grow / prune persistence & $H_g=2$, $H_p=3$ \\
+        Cooldown after expansion & 2 structural updates \\
+        Reward definition & $-\mathcal{L}_{\mathrm{val}} - \lambda_c C(z)$ \\
+        Validation subset size & \TODO{} \\
+        Optimizer and LR & \TODO{} \\
+        Batch size / epochs & \TODO{} \\
+        Expansion initialization & zero-init or gradient-informed \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+\subsection{Main Results Table Template}
+Table~\ref{tab:main_results} gives a polished main-result template suitable for the final paper.
+
+\begin{table*}[t]
+    \centering
+    \small
+    \caption{Main results template. Replace all \TODO{} entries with measured values. For fair comparison, either match trainable parameter budgets or explicitly report budget differences.}
+    \label{tab:main_results}
+    \begin{tabularx}{\textwidth}{lcccccc>{\centering\arraybackslash}p{0.12\textwidth}}
+        \toprule
+        Method & SST-2 & QNLI & MNLI-m & CNN/DM & Avg. & Params & Avg. rank \\
+        \midrule
+        Full fine-tuning & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} & -- \\
+        LoRA-$r=4$ & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} & 4 \\
+        LoRA-$r=8$ & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} & 8 \\
+        LoRA-$r=16$ & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} & 16 \\
+        AdaLoRA & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} \\
+        \method & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} & \TODO{} \\
+        \bottomrule
+    \end{tabularx}
+\end{table*}
+
+\subsection{Ablation Study Template}
+Table~\ref{tab:ablation} isolates the contribution of each structural component.
+
+\begin{table}[t]
+    \centering
+    \small
+    \caption{Ablation template for \method. Compare the full method with one-component removals and search variants.}
+    \label{tab:ablation}
+    \begin{tabularx}{\columnwidth}{>{\raggedright\arraybackslash}Xcc}
+        \toprule
+        Variant & Metric & $\Delta$ \\
+        \midrule
+        Full \method & \TODO{} & 0.0 \\
+        w/o expansion & \TODO{} & \TODO{} \\
+        w/o reduction & \TODO{} & \TODO{} \\
+        w/o reallocation & \TODO{} & \TODO{} \\
+        Random mutation & \TODO{} & \TODO{} \\
+        Greedy mutation & \TODO{} & \TODO{} \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+\subsection{Efficiency Reporting Template}
+A separate efficiency table is useful for reporting resource overhead.
+
+\begin{table}[t]
+    \centering
+    \small
+    \caption{Efficiency reporting template. Relative wall-clock time can be normalized to fixed-rank LoRA-$r=8$.}
+    \label{tab:efficiency}
+    \begin{tabularx}{\columnwidth}{>{\raggedright\arraybackslash}Xcc}
+        \toprule
+        Method & Rel. time & Params \\
+        \midrule
+        LoRA-$r=8$ & 1.00$\times$ & \TODO{} \\
+        AdaLoRA & \TODO{} & \TODO{} \\
+        \method & \TODO{} & \TODO{} \\
+        \bottomrule
+    \end{tabularx}
+\end{table}
+
+\subsection{Qualitative and Diagnostic Analysis}
+Useful diagnostics include the final layer-wise rank profile, the evolution of total active rank during training, and a Pareto plot of task metric versus trainable parameters for fixed-rank LoRA, AdaLoRA, and \method.
+
+\section{Limitations}
+This draft does not report measured results. A complete submission must evaluate at least one encoder-style and one generation-style backbone, quantify ES overhead, and compare against a strong adaptive-rank baseline. The theory also analyzes the LoRA update space rather than the full non-convex dynamics of large-model fine-tuning.
+
+\section{Conclusion}
+We presented \method, which treats LoRA rank allocation as an ES-driven structure search problem. The method combines gradient-based updates of continuous LoRA weights with bidirectional evolution over discrete rank variables. The resulting framework is simple, modular, and provides a practical alternative to fixed-rank LoRA.
+
+\paragraph{Before submission.}
+Replace all \TODO{} entries with measured values, convert Figure~\ref{fig:method} into a polished diagram, and update the bibliography with the exact cited versions.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+\end{document}
