@@ -2,8 +2,8 @@
 # ============================================================================
 # 公平对比: RTE 单任务 × DeBERTa-v3-base × 全方法
 # ----------------------------------------------------------------------------
-# 主表协议（统一公平）:
-#   - 单阶段、同预算、同主超参
+# 主表协议（SoRA 参数参考 + 统一公平）:
+#   - 单阶段、同预算、同主超参（参考 SoRA GLUE no-schedule）
 #   - SoRA 默认走 no-schedule（避免 schedule-dense 的额外阶段训练破坏等预算可比性）
 #
 # 公平原则:
@@ -21,21 +21,28 @@ nohup torchrun --nproc_per_node=2 --master_port=29510 \
   --model_name microsoft/deberta-v3-base \
   --target_rank 8 \
   --lora_alpha 16 \
-  --epochs 50 \
-  --batch_size 32 \
-  --max_length 320 \
-  --lr 1.2e-3 \
+  --epochs 20 \
+  --batch_size 8 \
+  --max_length 128 \
+  --lr 8e-4 \
   --warmup_ratio 0.06 \
   --weight_decay 0.1 \
   --max_grad_norm 0.1 \
   --adalora_delta_t 100 \
   --adalora_orth_reg_weight 0.1 \
   --lora_ga_batches 8 \
-  --sora_sparse_lambda 1e-3 \
+  --lora_ga_use_official_scheduler \
+  --lora_ga_official_warmup_ratio 0.03 \
+  --lora_ga_official_scheduler_type cosine \
+  --sora_sparse_lambda 10 \
   --sora_sparse_lambda_2 3e-4 \
-  --lambda_c 0.001 \
+  --lambda_c 0.0 \
   --expand_init_mode gradient \
-  --evo_max_reallocate_candidates 8 \
+  --mini_val_k 16 \
+  --evo_alpha_u 2.0 \
+  --evo_p_p 0.05 \
+  --evo_H_p 4 \
+  --evo_max_reallocate_candidates 16 \
   --verify_n_samples 0 \
   --seed 48 \
   --log_dir runs/fair_glue_deberta_rte_ddp \
