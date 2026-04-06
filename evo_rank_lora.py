@@ -127,7 +127,7 @@ class EvoRankLoRALayer(nn.Module):
         激活 (Expand) 一个秩-1组件，并进行补偿归一化。
 
         init_mode:
-            "zero"     -- B 列清零（安全 cold start，默认）
+            "zero"     -- A 行重置 + B 列清零（干净 cold start，默认）
             "gradient" -- 论文 Proposition 3.2：B 列和 A 行设为 ∂L/∂ΔW 的主奇异方向
         grad_direction:
             (u1, v1, sigma1) 元组，由 compute_gradient_rank1_direction() 提供。
@@ -154,6 +154,7 @@ class EvoRankLoRALayer(nn.Module):
             self.lora_B.weight.data[:, index] = (-u1 * init_scale).to(self.lora_B.weight.dtype)
             self.lora_A.weight.data[index, :] = v1.to(self.lora_A.weight.dtype)
         else:
+            nn.init.kaiming_uniform_(self.lora_A.weight[index:index + 1, :], a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight[:, index])
         
         # Double Scaling 防护：应用补偿因子

@@ -38,8 +38,8 @@ nohup torchrun --nproc_per_node=2 --master_port=29510 \
   --sora_sparse_lambda_2 3e-4 \
   --lambda_c 0.0 \
   --expand_init_mode gradient \
-  --mini_val_k 16 \
-  --evo_alpha_u 2.0 \
+  --mini_val_k 8 \
+  --evo_alpha_u 1.0 \
   --evo_p_p 0.05 \
   --evo_H_p 4 \
   --evo_max_reallocate_candidates 16 \
