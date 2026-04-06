@@ -1301,7 +1301,7 @@ def run_training_loop(
         optimizer = AdamW([
             {"params": _non_gate_peft, "lr": lr},
             {"params": _non_gate_head, "lr": head_lr_val}
-        ], weight_decay=sora_wd)
+        ], weight_decay=sora_wd, eps=1e-6)  # DeBERTa fp16 参数需要 eps=1e-6 防止分母下溢
         sparse_optimizer = SparseAdamW(
             _gate,
             lr=lr,
@@ -2263,6 +2263,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_lora_ga_use_rslora", dest="lora_ga_use_rslora", action="store_false", help="LoRA-GA：关闭 rsLoRA 缩放（消融用）")
     parser.set_defaults(lora_ga_use_rslora=True)
     parser.add_argument("--lora_ga_stable_gamma", type=float, default=16.0, help="LoRA-GA：stable init gamma 值。NLU/GLUE 默认 16；可按任务显式覆盖")
+    parser.add_argument("--lora_ga_lr", type=float, default=None, help="LoRA-GA 独立学习率，覆盖全局 --lr。原始论文 RTE 使用 2e-4，与 stable_gamma 初始化匹配")
     parser.add_argument(
         "--lora_ga_use_official_scheduler",
         action="store_true",
@@ -2373,6 +2374,9 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 seed_results: List[Dict[str, Any]] = []
                 method_warmup_ratio = float(args.warmup_ratio)
                 method_lr_scheduler_type = "linear"
+                # LoRA-GA 可通过 --lora_ga_lr 单独设置学习率（原始论文 RTE 使用 2e-4，
+                # 与 stable_gamma 初始化兼容；全局 lr 通常对其他方法更优但对 LoRA-GA 偏高）
+                method_lr = float(args.lora_ga_lr) if (method == "lora-ga" and args.lora_ga_lr is not None) else float(args.lr)
                 if method == "lora-ga" and bool(args.lora_ga_use_official_scheduler):
                     method_warmup_ratio = float(args.lora_ga_official_warmup_ratio)
                     method_lr_scheduler_type = str(args.lora_ga_official_scheduler_type)
@@ -2437,7 +2441,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         generation_max_new_tokens=args.generation_max_new_tokens,
                         nlg_eval_max_samples=args.nlg_eval_max_samples,
                         epochs=args.epochs,
-                        lr=args.lr,
+                        lr=method_lr,
                         head_lr=args.head_lr,
                         weight_decay=args.weight_decay,
                         warmup_ratio=method_warmup_ratio,

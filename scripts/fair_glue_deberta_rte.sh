@@ -31,10 +31,12 @@ nohup torchrun --nproc_per_node=2 --master_port=29510 \
   --adalora_delta_t 100 \
   --adalora_orth_reg_weight 0.1 \
   --lora_ga_batches 8 \
+  --lora_ga_lr 2e-4 \
+  --no_lora_ga_use_rslora \
   --lora_ga_use_official_scheduler \
   --lora_ga_official_warmup_ratio 0.03 \
   --lora_ga_official_scheduler_type cosine \
-  --sora_sparse_lambda 10 \
+  --sora_sparse_lambda 1e-2 \
   --sora_sparse_lambda_2 3e-4 \
   --lambda_c 0.0 \
   --expand_init_mode gradient \
