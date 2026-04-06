@@ -625,41 +625,18 @@ def peft_factory(
         return names
 
     def _default_target_modules(method: str, model_type_name: str) -> List[str]:
-        if method == "lora-ga":
-            return _collect_all_linear_target_modules(model)
-
-        broad_layout = method in {"adalora", "sora"}
+        # 公平对比：所有方法使用相同的 target_modules，确保可训练参数量一致。
         if "deberta" in model_type_name:
-            return (
-                ["query_proj", "key_proj", "value_proj", "intermediate.dense", "output.dense"]
-                if broad_layout
-                else ["query_proj", "key_proj", "value_proj"]
-            )
+            return ["query_proj", "key_proj", "value_proj", "intermediate.dense", "output.dense"]
         if "roberta" in model_type_name or "bert" in model_type_name:
-            return (
-                ["query", "key", "value", "intermediate.dense", "output.dense"]
-                if broad_layout
-                else ["query", "value"]
-            )
+            return ["query", "key", "value", "intermediate.dense", "output.dense"]
         if "bart" in model_type_name:
-            return (
-                ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
-                if broad_layout
-                else ["q_proj", "v_proj"]
-            )
+            return ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
         if "llama" in model_type_name or "mistral" in model_type_name:
-            return (
-                ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-                if broad_layout
-                else ["q_proj", "v_proj"]
-            )
+            return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         if "t5" in model_type_name:
-            return (
-                ["q", "k", "v", "o", "wi", "wo"]
-                if broad_layout
-                else ["q", "v"]
-            )
-        return ["query", "key", "value", "intermediate.dense", "output.dense"] if broad_layout else ["query", "value"]
+            return ["q", "k", "v", "o", "wi", "wo"]
+        return ["query", "key", "value", "intermediate.dense", "output.dense"]
 
     model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
 
@@ -672,13 +649,7 @@ def peft_factory(
     # --lora_alpha 优先；否则回退到 2 * target_rank
     effective_alpha = float(lora_alpha) if lora_alpha is not None else float(2 * target_rank)
 
-    # DeBERTa + 标准 LoRA：对 FFN（intermediate/output）注 LoRA 时激活范数大，与 DisentangledAttention 组合在 DDP+GLUE 下可在数十步内 forward NaN（运行证据：step0 有限，首个密采样步已 NaN）。
-    # 仅收紧 method=lora；AdaLoRA/LoRA-GA 等仍保留用户传入的 target_modules。
-    if method_name == "lora" and "deberta" in model_type:
-        _ffn_linear = {"intermediate.dense", "output.dense"}
-        target_modules = [m for m in target_modules if m not in _ffn_linear]
-        if not target_modules:
-            target_modules = ["query_proj", "key_proj", "value_proj"]
+    # 公平对比：所有方法统一 target_modules，不再对 LoRA 单独移除 FFN 层。
 
     # PEFT 的 task_type 需要与 backbone 类型匹配，避免 seq2seq/causal 分支内部逻辑错误。
     if "t5" in model_type:
@@ -1290,17 +1261,36 @@ def run_training_loop(
     head_lr_val = head_lr if head_lr is not None else lr
 
     if method_name == "sora":
-        # 官方 SoRA：gate 参数使用独立的 SparseAdamW（近端梯度），其余参数使用标准 AdamW。
-        _non_gate_peft = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate") and not any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
-        _non_gate_head = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate") and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
+        # 官方 SoRA trainer.py：区分 LayerNorm/bias（无 decay）和其他参数（有 decay），gate 参数独立优化。
+        # 对齐原始实现：get_parameter_names(model, [nn.LayerNorm]) 排除 LayerNorm，再排除 bias。
+        _no_decay_names = set()
+        for n, m in model.named_modules():
+            if isinstance(m, nn.LayerNorm):
+                for pn, _ in m.named_parameters():
+                    full_name = f"{n}.{pn}" if n else pn
+                    _no_decay_names.add(full_name)
+        for n, p in model.named_parameters():
+            if "bias" in n:
+                _no_decay_names.add(n)
+
+        _head_keys = ["classifier", "score", "lm_head", "shared", "pooler"]
+        _non_gate_peft_decay = [p for n, p in model.named_parameters()
+            if p.requires_grad and not n.endswith(".gate")
+            and not any(k in n for k in _head_keys)
+            and n not in _no_decay_names]
+        _non_gate_peft_no_decay = [p for n, p in model.named_parameters()
+            if p.requires_grad and not n.endswith(".gate")
+            and not any(k in n for k in _head_keys)
+            and n in _no_decay_names]
+        _non_gate_head = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate") and any(k in n for k in _head_keys)]
         _gate = [p for n, p in model.named_parameters() if p.requires_grad and n.endswith(".gate")]
-        
-        # 兼容 SoRA 的官方实现限制 (动态修正为 0.1 阻值)
+
         sora_wd = 0.1 if weight_decay == 0.01 else weight_decay
 
         optimizer = AdamW([
-            {"params": _non_gate_peft, "lr": lr},
-            {"params": _non_gate_head, "lr": head_lr_val}
+            {"params": _non_gate_peft_decay, "lr": lr, "weight_decay": sora_wd},
+            {"params": _non_gate_peft_no_decay, "lr": lr, "weight_decay": 0.0},
+            {"params": _non_gate_head, "lr": head_lr_val, "weight_decay": sora_wd},
         ], weight_decay=sora_wd, eps=1e-6)  # DeBERTa fp16 参数需要 eps=1e-6 防止分母下溢
         sparse_optimizer = SparseAdamW(
             _gate,
@@ -1319,11 +1309,10 @@ def run_training_loop(
         # 标准 LoRA / AdaLoRA：适配器矩阵通常不做 weight_decay（与常见 PEFT 复现一致），
         # 否则在 GLUE 等小数据、较高 lr 下易出现数值爆炸（logits/loss NaN）。
         dynamic_wd_peft = 0.0 if method_name in ("lora-ga", "lora", "adalora", "evorank") else weight_decay
-        # 第二组若不写 weight_decay，会继承 AdamW(..., weight_decay=0.1)。运行证据：warmup 首步 lr 已非零后，
-        # CoLA 在 global_step=1 出现 classifier.weight 范数为 Infinity；显式对 PEFT 两族均关掉 decay 可避免该路径。
-        _peft_no_decay = method_name in ("lora-ga", "lora", "adalora", "evorank")
-        _head_wd = 0.0 if _peft_no_decay else weight_decay
-        _adam_wd = 0.0 if _peft_no_decay else weight_decay
+        # 分类头必须保留 weight_decay 防止权重爆炸
+        # LoRA A/B 的 wd=0 是为了保护基础权重补偿，但分类头没有这个约束。
+        _head_wd = weight_decay
+        _adam_wd = 0.0 if method_name in ("lora-ga", "lora", "adalora", "evorank") else weight_decay
 
         # fp16 参数（如 DeBERTa classifier）在 eps=1e-8 时易在首步触发分母下溢并数值爆炸；
         # evorank 同样训练 fp16 头 + 适配器，与 lora/adalora/lora-ga 统一 eps。
@@ -1530,8 +1519,20 @@ def run_training_loop(
                     gate_numel = sum(
                         p.numel() for n, p in model.named_parameters() if n.endswith(".gate")
                     )
-                    loss = loss + lam * l1_penalty / max(gate_numel, 1)        
-                if method_name == "lora-ga" and global_step < 200:
+                    loss = loss + lam * l1_penalty / max(gate_numel, 1)
+                    # --- SoRA 调试输出 ---
+                    if is_main_process and (global_step % 50 == 0 or global_step < 5):
+                        _gate_vals = torch.cat([p.detach().abs().view(-1) for n, p in model.named_parameters() if n.endswith(".gate")])
+                        _gate_zero_ratio = float((_gate_vals < 1e-9).sum().item()) / max(_gate_vals.numel(), 1)
+                        _ce_loss = float(loss.detach().item()) - float(lam * l1_penalty.detach().item() / max(gate_numel, 1))
+                        print(
+                            f"[sora][debug] step={global_step} ce_loss={_ce_loss:.4f} "
+                            f"l1_penalty={float(l1_penalty.detach().item()):.4f} "
+                            f"lam={lam:.4f} l1_contrib={float(lam * l1_penalty.detach().item() / max(gate_numel, 1)):.6f} "
+                            f"gate|abs| min={float(_gate_vals.min().item()):.4e} max={float(_gate_vals.max().item()):.4e} "
+                            f"mean={float(_gate_vals.mean().item()):.4e} zero_ratio={_gate_zero_ratio:.4f}"
+                        )
+                if method_name == "lora-ga":
                     logit_entropy = float("nan")
                     if logits.dim() >= 2 and logits.size(-1) > 1:
                         probs = torch.softmax(logits.detach().float(), dim=-1)
@@ -1553,17 +1554,24 @@ def run_training_loop(
                         "logit_entropy": logit_entropy,
                         "head_weight_norm": head_weight_norm,
                     }
-                    lora_ga_health_records.append(rec)
+                    if global_step < 200:
+                        lora_ga_health_records.append(rec)
                     if writer is not None:
                         writer.add_scalar("lora_ga_health/train_loss", rec["train_loss"], global_step)
                         if not math.isnan(rec["logit_entropy"]):
                             writer.add_scalar("lora_ga_health/logit_entropy", rec["logit_entropy"], global_step)
                         if not math.isnan(rec["head_weight_norm"]):
                             writer.add_scalar("lora_ga_health/head_weight_norm", rec["head_weight_norm"], global_step)
-                    if is_main_process and (global_step % 20 == 0 or global_step == 199):
+                    if is_main_process and (global_step % 50 == 0 or global_step < 5):
+                        _opt_lr_peft = float(optimizer.param_groups[0]["lr"])
+                        _opt_wd_peft = float(optimizer.param_groups[0].get("weight_decay", 0.0))
+                        _opt_lr_head = float(optimizer.param_groups[1]["lr"]) if len(optimizer.param_groups) > 1 else _opt_lr_peft
+                        _opt_wd_head = float(optimizer.param_groups[1].get("weight_decay", 0.0)) if len(optimizer.param_groups) > 1 else _opt_wd_peft
                         print(
                             f"[lora-ga][health] step={global_step} train_loss={rec['train_loss']:.6f} "
-                            f"logit_entropy={rec['logit_entropy']:.6f} head_weight_norm={rec['head_weight_norm']:.6f}"
+                            f"logit_entropy={rec['logit_entropy']:.6f} head_weight_norm={rec['head_weight_norm']:.6f} "
+                            f"lr_peft={_opt_lr_peft:.2e} wd_peft={_opt_wd_peft:.4f} "
+                            f"lr_head={_opt_lr_head:.2e} wd_head={_opt_wd_head:.4f}"
                         )
                         _debug_log(
                             run_id=f"{task_name}-{method_name}-seed{random_seed}-health",

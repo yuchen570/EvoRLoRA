@@ -11,6 +11,7 @@ hub/
 
 # --- 实验输出：TensorBoard、artifact 目录、导出结果、日志 ---
 runs/
+artifacts_debug*/
 artifacts/
 outputs/
 logs/

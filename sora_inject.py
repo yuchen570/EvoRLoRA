@@ -50,12 +50,9 @@ def inject_sora(model: nn.Module, target_modules: List[str], r: int, lora_alpha:
             or "score" in lname
             or "lm_head" in lname
             or lname == "shared"
-            or "pooler" in lname
-            or "layernorm" in lname
-            or "layer_norm" in lname
-            or "final_layer_norm" in lname
         ):
             param.requires_grad = True
+        # pooler 和 LayerNorm 不再默认解冻，由外部调用方按需控制（公平对比要求与其他方法一致）
 
 
 class SparseAdamW(torch.optim.AdamW):

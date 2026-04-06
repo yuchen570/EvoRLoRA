@@ -64,24 +64,22 @@ run_case adalora rte_fair_adalora 29611 \
   --adalora_delta_t 100 \
   --adalora_orth_reg_weight 0.1
 
-# 3) EvoRank（按当前实现稳定口径）
+# 3) EvoRank（按当前实现稳定口径，与 fair_glue_deberta_rte.sh 对齐）
 run_case evorank rte_fair_evorank 29612 \
   --lr 8e-4 \
   --lambda_c 0.0 \
   --expand_init_mode gradient \
-  --mini_val_k 16 \
-  --evo_alpha_u 2.0 \
+  --mini_val_k 8 \
+  --evo_alpha_u 1.0 \
   --evo_p_p 0.05 \
   --evo_H_p 4 \
   --evo_max_reallocate_candidates 16
 
-# 4) LoRA-GA（官方训练调度 + 官方初始化配方）
+# 4) LoRA-GA（公平对比：统一 lr=8e-4 + linear 调度，与其他方法对齐）
 run_case lora-ga rte_fair_lora_ga 29613 \
-  --lr 5e-5 \
+  --lr 8e-4 \
   --lora_ga_batches 8 \
-  --lora_ga_use_official_scheduler \
-  --lora_ga_official_warmup_ratio 0.03 \
-  --lora_ga_official_scheduler_type cosine
+  --no_lora_ga_use_rslora
 
 # 5) SoRA（no-schedule 口径）
 run_case sora rte_fair_sora 29614 \
