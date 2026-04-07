@@ -16,7 +16,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29530 \
   --task_type nlg \
   --nlg_dataset_name xsum \
   --task_name xsum \
-  --methods lora adalora evorank sora \
+  --methods lora adalora evorank sora toplora \
   --model_name facebook/bart-large \
   --target_rank 8 \
   --lora_alpha 32 \

@@ -30,6 +30,7 @@ from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
 from adalora_utils import adalora_update_and_allocate, compute_adalora_orthogonal_loss, get_adalora_orth_reg_weight, unwrap_inner_from_training_model
 from rank_evolution_controller import RankEvolutionController
 from sora_inject import SparseAdamW, inject_sora
+from toplora_inject import inject_toplora
 from train_integration import inject_evo_lora, train_evo_lora_step
 
 from glue_metrics import collect_nlu_predictions, compute_glue_primary_metric, glue_primary_metric_key, compute_glue_metrics_dict
@@ -597,6 +598,7 @@ def peft_factory(
     evorank_cooldown_steps: int = 2,
     evorank_allow_reallocation: bool = True,
     evorank_max_reallocate_candidates: int = 8,
+    toplora_dropout: float = 0.05,
 ) -> Tuple[nn.Module, Optional[RankEvolutionController], Dict[str, Any]]:
     def _collect_all_linear_target_modules(m: nn.Module) -> List[str]:
         excluded_fragments = (
@@ -776,6 +778,18 @@ def peft_factory(
             lora_alpha=effective_alpha,
             lora_dropout=0.1,
         )
+
+    elif method_name == "toplora":
+        # TopLoRA (NeurIPS 2025): token-wise singular value scaling on LoRA
+        # 与 SoRA 同构注入模式，秩固定，不支持 merge
+        inject_toplora(
+            model=model,
+            target_modules=target_modules,
+            r=target_rank,
+            lora_alpha=effective_alpha,
+            lora_dropout=toplora_dropout,
+        )
+
     else:
         raise ValueError(f"未知 method_name: {method_name}")
 
@@ -899,7 +913,7 @@ def _collect_rank_distribution(
             summary_gate_stats = None
 
     else:
-        # LoRA: 固定秩
+        # LoRA / TopLoRA: 固定秩
         for n, p in inner.named_parameters():
             if "lora_A" in n and p.numel() > 0:
                 layer_key = n.replace(".lora_A.default.weight", "").replace(".lora_A.weight", "").replace(".lora_A", "")
@@ -959,7 +973,7 @@ def _print_rank_distribution(
     extra_str = f" [{summary['extra_string']}]" if "extra_string" in summary else ""
     print(f"[{method_name}] === Rank Distribution (epoch={epoch}/{epochs}){extra_str} ===")
     
-    if method_name != "lora":
+    if method_name not in ("lora", "toplora"):
         base_rank = summary.get("base_rank", -1)
         omitted = 0
         for layer_name, eff_r in per_layer.items():
@@ -1084,6 +1098,10 @@ def _save_final_artifact(
         json.dump(meta, f, indent=2, ensure_ascii=False)
     if method_name in ["lora", "adalora"] and hasattr(inner, "save_pretrained"):
         inner.save_pretrained(final_dir)
+    elif method_name == "toplora":
+        # TopLoRA 手动注入，仅保存微调权重
+        tunable_sd = _extract_tunable_state_dict(inner)
+        torch.save(tunable_sd, os.path.join(final_dir, "model_state.pt"))
     else:
         # 手动注入的方法(SORA/EvoRank)虽然基座有 save_pretrained 但会全量保存，这里强制拦截并仅保存过滤后的微调权重至 .pt 文件
         tunable_sd = _extract_tunable_state_dict(inner)
@@ -1267,15 +1285,15 @@ def run_training_loop(
         
         # 标准 LoRA / AdaLoRA / EvoRank：适配器矩阵通常不做 weight_decay（与常见 PEFT 复现一致），
         # 否则在 GLUE 等小数据、较高 lr 下易出现数值爆炸（logits/loss NaN）。
-        dynamic_wd_peft = 0.0 if method_name in ("lora", "adalora", "evorank") else weight_decay
+        dynamic_wd_peft = 0.0 if method_name in ("lora", "adalora", "evorank", "toplora") else weight_decay
         # 分类头必须保留 weight_decay 防止权重爆炸
         # LoRA A/B 的 wd=0 是为了保护基础权重补偿，但分类头没有这个约束。
         _head_wd = weight_decay
-        _adam_wd = 0.0 if method_name in ("lora", "adalora", "evorank") else weight_decay
+        _adam_wd = 0.0 if method_name in ("lora", "adalora", "evorank", "toplora") else weight_decay
 
         # fp16 参数（如 DeBERTa classifier）在 eps=1e-8 时易在首步触发分母下溢并数值爆炸；
         # evorank 同样训练 fp16 头 + 适配器，与 lora/adalora 统一 eps。
-        _adam_eps = 1e-6 if method_name in ("lora", "adalora", "evorank") else 1e-8
+        _adam_eps = 1e-6 if method_name in ("lora", "adalora", "evorank", "toplora") else 1e-8
         optimizer = AdamW(
             [
                 {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
@@ -2174,6 +2192,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sora_max_lambda", type=float, default=10.0, help="SoRA lambda_schedule 的最大 lambda 值")
     parser.add_argument("--sora_lambda_num", type=int, default=5, help="SoRA lambda_schedule 的步数（线性升至 max_lambda 所需步数）")
     parser.add_argument(
+        "--toplora_dropout",
+        type=float,
+        default=0.05,
+        help="TopLoRA：dropout 系数（论文默认 0.05）。仅 method=toplora 使用，其他方法忽略。",
+    )
+    parser.add_argument(
         "--max_grad_norm",
         type=float,
         default=None,
@@ -2282,6 +2306,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         evorank_cooldown_steps=args.evo_cooldown_steps,
                         evorank_allow_reallocation=args.evo_allow_reallocation,
                         evorank_max_reallocate_candidates=args.evo_max_reallocate_candidates,
+                        toplora_dropout=args.toplora_dropout,
                     )
                     checkpoint_root: Optional[str] = None
                     if not args.no_output_dir:

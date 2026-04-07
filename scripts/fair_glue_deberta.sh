@@ -26,7 +26,7 @@ mkdir -p logs runs artifacts
 nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
-  --methods lora adalora evorank sora \
+  --methods lora adalora evorank sora toplora \
   --task_list mnli sst2 cola qqp qnli mrpc stsb \
   --model_list microsoft/deberta-v3-base \
   --target_rank 8 \

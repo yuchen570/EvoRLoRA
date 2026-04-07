@@ -81,6 +81,10 @@ run_case sora rte_fair_sora 29614 \
   --sora_sparse_lambda 10 \
   --sora_sparse_lambda_2 3e-4
 
+# 5) TopLoRA（NeurIPS 2025，token-wise singular value scaling）
+run_case toplora rte_fair_toplora 29615 \
+  --lr 8e-4
+
 if [[ "${RUN_MODE}" == "parallel" ]]; then
   echo "All jobs launched in parallel."
 else
