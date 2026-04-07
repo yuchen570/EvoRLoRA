@@ -668,7 +668,7 @@ def peft_factory(
     else:
         modules_to_save = None
 
-    if method_name == "lora":
+    if method_name in ("lora", "flatlora"):
         # DeBERTa：LoRA 梯度幅度随层内激活范数放大，易出现早期数值爆炸（见 huggingface/peft#3073 等讨论）。
         # RSLoRA（alpha/sqrt(r)）可显著缓和该问题；与 AdaLoRA/其他方法对比时仅影响标准 lora 分支。
         _lora_dropout = 0.0 if "deberta" in model_type else 0.1
@@ -1212,6 +1212,7 @@ def run_training_loop(
     save_final_model: bool = True,
     verify_n_samples: int = 2,
     max_grad_norm: Optional[float] = None,
+    flatlora_rho: float = 0.05,
     peft_meta: Optional[Dict[str, Any]] = None,
     evo_include_noop_candidate: bool = True,
 ) -> Dict[str, Any]:
@@ -1408,537 +1409,554 @@ def run_training_loop(
 
     start_time = time.perf_counter()
     global_step = 0
-    best_val_acc = 0.0
-    best_val_metrics: Dict[str, float] = {}
-    train_loss_ema = None
-    ema_beta = 0.95
-    rouge1_val: float = 0.0
-    rouge2_val: float = 0.0
-    evorank_es_records: List[Dict[str, float]] = []
+    
+    # === Flat-LoRA PyTorch Hooks 初始化 ===
+    flatlora_manager = None
+    if method_name == "flatlora" and flatlora_rho > 0:
+        from flatlora_inject import FlatLoRAHookManager
+        total_steps_for_factor = max_train_steps if max_train_steps is not None else epochs * len(train_loader)
+        flatlora_manager = FlatLoRAHookManager(model, flatlora_rho, total_steps_for_factor)
+        flatlora_manager.attach_hooks()
+    # ==================================
+    
+    try:
+        best_val_acc = 0.0
+        best_val_metrics: Dict[str, float] = {}
+        train_loss_ema = None
+        ema_beta = 0.95
+        rouge1_val: float = 0.0
+        rouge2_val: float = 0.0
+        evorank_es_records: List[Dict[str, float]] = []
 
-    for epoch in range(epochs):
-        model.train()
-        # DistributedSampler 在每个 epoch 都要 set_epoch，否则会导致采样不同步。
-        if ddp_enabled and hasattr(train_loader, "sampler") and isinstance(train_loader.sampler, DistributedSampler):
-            train_loader.sampler.set_epoch(epoch)
-        for batch in train_loader:
-            batch = batch_to_device(batch, device)
-            features, labels = extract_features_and_labels(batch, task_type=task_type)
-
-            if method_name == "evorank":
-                if controller is None:
-                    raise ValueError("evorank 方法必须传入 controller")
-                out = train_evo_lora_step(
-                    model=model,
-                    controller=controller,
-                    optimizer=optimizer,
-                    train_batch=(features, labels),
-                    val_batch=mini_val_batches,
-                    loss_fn=loss_fn,
-                    step=global_step,
-                    warmup_steps=warmup_steps,
-                    T_es=T_es,
-                    lambda_c=lambda_c,
-                    complexity_mode=complexity_mode,
-                    lambda_pop=lambda_pop,
-                    population_strategy=population_strategy,
-                    random_seed=random_seed,
-                    max_grad_norm=max_grad_norm,
-                    include_noop_candidate=evo_include_noop_candidate,
-                )
-                train_loss = float(out["train_loss"])
-                avg_active_rank = float(
-                    sum(layer.get_active_rank() for layer in controller.layers.values()) / max(len(controller.layers), 1)
-                )
-                if out.get("did_evolution") and out.get("best_reward") is not None:
-                    d_val = out.get("es_delta_val_loss")
-                    d_comp = out.get("es_delta_complexity")
-                    if d_val is not None and d_comp is not None:
-                        evorank_es_records.append(
-                            {
-                                "step": float(global_step),
-                                "delta_val_loss": float(d_val),
-                                "delta_complexity": float(d_comp),
-                            }
-                        )
-                        if is_main_process:
-                            print(
-                                f"[evorank][es] step={global_step} mutation={out.get('best_mutation')} "
-                                f"delta_val_loss={float(d_val):+.6f} delta_complexity={float(d_comp):+.2f} "
-                                f"base_val_loss={float(out.get('es_base_val_loss')):.6f} "
-                                f"selected_val_loss={float(out.get('es_selected_val_loss')):.6f} "
-                                f"base_complexity={float(out.get('es_base_complexity')):.2f} "
-                                f"selected_complexity={float(out.get('es_selected_complexity')):.2f}"
-                            )
-                        if writer is not None:
-                            writer.add_scalar("evorank/es_delta_val_loss", float(d_val), global_step)
-                            writer.add_scalar("evorank/es_delta_complexity", float(d_comp), global_step)
-            else:
-                optimizer.zero_grad(set_to_none=True)
-                if sparse_optimizer is not None:
-                    sparse_optimizer.zero_grad(set_to_none=True)
-                logits = model(features)
-                loss = loss_fn(logits, labels)
-                if method_name == "adalora":
-                    inner = unwrap_inner_from_training_model(model)
-                    ow = get_adalora_orth_reg_weight(inner)
-                    if ow > 0:
-                        loss = loss + ow * compute_adalora_orthogonal_loss(inner)
-                if method_name == "sora":
-                    lam = float(sora_sparse_lambda)
-                    if sora_lambda_schedule is None and sora_lambda_warmup_steps > 0:
-                        lam *= min(1.0, float(global_step + 1) / float(sora_lambda_warmup_steps))
-                    # 官方 SoRA：L1 Loss 除以 gate 总元素数做归一化
-                    l1_penalty = sum(
-                        p.abs().sum() for n, p in model.named_parameters() if n.endswith(".gate")
-                    )
-                    gate_numel = sum(
-                        p.numel() for n, p in model.named_parameters() if n.endswith(".gate")
-                    )
-                    loss = loss + lam * l1_penalty / max(gate_numel, 1)
-                    # --- SoRA 调试输出 ---
-                    if is_main_process and (global_step % 50 == 0 or global_step < 5):
-                        _gate_vals = torch.cat([p.detach().abs().view(-1) for n, p in model.named_parameters() if n.endswith(".gate")])
-                        _gate_zero_ratio = float((_gate_vals < 1e-9).sum().item()) / max(_gate_vals.numel(), 1)
-                        _ce_loss = float(loss.detach().item()) - float(lam * l1_penalty.detach().item() / max(gate_numel, 1))
-                        print(
-                            f"[sora][debug] step={global_step} ce_loss={_ce_loss:.4f} "
-                            f"l1_penalty={float(l1_penalty.detach().item()):.4f} "
-                            f"lam={lam:.4f} l1_contrib={float(lam * l1_penalty.detach().item() / max(gate_numel, 1)):.6f} "
-                            f"gate|abs| min={float(_gate_vals.min().item()):.4e} max={float(_gate_vals.max().item()):.4e} "
-                            f"mean={float(_gate_vals.mean().item()):.4e} zero_ratio={_gate_zero_ratio:.4f}"
-                        )
-                loss.backward()
-                grad_norm_total: Optional[float] = None
-                if max_grad_norm is not None and max_grad_norm > 0:
-                    _gn = torch.nn.utils.clip_grad_norm_(
-                        [p for p in model.parameters() if p.requires_grad], max_grad_norm
-                    )
-                    grad_norm_total = float(_gn.detach().item()) if isinstance(_gn, torch.Tensor) else float(_gn)
-                if (
-                    is_main_process
-                    and method_name in {"lora", "evorank"}
-                    and task_name in {"cola", "rte"}
-                    and (
-                        global_step in debug_steps
-                        or (lora_glue_step_trace and 40 <= global_step < 100)
-                        or (lora_glue_step_trace and global_step in lora_glue_early_steps)
-                    )
-                ):
-                    head_norm = None
-                    head_grad_norm = None
-                    head_dtype = None
-                    lora_norm = None
-                    lora_grad_norm = None
-                    lora_dtype = None
-                    head_name = None
-                    lora_name = None
-                    for n, p in model.named_parameters():
-                        if (
-                            head_norm is None
-                            and p.requires_grad
-                            and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])
-                            and n.endswith(".weight")
-                        ):
-                            head_name = n
-                            head_norm = float(p.detach().norm().item())
-                            head_dtype = str(p.dtype)
-                            if p.grad is not None:
-                                head_grad_norm = float(p.grad.detach().norm().item())
-                        if lora_norm is None and p.requires_grad and ("lora_A" in n or "lora_B" in n):
-                            lora_name = n
-                            lora_norm = float(p.detach().norm().item())
-                            lora_dtype = str(p.dtype)
-                            if p.grad is not None:
-                                lora_grad_norm = float(p.grad.detach().norm().item())
-                        if head_norm is not None and lora_norm is not None:
-                            break
-                    label_vals, label_counts = labels.detach().cpu().unique(return_counts=True)
-                    # region agent log
-                    _debug_log(
-                        run_id=f"{task_name}-{method_name}-seed{random_seed}-train",
-                        hypothesis_id="H1",
-                        location="run_benchmark.py:train_step",
-                        message="train_step_snapshot",
-                        data={
-                            "task": task_name,
-                            "global_step": int(global_step),
-                            "loss": float(loss.detach().item()),
-                            "logits_mean": float(logits.detach().float().mean().item()),
-                            "logits_std": float(logits.detach().float().std().item()),
-                            "batch_label_dist": {str(int(k.item())): int(v.item()) for k, v in zip(label_vals, label_counts)},
-                            "head_norm": head_norm,
-                            "head_grad_norm": head_grad_norm,
-                            "head_dtype": head_dtype,
-                            "head_param_name": head_name,
-                            "lora_norm": lora_norm,
-                            "lora_grad_norm": lora_grad_norm,
-                            "lora_dtype": lora_dtype,
-                            "lora_param_name": lora_name,
-                            "lr_peft": float(optimizer.param_groups[0]["lr"]),
-                            "lr_head": float(optimizer.param_groups[1]["lr"]) if len(optimizer.param_groups) > 1 else None,
-                            "optimizer_eps": float(getattr(optimizer, "defaults", {}).get("eps", 1e-8)),
-                            "warmup_steps": int(warmup_steps),
-                            "grad_norm_total": grad_norm_total,
-                        },
-                    )
-                    # endregion
-                if method_name == "sora":
-                    # 防止 gate 梯度中的 NaN/Inf 传入优化器状态，导致后续参数全 NaN。
-                    for n, p in model.named_parameters():
-                        if n.endswith(".gate") and p.grad is not None and not torch.isfinite(p.grad).all():
-                            p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
-                optimizer.step()
-                if (
-                    is_main_process
-                    and method_name in {"lora", "evorank"}
-                    and task_name in {"cola", "rte"}
-                    and global_step == 0
-                ):
-                    # region agent log
-                    _hmax = None
-                    _hfin: Optional[bool] = None
-                    _hdtype: Optional[str] = None
-                    for _n, _p in model.named_parameters():
-                        if (
-                            _p.requires_grad
-                            and "classifier" in _n
-                            and _n.endswith(".weight")
-                        ):
-                            _hmax = float(_p.detach().float().abs().max().item())
-                            _hfin = bool(torch.isfinite(_p.detach()).all().item())
-                            _hdtype = str(_p.dtype)
-                            break
-                    _debug_log(
-                        run_id=f"{task_name}-{method_name}-seed{random_seed}-train",
-                        hypothesis_id="H4",
-                        location="run_benchmark.py:after_first_optimizer_step",
-                        message="post_step0_head_stats",
-                        data={
-                            "task": task_name,
-                            "head_weight_max_abs": _hmax,
-                            "head_all_finite": _hfin,
-                            "head_dtype": _hdtype,
-                            "optimizer_eps": float(getattr(optimizer, "defaults", {}).get("eps", 1e-8)),
-                        },
-                    )
-                    # endregion
-                if sparse_optimizer is not None:
-                    sparse_optimizer.step()
-                if method_name == "sora":
-                    # 近端更新后再次兜底清洗 gate 参数，避免 NaN 造成 rank 统计全部为 0。
-                    for n, p in model.named_parameters():
-                        if n.endswith(".gate") and not torch.isfinite(p).all():
-                            p.data = torch.nan_to_num(p.data, nan=0.0, posinf=0.0, neginf=0.0)
-                if method_name == "adalora":
-                    _adalora_post_step_update(model, global_step)
-                train_loss = float(loss.detach().item())
-                avg_active_rank = float("nan")
-
-            # 无论哪条路径，optimizer.step() 都已在本步完成，此处统一推进学习率调度。
-            lr_scheduler.step()
-            if sparse_lr_scheduler is not None:
-                sparse_lr_scheduler.step()
-            current_lr = float(optimizer.param_groups[0]["lr"])
-
-            train_loss_ema = train_loss if train_loss_ema is None else (ema_beta * train_loss_ema + (1 - ema_beta) * train_loss)
-            if writer is not None:
-                writer.add_scalar("train/loss", train_loss, global_step)
-                writer.add_scalar("train/loss_ema", train_loss_ema, global_step)
-                writer.add_scalar("train/lr", current_lr, global_step)
+        for epoch in range(epochs):
+            model.train()
+            # DistributedSampler 在每个 epoch 都要 set_epoch，否则会导致采样不同步。
+            if ddp_enabled and hasattr(train_loader, "sampler") and isinstance(train_loader.sampler, DistributedSampler):
+                train_loader.sampler.set_epoch(epoch)
+            for batch in train_loader:
+                if flatlora_manager is not None:
+                    flatlora_manager.update_step(global_step)
+    
+                batch = batch_to_device(batch, device)
+                features, labels = extract_features_and_labels(batch, task_type=task_type)
+    
                 if method_name == "evorank":
-                    writer.add_scalar("train/active_rank_mean", avg_active_rank, global_step)
-            if wandb_run is not None:
-                wandb_run.log(
-                    {
-                        "train/loss": train_loss,
-                        "train/loss_ema": train_loss_ema,
-                        "train/lr": current_lr,
-                        "step": global_step,
-                    }
+                    if controller is None:
+                        raise ValueError("evorank 方法必须传入 controller")
+                    out = train_evo_lora_step(
+                        model=model,
+                        controller=controller,
+                        optimizer=optimizer,
+                        train_batch=(features, labels),
+                        val_batch=mini_val_batches,
+                        loss_fn=loss_fn,
+                        step=global_step,
+                        warmup_steps=warmup_steps,
+                        T_es=T_es,
+                        lambda_c=lambda_c,
+                        complexity_mode=complexity_mode,
+                        lambda_pop=lambda_pop,
+                        population_strategy=population_strategy,
+                        random_seed=random_seed,
+                        max_grad_norm=max_grad_norm,
+                        include_noop_candidate=evo_include_noop_candidate,
+                    )
+                    train_loss = float(out["train_loss"])
+                    avg_active_rank = float(
+                        sum(layer.get_active_rank() for layer in controller.layers.values()) / max(len(controller.layers), 1)
+                    )
+                    if out.get("did_evolution") and out.get("best_reward") is not None:
+                        d_val = out.get("es_delta_val_loss")
+                        d_comp = out.get("es_delta_complexity")
+                        if d_val is not None and d_comp is not None:
+                            evorank_es_records.append(
+                                {
+                                    "step": float(global_step),
+                                    "delta_val_loss": float(d_val),
+                                    "delta_complexity": float(d_comp),
+                                }
+                            )
+                            if is_main_process:
+                                print(
+                                    f"[evorank][es] step={global_step} mutation={out.get('best_mutation')} "
+                                    f"delta_val_loss={float(d_val):+.6f} delta_complexity={float(d_comp):+.2f} "
+                                    f"base_val_loss={float(out.get('es_base_val_loss')):.6f} "
+                                    f"selected_val_loss={float(out.get('es_selected_val_loss')):.6f} "
+                                    f"base_complexity={float(out.get('es_base_complexity')):.2f} "
+                                    f"selected_complexity={float(out.get('es_selected_complexity')):.2f}"
+                                )
+                            if writer is not None:
+                                writer.add_scalar("evorank/es_delta_val_loss", float(d_val), global_step)
+                                writer.add_scalar("evorank/es_delta_complexity", float(d_comp), global_step)
+                else:
+                    optimizer.zero_grad(set_to_none=True)
+                    if sparse_optimizer is not None:
+                        sparse_optimizer.zero_grad(set_to_none=True)
+                    logits = model(features)
+                    loss = loss_fn(logits, labels)
+                    if method_name == "adalora":
+                        inner = unwrap_inner_from_training_model(model)
+                        ow = get_adalora_orth_reg_weight(inner)
+                        if ow > 0:
+                            loss = loss + ow * compute_adalora_orthogonal_loss(inner)
+                    if method_name == "sora":
+                        lam = float(sora_sparse_lambda)
+                        if sora_lambda_schedule is None and sora_lambda_warmup_steps > 0:
+                            lam *= min(1.0, float(global_step + 1) / float(sora_lambda_warmup_steps))
+                        # 官方 SoRA：L1 Loss 除以 gate 总元素数做归一化
+                        l1_penalty = sum(
+                            p.abs().sum() for n, p in model.named_parameters() if n.endswith(".gate")
+                        )
+                        gate_numel = sum(
+                            p.numel() for n, p in model.named_parameters() if n.endswith(".gate")
+                        )
+                        loss = loss + lam * l1_penalty / max(gate_numel, 1)
+                        # --- SoRA 调试输出 ---
+                        if is_main_process and (global_step % 50 == 0 or global_step < 5):
+                            _gate_vals = torch.cat([p.detach().abs().view(-1) for n, p in model.named_parameters() if n.endswith(".gate")])
+                            _gate_zero_ratio = float((_gate_vals < 1e-9).sum().item()) / max(_gate_vals.numel(), 1)
+                            _ce_loss = float(loss.detach().item()) - float(lam * l1_penalty.detach().item() / max(gate_numel, 1))
+                            print(
+                                f"[sora][debug] step={global_step} ce_loss={_ce_loss:.4f} "
+                                f"l1_penalty={float(l1_penalty.detach().item()):.4f} "
+                                f"lam={lam:.4f} l1_contrib={float(lam * l1_penalty.detach().item() / max(gate_numel, 1)):.6f} "
+                                f"gate|abs| min={float(_gate_vals.min().item()):.4e} max={float(_gate_vals.max().item()):.4e} "
+                                f"mean={float(_gate_vals.mean().item()):.4e} zero_ratio={_gate_zero_ratio:.4f}"
+                            )
+                    loss.backward()
+                    grad_norm_total: Optional[float] = None
+                    if max_grad_norm is not None and max_grad_norm > 0:
+                        _gn = torch.nn.utils.clip_grad_norm_(
+                            [p for p in model.parameters() if p.requires_grad], max_grad_norm
+                        )
+                        grad_norm_total = float(_gn.detach().item()) if isinstance(_gn, torch.Tensor) else float(_gn)
+                    if (
+                        is_main_process
+                        and method_name in {"lora", "evorank"}
+                        and task_name in {"cola", "rte"}
+                        and (
+                            global_step in debug_steps
+                            or (lora_glue_step_trace and 40 <= global_step < 100)
+                            or (lora_glue_step_trace and global_step in lora_glue_early_steps)
+                        )
+                    ):
+                        head_norm = None
+                        head_grad_norm = None
+                        head_dtype = None
+                        lora_norm = None
+                        lora_grad_norm = None
+                        lora_dtype = None
+                        head_name = None
+                        lora_name = None
+                        for n, p in model.named_parameters():
+                            if (
+                                head_norm is None
+                                and p.requires_grad
+                                and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])
+                                and n.endswith(".weight")
+                            ):
+                                head_name = n
+                                head_norm = float(p.detach().norm().item())
+                                head_dtype = str(p.dtype)
+                                if p.grad is not None:
+                                    head_grad_norm = float(p.grad.detach().norm().item())
+                            if lora_norm is None and p.requires_grad and ("lora_A" in n or "lora_B" in n):
+                                lora_name = n
+                                lora_norm = float(p.detach().norm().item())
+                                lora_dtype = str(p.dtype)
+                                if p.grad is not None:
+                                    lora_grad_norm = float(p.grad.detach().norm().item())
+                            if head_norm is not None and lora_norm is not None:
+                                break
+                        label_vals, label_counts = labels.detach().cpu().unique(return_counts=True)
+                        # region agent log
+                        _debug_log(
+                            run_id=f"{task_name}-{method_name}-seed{random_seed}-train",
+                            hypothesis_id="H1",
+                            location="run_benchmark.py:train_step",
+                            message="train_step_snapshot",
+                            data={
+                                "task": task_name,
+                                "global_step": int(global_step),
+                                "loss": float(loss.detach().item()),
+                                "logits_mean": float(logits.detach().float().mean().item()),
+                                "logits_std": float(logits.detach().float().std().item()),
+                                "batch_label_dist": {str(int(k.item())): int(v.item()) for k, v in zip(label_vals, label_counts)},
+                                "head_norm": head_norm,
+                                "head_grad_norm": head_grad_norm,
+                                "head_dtype": head_dtype,
+                                "head_param_name": head_name,
+                                "lora_norm": lora_norm,
+                                "lora_grad_norm": lora_grad_norm,
+                                "lora_dtype": lora_dtype,
+                                "lora_param_name": lora_name,
+                                "lr_peft": float(optimizer.param_groups[0]["lr"]),
+                                "lr_head": float(optimizer.param_groups[1]["lr"]) if len(optimizer.param_groups) > 1 else None,
+                                "optimizer_eps": float(getattr(optimizer, "defaults", {}).get("eps", 1e-8)),
+                                "warmup_steps": int(warmup_steps),
+                                "grad_norm_total": grad_norm_total,
+                            },
+                        )
+                        # endregion
+                    if method_name == "sora":
+                        # 防止 gate 梯度中的 NaN/Inf 传入优化器状态，导致后续参数全 NaN。
+                        for n, p in model.named_parameters():
+                            if n.endswith(".gate") and p.grad is not None and not torch.isfinite(p.grad).all():
+                                p.grad = torch.nan_to_num(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                    optimizer.step()
+                    if (
+                        is_main_process
+                        and method_name in {"lora", "evorank"}
+                        and task_name in {"cola", "rte"}
+                        and global_step == 0
+                    ):
+                        # region agent log
+                        _hmax = None
+                        _hfin: Optional[bool] = None
+                        _hdtype: Optional[str] = None
+                        for _n, _p in model.named_parameters():
+                            if (
+                                _p.requires_grad
+                                and "classifier" in _n
+                                and _n.endswith(".weight")
+                            ):
+                                _hmax = float(_p.detach().float().abs().max().item())
+                                _hfin = bool(torch.isfinite(_p.detach()).all().item())
+                                _hdtype = str(_p.dtype)
+                                break
+                        _debug_log(
+                            run_id=f"{task_name}-{method_name}-seed{random_seed}-train",
+                            hypothesis_id="H4",
+                            location="run_benchmark.py:after_first_optimizer_step",
+                            message="post_step0_head_stats",
+                            data={
+                                "task": task_name,
+                                "head_weight_max_abs": _hmax,
+                                "head_all_finite": _hfin,
+                                "head_dtype": _hdtype,
+                                "optimizer_eps": float(getattr(optimizer, "defaults", {}).get("eps", 1e-8)),
+                            },
+                        )
+                        # endregion
+                    if sparse_optimizer is not None:
+                        sparse_optimizer.step()
+                    if method_name == "sora":
+                        # 近端更新后再次兜底清洗 gate 参数，避免 NaN 造成 rank 统计全部为 0。
+                        for n, p in model.named_parameters():
+                            if n.endswith(".gate") and not torch.isfinite(p).all():
+                                p.data = torch.nan_to_num(p.data, nan=0.0, posinf=0.0, neginf=0.0)
+                    if method_name == "adalora":
+                        _adalora_post_step_update(model, global_step)
+                    train_loss = float(loss.detach().item())
+                    avg_active_rank = float("nan")
+    
+                # 无论哪条路径，optimizer.step() 都已在本步完成，此处统一推进学习率调度。
+                lr_scheduler.step()
+                if sparse_lr_scheduler is not None:
+                    sparse_lr_scheduler.step()
+                current_lr = float(optimizer.param_groups[0]["lr"])
+    
+                train_loss_ema = train_loss if train_loss_ema is None else (ema_beta * train_loss_ema + (1 - ema_beta) * train_loss)
+                if writer is not None:
+                    writer.add_scalar("train/loss", train_loss, global_step)
+                    writer.add_scalar("train/loss_ema", train_loss_ema, global_step)
+                    writer.add_scalar("train/lr", current_lr, global_step)
+                    if method_name == "evorank":
+                        writer.add_scalar("train/active_rank_mean", avg_active_rank, global_step)
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "train/loss": train_loss,
+                            "train/loss_ema": train_loss_ema,
+                            "train/lr": current_lr,
+                            "step": global_step,
+                        }
+                    )
+    
+                global_step += 1
+                if (
+                    method_name == "sora"
+                    and sparse_optimizer is not None
+                    and sora_schedule_stage_steps is not None
+                    and global_step < total_train_steps
+                    and global_step % sora_schedule_stage_steps == 0
+                ):
+                    sparse_optimizer.step_lambda()
+                if (
+                    is_main_process
+                    and checkpoint_root
+                    and save_steps > 0
+                    and global_step % save_steps == 0
+                ):
+                    inner_ckpt = _unwrap_for_save(model)
+                    _save_checkpoint_pt(
+                        os.path.join(checkpoint_root, f"checkpoint_step_{global_step}.pt"),
+                        inner_ckpt,
+                        optimizer,
+                        lr_scheduler,
+                        global_step,
+                        epoch,
+                        best_val_acc,
+                    )
+                if max_train_steps is not None and global_step >= max_train_steps:
+                    break
+    
+            # 每个 epoch 在完整验证集上评估指标
+            model.eval()
+    
+            if task_type == "nlu":
+                if task_name is None:
+                    raise ValueError("NLU（GLUE）评估需要传入 task_name")
+                if ddp_enabled and _ddp_is_active():
+                    dist.barrier()
+                val_metric = 0.0
+                mkey = glue_primary_metric_key(task_name)
+                regression = nlu_is_glue_regression(task_name)
+                metrics_dict_val: Dict[str, float] = {}
+                y_pred_main: List[float] = []
+                y_true_main: List[float] = []
+                ev_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
+                eval_model = _unwrap_training_module(model)
+                if isinstance(ev_loader, dict):
+                    y_pred_m, y_true_m = _collect_nlu_predictions_distributed(
+                        eval_model,
+                        ev_loader["matched"],
+                        device,
+                        regression=regression,
+                        ddp_enabled=ddp_enabled,
+                        is_main_process=is_main_process,
+                    )
+                    y_pred_mm, y_true_mm = _collect_nlu_predictions_distributed(
+                        eval_model,
+                        ev_loader["mismatched"],
+                        device,
+                        regression=regression,
+                        ddp_enabled=ddp_enabled,
+                        is_main_process=is_main_process,
+                    )
+                    if is_main_process:
+                        val_metric_m = compute_glue_primary_metric(task_name, y_pred_m, y_true_m)
+                        val_metric_mm = compute_glue_primary_metric(task_name, y_pred_mm, y_true_mm)
+                        val_metric = (val_metric_m + val_metric_mm) / 2.0
+                        metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred_m, y_true_m)
+                        metrics_dict_val["accuracy_m"] = val_metric_m
+                        metrics_dict_val["accuracy_mm"] = val_metric_mm
+                        y_pred_main = y_pred_m
+                        y_true_main = y_true_m
+                else:
+                    y_pred_local, y_true_local = _collect_nlu_predictions_distributed(
+                        eval_model,
+                        ev_loader,
+                        device,
+                        regression=regression,
+                        ddp_enabled=ddp_enabled,
+                        is_main_process=is_main_process,
+                    )
+                    if is_main_process:
+                        val_metric = compute_glue_primary_metric(task_name, y_pred_local, y_true_local)
+                        metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred_local, y_true_local)
+                        y_pred_main = y_pred_local
+                        y_true_main = y_true_local
+                if ddp_enabled and _ddp_is_active():
+                    m_tensor = torch.tensor([val_metric if is_main_process else 0.0], device=device, dtype=torch.float64)
+                    dist.broadcast(m_tensor, src=0)
+                    val_metric = float(m_tensor.item())
+                    dist.barrier()
+                if is_main_process:
+                    if val_metric > best_val_acc:
+                        best_val_acc = val_metric
+                        best_val_metrics = metrics_dict_val
+                    elif val_metric == best_val_acc and not best_val_metrics:
+                        best_val_metrics = metrics_dict_val
+                    if method_name in {"lora", "evorank"} and task_name in {"cola", "rte"} and epoch in {0, epochs - 1}:
+                        pred_list = [int(x) for x in y_pred_main]
+                        true_list = [int(x) for x in y_true_main]
+                        pred_dist = {str(k): int(sum(1 for x in pred_list if x == k)) for k in sorted(set(pred_list))}
+                        true_dist = {str(k): int(sum(1 for x in true_list if x == k)) for k in sorted(set(true_list))}
+                        _debug_log(
+                            run_id=f"{task_name}-{method_name}-seed{random_seed}-eval",
+                            hypothesis_id="H3",
+                            location="run_benchmark.py:nlu_eval",
+                            message="eval_prediction_distribution",
+                            data={
+                                "task": task_name,
+                                "epoch": int(epoch + 1),
+                                "global_step": int(global_step),
+                                "metric_key": mkey,
+                                "metric_value": float(val_metric),
+                                "pred_dist": pred_dist,
+                                "true_dist": true_dist,
+                                "sample_preds": pred_list[:16],
+                                "sample_true": true_list[:16],
+                            },
+                        )
+                    print(
+                        f"[{method_name}] epoch={epoch + 1}/{epochs} "
+                        f"step={global_step} val_{mkey}={val_metric:.4f} best={best_val_acc:.4f}"
+                    )
+                    # === 逐层秩分布日志 ===
+                    rank_info = _collect_rank_distribution(
+                        model, method_name, controller=controller,
+                        target_rank=int(next(
+                            (p.size(0) for n, p in _unwrap_for_save(model).named_parameters()
+                             if "lora_A" in n and p.numel() > 0), 8
+                        )) if method_name == "lora" else 8,
+                    )
+                    _print_rank_distribution(rank_info, method_name, epoch + 1, epochs)
+                    if writer is not None:
+                        writer.add_scalar(f"val/{mkey}", val_metric, epoch)
+                        for lname, lr_val in rank_info["per_layer"].items():
+                            writer.add_scalar(f"rank/{lname}", lr_val, epoch)
+                        writer.add_scalar("rank/avg", rank_info["summary"]["avg_rank"], epoch)
+                    if wandb_run is not None:
+                        wandb_log_dict = {f"val/{mkey}": val_metric, "epoch": epoch + 1, "step": global_step}
+                        wandb_log_dict["rank/avg"] = rank_info["summary"]["avg_rank"]
+                        wandb_run.log(wandb_log_dict)
+    
+            else:
+                if tokenizer is None:
+                    raise ValueError("task_type='nlg' 时必须传入 tokenizer")
+                if ddp_enabled and _ddp_is_active():
+                    dist.barrier()
+    
+                val_metric = 0.0
+                rouge1_val = 0.0
+                rouge2_val = 0.0
+                eval_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
+                if isinstance(eval_loader, dict):
+                    raise ValueError("NLG 评估不支持 dict 类型验证 loader")
+    
+                # 生成阶段需要底层 seq2seq 模型（可能在 DictFeatureClassifier.inner 或 DDP.module.inner 中）
+                if isinstance(model, DDP):
+                    inner = getattr(model.module, "inner", model.module)
+                    gen_model = inner
+                else:
+                    gen_model = getattr(model, "inner", model)
+    
+                preds_text, refs_text = _collect_nlg_text_pairs_distributed(
+                    gen_model=gen_model,
+                    data_loader=eval_loader,
+                    tokenizer=tokenizer,
+                    device=device,
+                    generation_max_new_tokens=generation_max_new_tokens,
+                    nlg_eval_max_samples=nlg_eval_max_samples,
+                    ddp_enabled=ddp_enabled,
+                    is_main_process=is_main_process,
                 )
-
-            global_step += 1
-            if (
-                method_name == "sora"
-                and sparse_optimizer is not None
-                and sora_schedule_stage_steps is not None
-                and global_step < total_train_steps
-                and global_step % sora_schedule_stage_steps == 0
-            ):
-                sparse_optimizer.step_lambda()
-            if (
-                is_main_process
-                and checkpoint_root
-                and save_steps > 0
-                and global_step % save_steps == 0
-            ):
-                inner_ckpt = _unwrap_for_save(model)
-                _save_checkpoint_pt(
-                    os.path.join(checkpoint_root, f"checkpoint_step_{global_step}.pt"),
-                    inner_ckpt,
-                    optimizer,
-                    lr_scheduler,
-                    global_step,
-                    epoch,
-                    best_val_acc,
-                )
+                if is_main_process:
+                    try:
+                        import evaluate  # type: ignore
+    
+                        rouge_metric = evaluate.load("rouge")
+                    except Exception as e:
+                        # NLG 指标在一些离线/依赖缺失环境下可能无法加载 rouge。
+                        # 之前静默写 0 分，导致“全 0”难以定位原因；这里显式打印异常。
+                        rouge_metric = None
+                        print(f"[warn] evaluate.load('rouge') failed: {type(e).__name__}: {e!r}")
+    
+                    if rouge_metric is None:
+                        if is_main_process:
+                            # 避免误以为模型真的完全没有任何重叠
+                            print(
+                                f"[warn] rouge metric skipped -> 0.0 (preds={len(preds_text)}, refs={len(refs_text)})"
+                            )
+                        val_metric = 0.0
+                        rouge1_val = rouge2_val = 0.0
+                    else:
+                        if len(preds_text) == 0 or len(refs_text) == 0 or len(preds_text) != len(refs_text):
+                            print(
+                                f"[warn] rouge inputs look suspicious: preds={len(preds_text)}, refs={len(refs_text)}; "
+                                f"pred0={preds_text[0][:80] if preds_text else ''!r}; ref0={refs_text[0][:80] if refs_text else ''!r}"
+                            )
+                        scores = rouge_metric.compute(predictions=preds_text, references=refs_text)
+                        rouge1_val = float(scores.get("rouge1", 0.0))
+                        rouge2_val = float(scores.get("rouge2", 0.0))
+                        val_metric = float(scores.get("rougeL", scores.get("rougeLsum", 0.0)))
+                        if rouge1_val == 0.0 and rouge2_val == 0.0 and val_metric == 0.0:
+                            # 如果确实存在可见文本但 rouge 全 0，通常是 tokenize/metric 解析问题或重叠为 0
+                            if is_main_process:
+                                print(
+                                    "[warn] rouge scores all 0.0; "
+                                    f"pred0={preds_text[0][:120] if preds_text else ''!r}; "
+                                    f"ref0={refs_text[0][:120] if refs_text else ''!r}"
+                                )
+    
+                    best_val_acc = max(best_val_acc, val_metric)
+                    print(
+                        f"[{method_name}] epoch={epoch + 1}/{epochs} "
+                        f"step={global_step} val_rouge1={rouge1_val:.4f} val_rouge2={rouge2_val:.4f} "
+                        f"val_rougeL={val_metric:.4f} best={best_val_acc:.4f}"
+                    )
+                    # === 逐层秩分布日志 (NLG) ===
+                    rank_info = _collect_rank_distribution(
+                        model, method_name, controller=controller,
+                        target_rank=int(next(
+                            (p.size(0) for n, p in _unwrap_for_save(model).named_parameters()
+                             if "lora_A" in n and p.numel() > 0), 8
+                        )) if method_name == "lora" else 8,
+                    )
+                    _print_rank_distribution(rank_info, method_name, epoch + 1, epochs)
+                    if writer is not None:
+                        writer.add_scalar("val/rouge1", rouge1_val, epoch)
+                        writer.add_scalar("val/rouge2", rouge2_val, epoch)
+                        writer.add_scalar("val/rougeL", val_metric, epoch)
+                        for lname, lr_val in rank_info["per_layer"].items():
+                            writer.add_scalar(f"rank/{lname}", lr_val, epoch)
+                        writer.add_scalar("rank/avg", rank_info["summary"]["avg_rank"], epoch)
+                    if wandb_run is not None:
+                        wandb_log_dict = {
+                            "val/rouge1": rouge1_val,
+                            "val/rouge2": rouge2_val,
+                            "val/rougeL": val_metric,
+                            "epoch": epoch + 1,
+                            "step": global_step,
+                        }
+                        wandb_log_dict["rank/avg"] = rank_info["summary"]["avg_rank"]
+                        wandb_run.log(wandb_log_dict)
+    
+                if ddp_enabled and _ddp_is_active():
+                    dist.barrier()
+    
+            if is_main_process and checkpoint_root:
+                # 秩分布信息（若上方 eval 尚未计算则此处补算）
+                try:
+                    _rank_info = rank_info  # type: ignore[possibly-undefined]
+                except NameError:
+                    _rank_info = _collect_rank_distribution(model, method_name, controller=controller)
+                rec: Dict[str, Any] = {
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "val_metric": float(val_metric),
+                    "best_val": float(best_val_acc),
+                    "train_loss_ema": float(train_loss_ema) if train_loss_ema is not None else None,
+                    "rank_distribution": _rank_info["per_layer"],
+                    "rank_summary": _rank_info["summary"],
+                }
+                if task_type == "nlu" and task_name is not None:
+                    rec["glue_metric"] = glue_primary_metric_key(task_name)
+                if task_type == "nlg":
+                    rec["rouge1"] = rouge1_val
+                    rec["rouge2"] = rouge2_val
+                    rec["rougeL"] = float(val_metric)
+                with open(os.path.join(checkpoint_root, "metrics.jsonl"), "a", encoding="utf-8") as mf:
+                    mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                if save_every_epoch:
+                    inner_ep = _unwrap_for_save(model)
+                    _save_checkpoint_pt(
+                        os.path.join(checkpoint_root, f"checkpoint_epoch_{epoch + 1}.pt"),
+                        inner_ep,
+                        optimizer,
+                        lr_scheduler,
+                        global_step,
+                        epoch,
+                        best_val_acc,
+                    )
+    
             if max_train_steps is not None and global_step >= max_train_steps:
                 break
-
-        # 每个 epoch 在完整验证集上评估指标
-        model.eval()
-
-        if task_type == "nlu":
-            if task_name is None:
-                raise ValueError("NLU（GLUE）评估需要传入 task_name")
-            if ddp_enabled and _ddp_is_active():
-                dist.barrier()
-            val_metric = 0.0
-            mkey = glue_primary_metric_key(task_name)
-            regression = nlu_is_glue_regression(task_name)
-            metrics_dict_val: Dict[str, float] = {}
-            y_pred_main: List[float] = []
-            y_true_main: List[float] = []
-            ev_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
-            eval_model = _unwrap_training_module(model)
-            if isinstance(ev_loader, dict):
-                y_pred_m, y_true_m = _collect_nlu_predictions_distributed(
-                    eval_model,
-                    ev_loader["matched"],
-                    device,
-                    regression=regression,
-                    ddp_enabled=ddp_enabled,
-                    is_main_process=is_main_process,
-                )
-                y_pred_mm, y_true_mm = _collect_nlu_predictions_distributed(
-                    eval_model,
-                    ev_loader["mismatched"],
-                    device,
-                    regression=regression,
-                    ddp_enabled=ddp_enabled,
-                    is_main_process=is_main_process,
-                )
-                if is_main_process:
-                    val_metric_m = compute_glue_primary_metric(task_name, y_pred_m, y_true_m)
-                    val_metric_mm = compute_glue_primary_metric(task_name, y_pred_mm, y_true_mm)
-                    val_metric = (val_metric_m + val_metric_mm) / 2.0
-                    metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred_m, y_true_m)
-                    metrics_dict_val["accuracy_m"] = val_metric_m
-                    metrics_dict_val["accuracy_mm"] = val_metric_mm
-                    y_pred_main = y_pred_m
-                    y_true_main = y_true_m
-            else:
-                y_pred_local, y_true_local = _collect_nlu_predictions_distributed(
-                    eval_model,
-                    ev_loader,
-                    device,
-                    regression=regression,
-                    ddp_enabled=ddp_enabled,
-                    is_main_process=is_main_process,
-                )
-                if is_main_process:
-                    val_metric = compute_glue_primary_metric(task_name, y_pred_local, y_true_local)
-                    metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred_local, y_true_local)
-                    y_pred_main = y_pred_local
-                    y_true_main = y_true_local
-            if ddp_enabled and _ddp_is_active():
-                m_tensor = torch.tensor([val_metric if is_main_process else 0.0], device=device, dtype=torch.float64)
-                dist.broadcast(m_tensor, src=0)
-                val_metric = float(m_tensor.item())
-                dist.barrier()
-            if is_main_process:
-                if val_metric > best_val_acc:
-                    best_val_acc = val_metric
-                    best_val_metrics = metrics_dict_val
-                elif val_metric == best_val_acc and not best_val_metrics:
-                    best_val_metrics = metrics_dict_val
-                if method_name in {"lora", "evorank"} and task_name in {"cola", "rte"} and epoch in {0, epochs - 1}:
-                    pred_list = [int(x) for x in y_pred_main]
-                    true_list = [int(x) for x in y_true_main]
-                    pred_dist = {str(k): int(sum(1 for x in pred_list if x == k)) for k in sorted(set(pred_list))}
-                    true_dist = {str(k): int(sum(1 for x in true_list if x == k)) for k in sorted(set(true_list))}
-                    _debug_log(
-                        run_id=f"{task_name}-{method_name}-seed{random_seed}-eval",
-                        hypothesis_id="H3",
-                        location="run_benchmark.py:nlu_eval",
-                        message="eval_prediction_distribution",
-                        data={
-                            "task": task_name,
-                            "epoch": int(epoch + 1),
-                            "global_step": int(global_step),
-                            "metric_key": mkey,
-                            "metric_value": float(val_metric),
-                            "pred_dist": pred_dist,
-                            "true_dist": true_dist,
-                            "sample_preds": pred_list[:16],
-                            "sample_true": true_list[:16],
-                        },
-                    )
-                print(
-                    f"[{method_name}] epoch={epoch + 1}/{epochs} "
-                    f"step={global_step} val_{mkey}={val_metric:.4f} best={best_val_acc:.4f}"
-                )
-                # === 逐层秩分布日志 ===
-                rank_info = _collect_rank_distribution(
-                    model, method_name, controller=controller,
-                    target_rank=int(next(
-                        (p.size(0) for n, p in _unwrap_for_save(model).named_parameters()
-                         if "lora_A" in n and p.numel() > 0), 8
-                    )) if method_name == "lora" else 8,
-                )
-                _print_rank_distribution(rank_info, method_name, epoch + 1, epochs)
-                if writer is not None:
-                    writer.add_scalar(f"val/{mkey}", val_metric, epoch)
-                    for lname, lr_val in rank_info["per_layer"].items():
-                        writer.add_scalar(f"rank/{lname}", lr_val, epoch)
-                    writer.add_scalar("rank/avg", rank_info["summary"]["avg_rank"], epoch)
-                if wandb_run is not None:
-                    wandb_log_dict = {f"val/{mkey}": val_metric, "epoch": epoch + 1, "step": global_step}
-                    wandb_log_dict["rank/avg"] = rank_info["summary"]["avg_rank"]
-                    wandb_run.log(wandb_log_dict)
-
-        else:
-            if tokenizer is None:
-                raise ValueError("task_type='nlg' 时必须传入 tokenizer")
-            if ddp_enabled and _ddp_is_active():
-                dist.barrier()
-
-            val_metric = 0.0
-            rouge1_val = 0.0
-            rouge2_val = 0.0
-            eval_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
-            if isinstance(eval_loader, dict):
-                raise ValueError("NLG 评估不支持 dict 类型验证 loader")
-
-            # 生成阶段需要底层 seq2seq 模型（可能在 DictFeatureClassifier.inner 或 DDP.module.inner 中）
-            if isinstance(model, DDP):
-                inner = getattr(model.module, "inner", model.module)
-                gen_model = inner
-            else:
-                gen_model = getattr(model, "inner", model)
-
-            preds_text, refs_text = _collect_nlg_text_pairs_distributed(
-                gen_model=gen_model,
-                data_loader=eval_loader,
-                tokenizer=tokenizer,
-                device=device,
-                generation_max_new_tokens=generation_max_new_tokens,
-                nlg_eval_max_samples=nlg_eval_max_samples,
-                ddp_enabled=ddp_enabled,
-                is_main_process=is_main_process,
-            )
-            if is_main_process:
-                try:
-                    import evaluate  # type: ignore
-
-                    rouge_metric = evaluate.load("rouge")
-                except Exception as e:
-                    # NLG 指标在一些离线/依赖缺失环境下可能无法加载 rouge。
-                    # 之前静默写 0 分，导致“全 0”难以定位原因；这里显式打印异常。
-                    rouge_metric = None
-                    print(f"[warn] evaluate.load('rouge') failed: {type(e).__name__}: {e!r}")
-
-                if rouge_metric is None:
-                    if is_main_process:
-                        # 避免误以为模型真的完全没有任何重叠
-                        print(
-                            f"[warn] rouge metric skipped -> 0.0 (preds={len(preds_text)}, refs={len(refs_text)})"
-                        )
-                    val_metric = 0.0
-                    rouge1_val = rouge2_val = 0.0
-                else:
-                    if len(preds_text) == 0 or len(refs_text) == 0 or len(preds_text) != len(refs_text):
-                        print(
-                            f"[warn] rouge inputs look suspicious: preds={len(preds_text)}, refs={len(refs_text)}; "
-                            f"pred0={preds_text[0][:80] if preds_text else ''!r}; ref0={refs_text[0][:80] if refs_text else ''!r}"
-                        )
-                    scores = rouge_metric.compute(predictions=preds_text, references=refs_text)
-                    rouge1_val = float(scores.get("rouge1", 0.0))
-                    rouge2_val = float(scores.get("rouge2", 0.0))
-                    val_metric = float(scores.get("rougeL", scores.get("rougeLsum", 0.0)))
-                    if rouge1_val == 0.0 and rouge2_val == 0.0 and val_metric == 0.0:
-                        # 如果确实存在可见文本但 rouge 全 0，通常是 tokenize/metric 解析问题或重叠为 0
-                        if is_main_process:
-                            print(
-                                "[warn] rouge scores all 0.0; "
-                                f"pred0={preds_text[0][:120] if preds_text else ''!r}; "
-                                f"ref0={refs_text[0][:120] if refs_text else ''!r}"
-                            )
-
-                best_val_acc = max(best_val_acc, val_metric)
-                print(
-                    f"[{method_name}] epoch={epoch + 1}/{epochs} "
-                    f"step={global_step} val_rouge1={rouge1_val:.4f} val_rouge2={rouge2_val:.4f} "
-                    f"val_rougeL={val_metric:.4f} best={best_val_acc:.4f}"
-                )
-                # === 逐层秩分布日志 (NLG) ===
-                rank_info = _collect_rank_distribution(
-                    model, method_name, controller=controller,
-                    target_rank=int(next(
-                        (p.size(0) for n, p in _unwrap_for_save(model).named_parameters()
-                         if "lora_A" in n and p.numel() > 0), 8
-                    )) if method_name == "lora" else 8,
-                )
-                _print_rank_distribution(rank_info, method_name, epoch + 1, epochs)
-                if writer is not None:
-                    writer.add_scalar("val/rouge1", rouge1_val, epoch)
-                    writer.add_scalar("val/rouge2", rouge2_val, epoch)
-                    writer.add_scalar("val/rougeL", val_metric, epoch)
-                    for lname, lr_val in rank_info["per_layer"].items():
-                        writer.add_scalar(f"rank/{lname}", lr_val, epoch)
-                    writer.add_scalar("rank/avg", rank_info["summary"]["avg_rank"], epoch)
-                if wandb_run is not None:
-                    wandb_log_dict = {
-                        "val/rouge1": rouge1_val,
-                        "val/rouge2": rouge2_val,
-                        "val/rougeL": val_metric,
-                        "epoch": epoch + 1,
-                        "step": global_step,
-                    }
-                    wandb_log_dict["rank/avg"] = rank_info["summary"]["avg_rank"]
-                    wandb_run.log(wandb_log_dict)
-
-            if ddp_enabled and _ddp_is_active():
-                dist.barrier()
-
-        if is_main_process and checkpoint_root:
-            # 秩分布信息（若上方 eval 尚未计算则此处补算）
-            try:
-                _rank_info = rank_info  # type: ignore[possibly-undefined]
-            except NameError:
-                _rank_info = _collect_rank_distribution(model, method_name, controller=controller)
-            rec: Dict[str, Any] = {
-                "epoch": epoch + 1,
-                "global_step": global_step,
-                "val_metric": float(val_metric),
-                "best_val": float(best_val_acc),
-                "train_loss_ema": float(train_loss_ema) if train_loss_ema is not None else None,
-                "rank_distribution": _rank_info["per_layer"],
-                "rank_summary": _rank_info["summary"],
-            }
-            if task_type == "nlu" and task_name is not None:
-                rec["glue_metric"] = glue_primary_metric_key(task_name)
-            if task_type == "nlg":
-                rec["rouge1"] = rouge1_val
-                rec["rouge2"] = rouge2_val
-                rec["rougeL"] = float(val_metric)
-            with open(os.path.join(checkpoint_root, "metrics.jsonl"), "a", encoding="utf-8") as mf:
-                mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            if save_every_epoch:
-                inner_ep = _unwrap_for_save(model)
-                _save_checkpoint_pt(
-                    os.path.join(checkpoint_root, f"checkpoint_epoch_{epoch + 1}.pt"),
-                    inner_ep,
-                    optimizer,
-                    lr_scheduler,
-                    global_step,
-                    epoch,
-                    best_val_acc,
-                )
-
-        if max_train_steps is not None and global_step >= max_train_steps:
-            break
+    finally:
+        if flatlora_manager is not None:
+            flatlora_manager.remove_hooks()
 
     total_time = time.perf_counter() - start_time
     peak_mem_mb = (
@@ -2065,7 +2083,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_cache_dir", type=str, default="datasets", help="数据集缓存目录（建议仓库内相对路径）")
     parser.add_argument("--model_cache_dir", type=str, default="models", help="模型缓存目录（建议仓库内相对路径）")
     parser.add_argument("--model_name", type=str, default="roberta-base")
-    parser.add_argument("--methods", nargs="+", default=["lora", "adalora", "evorank"])
+    parser.add_argument("--methods", nargs="+", default=["lora", "adalora", "evorank", "sora", "flatlora"])
+    parser.add_argument("--flatlora_rho", type=float, default=0.05, help="Flat-LoRA 扰动方差/强度参数 (默认: 0.05)")
     parser.add_argument("--target_rank", type=int, default=8)
     parser.add_argument(
         "--lora_alpha",
@@ -2359,6 +2378,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         save_final_model=not args.no_save_final_model,
                         verify_n_samples=args.verify_n_samples,
                         max_grad_norm=args.max_grad_norm,
+                        flatlora_rho=args.flatlora_rho,
                         peft_meta=meta,
                         evo_include_noop_candidate=args.evo_include_noop_candidate,
                     )

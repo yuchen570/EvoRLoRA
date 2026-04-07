@@ -16,7 +16,8 @@ nohup torchrun --nproc_per_node=2 --master_port=29520 \
   --task_type nlg \
   --nlg_dataset_name cnn_dailymail \
   --task_name cnn_dailymail \
-  --methods lora adalora evorank sora toplora \
+  --methods lora adalora evorank sora toplora flatlora \
+  --flatlora_rho 0.05 \
   --model_name facebook/bart-large \
   --target_rank 8 \
   --lora_alpha 32 \
