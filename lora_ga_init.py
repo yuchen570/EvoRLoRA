@@ -220,18 +220,27 @@ def apply_lora_ga_init_to_peft(peft_model, init_by_key, target_device):
             w_norm = base_weight.data.float().norm().item()
             o_norm = offset.norm().item()
             ratio_norm = o_norm / max(w_norm, 1e-12)
-            if ratio_norm > 0.1:  # 如果补偿分量超过原始权重的 10%，记录警告
-                print(f"[warning] LoRA-GA: layer={key} offset_norm/weight_norm={ratio_norm:.4f} 较大，可能破坏预训练特征。")
+            
+            # [Phase 5] 增强调试输出：由于用户要求更多调试信息，此处对每一层都输出初始化快照
+            la_norm = la.weight.data.float().norm().item()
+            lb_norm = lb.weight.data.float().norm().item()
+            msg = f"[debug] LoRA-GA init layer={key}: w_norm={w_norm:.4f}, offset_norm={o_norm:.4f}, ratio={ratio_norm:.4%}, A_norm={la_norm:.4f}, B_norm={lb_norm:.4f}"
+            
+            if ratio_norm > 0.1:
+                print(f"{msg} [warning: large offset]")
+            else:
+                print(msg)
 
             if o_abs_max > 0 and w_abs_max / o_abs_max < 1.0:
                 ratio = (w_abs_max / o_abs_max).item()
-                print(f"[info] LoRA-GA: layer={key} clipping offset by ratio={ratio:.4f}")
+                print(f"[info] LoRA-GA: layer={key} clipping offset by ratio={ratio:.4f} (abs_max guard)")
                 offset *= ratio
                 sqrt_ratio = math.sqrt(ratio)
                 la.weight.data.mul_(sqrt_ratio)
                 lb.weight.data.mul_(sqrt_ratio)
 
             base_weight.data.sub_(offset.to(dtype=base_weight.dtype))
+
 
             
         applied += 1

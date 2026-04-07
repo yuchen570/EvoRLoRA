@@ -1250,6 +1250,29 @@ def run_training_loop(
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
     model = model.to(device)
+
+    if method_name == "lora-ga":
+        # [Phase 2] LoRA-GA 初始化必须在 DDP 包装前完成，因为补偿逻辑会修改 requires_grad=False 的基座权重。
+        # 在 DDP 之前修改可确保 DDP 第一次广播 (Broadcast) 时，所有 Rank 拿到的基座权重是“补偿后”的一致状态。
+        print(f"[debug] Rank {local_rank}: Starting LoRA-GA initialization before DDP wrap (method=lora-ga)...")
+        # 直接复用已有的 train_loader 进行梯度估计
+        init_tensors = estimate_lora_ga_init_tensors(
+            model=model,
+            data_loader=train_loader,
+            target_modules=peft_meta.get("lora_target_modules", []),
+            lora_r=peft_meta.get("target_rank", 8),
+            lora_ga_batches=peft_meta.get("lora_ga_batches", 10),
+            task_type=task_type,
+            device=device,
+            stable_gamma=16.0,
+            aggregate_across_ranks=True,
+            svd_on_this_rank=(local_rank == 0),
+        )
+        apply_lora_ga_init_to_peft(model, init_tensors, target_device=device)
+        print(f"[debug] Rank {local_rank}: LoRA-GA initialization done.")
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         model = DDP(
             model,
@@ -1259,17 +1282,23 @@ def run_training_loop(
         )
     # 默认与适配器同 lr；显式提高分类头速率请传 --head_lr（原先 max(lr,5e-4) 易使 pooler/classifier 相对 LoRA 过快更新）。
     # 对于 DeBERTa 系列模型，分类头对高学习率极度敏感，且由于 DDP 可能导致属性检测失效。
+    inner_m = getattr(model, "module", model)
+    m_config = getattr(inner_m, "config", None)
+    m_type = getattr(m_config, "model_type", "").lower() if m_config else "unknown"
+    
     if head_lr is not None:
         head_lr_val = head_lr
     else:
-        # DDP 模式下实际模型位于 .module 属性中
-        inner_m = getattr(model, "module", model)
-        m_type = getattr(getattr(inner_m, "config", None), "model_type", "").lower()
         if "deberta" in m_type and task_type == "nlu":
             # RTE 任务特别小且容易坍缩，默认使用更保守的 5e-5
             head_lr_val = min(lr, 5e-5) if task_name == "rte" else min(lr, 1e-4)
         else:
             head_lr_val = lr
+    
+    if is_main_process:
+        print(f"[debug] Optimizer setup: model_type={m_type}, task_type={task_type}, task_name={task_name}, base_lr={lr:.2e}, head_lr_val={head_lr_val:.2e}")
+        print(f"[debug] Classifier/Head parameter paths: {[n for n, p in model.named_parameters() if any(k in n for k in ['classifier', 'score', 'lm_head', 'shared', 'pooler'])]}")
+
 
 
 
@@ -1545,6 +1574,7 @@ def run_training_loop(
                             f"gate|abs| min={float(_gate_vals.min().item()):.4e} max={float(_gate_vals.max().item()):.4e} "
                             f"mean={float(_gate_vals.mean().item()):.4e} zero_ratio={_gate_zero_ratio:.4f}"
                         )
+                # LoRA-GA 相关逻辑已移动至 DDP 包装前。此处仅保留占位以防止逻辑重复执行。
                 if method_name == "lora-ga":
                     logit_entropy = float("nan")
                     if logits.dim() >= 2 and logits.size(-1) > 1:
