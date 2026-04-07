@@ -5,7 +5,7 @@
 # 目标:
 #   - 共同训练预算（epoch/batch/seq_len/seed 一致）
 #   - 每个方法仅开放其“官方关键旋钮”
-#   - 参数口径参考 SoRA（no-schedule）并兼容 LoRA-GA 官方训练调度
+#   - 参数口径参考 SoRA（no-schedule）
 #
 # 运行方式:
 #   RUN_MODE=sequential bash scripts/fair_glue_deberta_rte_method_faithful.sh
@@ -75,13 +75,7 @@ run_case evorank rte_fair_evorank 29612 \
   --evo_H_p 4 \
   --evo_max_reallocate_candidates 16
 
-# 4) LoRA-GA（公平对比：统一 lr=8e-4 + linear 调度，与其他方法对齐）
-run_case lora-ga rte_fair_lora_ga 29613 \
-  --lr 8e-4 \
-  --lora_ga_batches 8 \
-  --no_lora_ga_use_rslora
-
-# 5) SoRA（no-schedule 口径）
+# 4) SoRA（no-schedule 口径）
 run_case sora rte_fair_sora 29614 \
   --lr 8e-4 \
   --sora_sparse_lambda 10 \

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-EvoRLoRA is a research framework implementing **EvoRank-LoRA**, a dynamic rank adaptation method for LoRA based on Evolution Strategies. It benchmarks five PEFT methods (LoRA, AdaLoRA, EvoRank-LoRA, LoRA-GA, SoRA) on GLUE (NLU) and summarization (NLG) tasks.
+EvoRLoRA is a research framework implementing **EvoRank-LoRA**, a dynamic rank adaptation method for LoRA based on Evolution Strategies. It benchmarks five PEFT methods (LoRA, AdaLoRA, EvoRank-LoRA, SoRA) on GLUE (NLU) and summarization (NLG) tasks.
 
 ## Environment Setup
 
@@ -33,7 +33,7 @@ python run_benchmark.py \
 **Multi-GPU (DDP):**
 ```bash
 torchrun --nproc_per_node=2 --master_port=29500 run_benchmark.py \
-  --ddp --methods lora adalora evorank lora-ga sora \
+  --ddp --methods lora adalora evorank sora \
   --task_name sst2 --model_name roberta-base \
   --max_train_steps 20 --T_es 10 --seed 42 --output_dir artifacts
 ```
@@ -71,7 +71,6 @@ Manages ES trials and three mutation types (`ExpandMutation`, `PruneMutation`, `
 
 | File | Method | Key mechanism |
 |------|--------|---------------|
-| `lora_ga_init.py` | LoRA-GA | Gradient SVD initialization over first K batches; rank-0 computes, broadcasts in DDP |
 | `sora_inject.py` | SoRA | Learnable sparse gate + `SparseAdamW` proximal optimizer with L1 soft-thresholding |
 | `adalora_utils.py` | AdaLoRA | Wraps HuggingFace PEFT AdaLoRA with orthogonal regularization loss |
 

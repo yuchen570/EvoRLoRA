@@ -28,7 +28,6 @@ from transformers import (
 from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
 
 from adalora_utils import adalora_update_and_allocate, compute_adalora_orthogonal_loss, get_adalora_orth_reg_weight, unwrap_inner_from_training_model
-from lora_ga_init import apply_lora_ga_init_to_peft, run_lora_ga_init_pipeline
 from rank_evolution_controller import RankEvolutionController
 from sora_inject import SparseAdamW, inject_sora
 from train_integration import inject_evo_lora, train_evo_lora_step
@@ -577,9 +576,7 @@ def peft_factory(
     total_steps: Optional[int] = None,
     adalora_delta_t: int = 200,
     train_loader: Optional[DataLoader] = None,
-    lora_ga_batches: int = 8,
     task_type: str = "nlu",
-    lora_ga_device: Optional[torch.device] = None,
     is_main_process: bool = True,
     ddp_enabled: bool = False,
     adalora_init_r: Optional[int] = None,
@@ -589,8 +586,6 @@ def peft_factory(
     nlu_regression: bool = False,
     lora_alpha: Optional[float] = None,
     target_modules_override: Optional[str] = None,
-    lora_ga_use_rslora: bool = False,
-    lora_ga_stable_gamma: Optional[float] = None,
     evorank_r_max: int = 16,
     evorank_alpha_u: float = 1.0,
     evorank_beta_u: float = 1.0,
@@ -773,41 +768,6 @@ def peft_factory(
             elif "pooler" in name and "deberta" not in model_type:
                 param.requires_grad = True
 
-    elif method_name == "lora-ga":
-        if train_loader is None:
-            raise ValueError("method_name='lora-ga' 时必须传入 train_loader")
-        ga_dev = lora_ga_device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-        ga_loss_fn: Optional[nn.Module] = None
-        ga_stable_gamma = float(lora_ga_stable_gamma) if lora_ga_stable_gamma is not None else (16.0 if task_type == "nlu" else 64.0)
-        if task_type == "nlu" and nlu_regression:
-            ga_loss_fn = nn.MSELoss()
-        init_by_key = run_lora_ga_init_pipeline(
-            base_model=model,
-            train_loader=train_loader,
-            target_modules=target_modules,
-            lora_r=target_rank,
-            lora_ga_batches=lora_ga_batches,
-            task_type=task_type,
-            device=ga_dev,
-            is_main_process=is_main_process,
-            ddp_enabled=ddp_enabled,
-            loss_fn=ga_loss_fn,
-            stable_gamma=ga_stable_gamma,
-        )
-        config = LoraConfig(
-            task_type=peft_task_type,
-            r=target_rank,
-            lora_alpha=effective_alpha,
-            lora_dropout=0.1,
-            target_modules=target_modules,
-            modules_to_save=modules_to_save,
-            bias="none",
-            use_rslora=bool(lora_ga_use_rslora),
-        )
-        model = get_peft_model(model, config)
-        tgt = next(model.parameters()).device
-        apply_lora_ga_init_to_peft(model, init_by_key, target_device=tgt)
-
     elif method_name == "sora":
         inject_sora(
             model=model,
@@ -939,7 +899,7 @@ def _collect_rank_distribution(
             summary_gate_stats = None
 
     else:
-        # LoRA / LoRA-GA: 固定秩
+        # LoRA: 固定秩
         for n, p in inner.named_parameters():
             if "lora_A" in n and p.numel() > 0:
                 layer_key = n.replace(".lora_A.default.weight", "").replace(".lora_A.weight", "").replace(".lora_A", "")
@@ -999,7 +959,7 @@ def _print_rank_distribution(
     extra_str = f" [{summary['extra_string']}]" if "extra_string" in summary else ""
     print(f"[{method_name}] === Rank Distribution (epoch={epoch}/{epochs}){extra_str} ===")
     
-    if method_name not in ("lora", "lora-ga"):
+    if method_name != "lora":
         base_rank = summary.get("base_rank", -1)
         omitted = 0
         for layer_name, eff_r in per_layer.items():
@@ -1122,7 +1082,7 @@ def _save_final_artifact(
         meta["task_name"] = task_name
     with open(os.path.join(final_dir, "training_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
-    if method_name in ["lora", "adalora", "lora-ga"] and hasattr(inner, "save_pretrained"):
+    if method_name in ["lora", "adalora"] and hasattr(inner, "save_pretrained"):
         inner.save_pretrained(final_dir)
     else:
         # 手动注入的方法(SORA/EvoRank)虽然基座有 save_pretrained 但会全量保存，这里强制拦截并仅保存过滤后的微调权重至 .pt 文件
@@ -1305,18 +1265,17 @@ def run_training_loop(
         _peft_params = [p for n, p in model.named_parameters() if p.requires_grad and not any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
         _head_params = [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
         
-        # LoRA-GA：A/B 与基座权重的抵消对 decay 极敏感，必须为 0。
-        # 标准 LoRA / AdaLoRA：适配器矩阵通常不做 weight_decay（与常见 PEFT 复现一致），
+        # 标准 LoRA / AdaLoRA / EvoRank：适配器矩阵通常不做 weight_decay（与常见 PEFT 复现一致），
         # 否则在 GLUE 等小数据、较高 lr 下易出现数值爆炸（logits/loss NaN）。
-        dynamic_wd_peft = 0.0 if method_name in ("lora-ga", "lora", "adalora", "evorank") else weight_decay
+        dynamic_wd_peft = 0.0 if method_name in ("lora", "adalora", "evorank") else weight_decay
         # 分类头必须保留 weight_decay 防止权重爆炸
         # LoRA A/B 的 wd=0 是为了保护基础权重补偿，但分类头没有这个约束。
         _head_wd = weight_decay
-        _adam_wd = 0.0 if method_name in ("lora-ga", "lora", "adalora", "evorank") else weight_decay
+        _adam_wd = 0.0 if method_name in ("lora", "adalora", "evorank") else weight_decay
 
         # fp16 参数（如 DeBERTa classifier）在 eps=1e-8 时易在首步触发分母下溢并数值爆炸；
-        # evorank 同样训练 fp16 头 + 适配器，与 lora/adalora/lora-ga 统一 eps。
-        _adam_eps = 1e-6 if method_name in ("lora-ga", "lora", "adalora", "evorank") else 1e-8
+        # evorank 同样训练 fp16 头 + 适配器，与 lora/adalora 统一 eps。
+        _adam_eps = 1e-6 if method_name in ("lora", "adalora", "evorank") else 1e-8
         optimizer = AdamW(
             [
                 {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
@@ -1437,7 +1396,6 @@ def run_training_loop(
     ema_beta = 0.95
     rouge1_val: float = 0.0
     rouge2_val: float = 0.0
-    lora_ga_health_records: List[Dict[str, float]] = []
     evorank_es_records: List[Dict[str, float]] = []
 
     for epoch in range(epochs):
@@ -1531,60 +1489,6 @@ def run_training_loop(
                             f"lam={lam:.4f} l1_contrib={float(lam * l1_penalty.detach().item() / max(gate_numel, 1)):.6f} "
                             f"gate|abs| min={float(_gate_vals.min().item()):.4e} max={float(_gate_vals.max().item()):.4e} "
                             f"mean={float(_gate_vals.mean().item()):.4e} zero_ratio={_gate_zero_ratio:.4f}"
-                        )
-                if method_name == "lora-ga":
-                    logit_entropy = float("nan")
-                    if logits.dim() >= 2 and logits.size(-1) > 1:
-                        probs = torch.softmax(logits.detach().float(), dim=-1)
-                        logit_entropy = float(
-                            (-(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1).mean()).item()
-                        )
-                    head_weight_norm = float("nan")
-                    for n, p in model.named_parameters():
-                        if (
-                            p.requires_grad
-                            and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])
-                            and n.endswith(".weight")
-                        ):
-                            head_weight_norm = float(p.detach().float().norm().item())
-                            break
-                    rec = {
-                        "step": float(global_step),
-                        "train_loss": float(loss.detach().item()),
-                        "logit_entropy": logit_entropy,
-                        "head_weight_norm": head_weight_norm,
-                    }
-                    if global_step < 200:
-                        lora_ga_health_records.append(rec)
-                    if writer is not None:
-                        writer.add_scalar("lora_ga_health/train_loss", rec["train_loss"], global_step)
-                        if not math.isnan(rec["logit_entropy"]):
-                            writer.add_scalar("lora_ga_health/logit_entropy", rec["logit_entropy"], global_step)
-                        if not math.isnan(rec["head_weight_norm"]):
-                            writer.add_scalar("lora_ga_health/head_weight_norm", rec["head_weight_norm"], global_step)
-                    if is_main_process and (global_step % 50 == 0 or global_step < 5):
-                        _opt_lr_peft = float(optimizer.param_groups[0]["lr"])
-                        _opt_wd_peft = float(optimizer.param_groups[0].get("weight_decay", 0.0))
-                        _opt_lr_head = float(optimizer.param_groups[1]["lr"]) if len(optimizer.param_groups) > 1 else _opt_lr_peft
-                        _opt_wd_head = float(optimizer.param_groups[1].get("weight_decay", 0.0)) if len(optimizer.param_groups) > 1 else _opt_wd_peft
-                        print(
-                            f"[lora-ga][health] step={global_step} train_loss={rec['train_loss']:.6f} "
-                            f"logit_entropy={rec['logit_entropy']:.6f} head_weight_norm={rec['head_weight_norm']:.6f} "
-                            f"lr_peft={_opt_lr_peft:.2e} wd_peft={_opt_wd_peft:.4f} "
-                            f"lr_head={_opt_lr_head:.2e} wd_head={_opt_wd_head:.4f}"
-                        )
-                        _debug_log(
-                            run_id=f"{task_name}-{method_name}-seed{random_seed}-health",
-                            hypothesis_id="H-LG",
-                            location="run_benchmark.py:lora_ga_health",
-                            message="early_training_health",
-                            data={
-                                "task": task_name,
-                                "global_step": int(global_step),
-                                "train_loss": rec["train_loss"],
-                                "logit_entropy": rec["logit_entropy"],
-                                "head_weight_norm": rec["head_weight_norm"],
-                            },
                         )
                 loss.backward()
                 grad_norm_total: Optional[float] = None
@@ -1863,7 +1767,7 @@ def run_training_loop(
                     target_rank=int(next(
                         (p.size(0) for n, p in _unwrap_for_save(model).named_parameters()
                          if "lora_A" in n and p.numel() > 0), 8
-                    )) if method_name in ("lora", "lora-ga") else 8,
+                    )) if method_name == "lora" else 8,
                 )
                 _print_rank_distribution(rank_info, method_name, epoch + 1, epochs)
                 if writer is not None:
@@ -1956,7 +1860,7 @@ def run_training_loop(
                     target_rank=int(next(
                         (p.size(0) for n, p in _unwrap_for_save(model).named_parameters()
                          if "lora_A" in n and p.numel() > 0), 8
-                    )) if method_name in ("lora", "lora-ga") else 8,
+                    )) if method_name == "lora" else 8,
                 )
                 _print_rank_distribution(rank_info, method_name, epoch + 1, epochs)
                 if writer is not None:
@@ -2093,13 +1997,7 @@ def run_training_loop(
             return None
         return float(sum(vals) / len(vals))
 
-    lora_ga_health_loss_mean = _mean_numeric(lora_ga_health_records, "train_loss")
-    lora_ga_health_entropy_mean = _mean_numeric(lora_ga_health_records, "logit_entropy")
-    lora_ga_health_head_norm_mean = _mean_numeric(lora_ga_health_records, "head_weight_norm")
-    evorank_delta_val_loss_mean = _mean_numeric(evorank_es_records, "delta_val_loss")
-    evorank_delta_complexity_mean = _mean_numeric(evorank_es_records, "delta_complexity")
     evorank_es_events = len(evorank_es_records)
-    lora_ga_health_events = len(lora_ga_health_records)
 
     result = {
         "method": method_name,
@@ -2114,10 +2012,7 @@ def run_training_loop(
         "evorank_es_events": evorank_es_events if method_name == "evorank" else "",
         "evorank_avg_delta_val_loss": evorank_delta_val_loss_mean if method_name == "evorank" else "",
         "evorank_avg_delta_complexity": evorank_delta_complexity_mean if method_name == "evorank" else "",
-        "lora_ga_health_events": lora_ga_health_events if method_name == "lora-ga" else "",
-        "lora_ga_health_train_loss_mean": lora_ga_health_loss_mean if method_name == "lora-ga" else "",
-        "lora_ga_health_logit_entropy_mean": lora_ga_health_entropy_mean if method_name == "lora-ga" else "",
-        "lora_ga_health_head_norm_mean": lora_ga_health_head_norm_mean if method_name == "lora-ga" else "",
+        "evorank_avg_delta_complexity": evorank_delta_complexity_mean if method_name == "evorank" else "",
         
         "matthews_corrcoef": best_val_metrics.get("matthews_corrcoef", "") if task_type == "nlu" else "",
         "accuracy": best_val_metrics.get("accuracy", "") if task_type == "nlu" else "",
@@ -2165,7 +2060,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="逗号分隔的注入模块后缀列表，如 'query,key,value,intermediate'。"
-             "未指定时按方法+模型类型自动选择默认协议：LoRA 走较窄默认，AdaLoRA/SoRA 走论文主线宽注入，LoRA-GA 走 all-linear。",
+             "未指定时按方法+模型类型自动选择默认协议：LoRA 走较窄默认，AdaLoRA/SoRA 走论文主线宽注入。",
     )
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -2266,30 +2161,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export_csv", type=str, default="benchmark_results.csv")
     parser.add_argument("--ddp", action="store_true", help="是否启用 torchrun/DistributedDataParallel")
     parser.add_argument("--ddp_backend", type=str, default="nccl", help="DDP backend，通常是 nccl")
-    parser.add_argument("--lora_ga_batches", type=int, default=8, help="LoRA-GA 梯度估计用的训练 batch 数（仅前若干个 batch）")
-    parser.add_argument("--lora_ga_use_rslora", dest="lora_ga_use_rslora", action="store_true", help="LoRA-GA：启用 rsLoRA 缩放（默认开启，对标官方主配方）")
-    parser.add_argument("--no_lora_ga_use_rslora", dest="lora_ga_use_rslora", action="store_false", help="LoRA-GA：关闭 rsLoRA 缩放（消融用）")
-    parser.set_defaults(lora_ga_use_rslora=True)
-    parser.add_argument("--lora_ga_stable_gamma", type=float, default=16.0, help="LoRA-GA：stable init gamma 值。NLU/GLUE 默认 16；可按任务显式覆盖")
-    parser.add_argument("--lora_ga_lr", type=float, default=None, help="LoRA-GA 独立学习率，覆盖全局 --lr。原始论文 RTE 使用 2e-4，与 stable_gamma 初始化匹配")
-    parser.add_argument(
-        "--lora_ga_use_official_scheduler",
-        action="store_true",
-        help="LoRA-GA 诊断开关：使用官方风格训练调度（warmup=0.03 + cosine）。默认关闭，以保持公平主表统一调度。",
-    )
-    parser.add_argument(
-        "--lora_ga_official_warmup_ratio",
-        type=float,
-        default=0.03,
-        help="LoRA-GA 官方调度分支的 warmup_ratio（默认 0.03）。",
-    )
-    parser.add_argument(
-        "--lora_ga_official_scheduler_type",
-        type=str,
-        default="cosine",
-        choices=["linear", "cosine"],
-        help="LoRA-GA 官方调度分支的学习率调度类型（默认 cosine）。",
-    )
     parser.add_argument("--sora_sparse_lambda", type=float, default=1e-3, help="SoRA：gate L1 惩罚系数")
     parser.add_argument("--sora_lambda_warmup_steps", type=int, default=0, help="SoRA：前若干步将 sparse_lambda 从 0 线性升到设定值；0 表示关闭")
     parser.add_argument("--sora_sparse_lambda_2", type=float, default=3e-4, help="SoRA：gate 近端梯度硬裁剪阈值（Proximal Gradient / Soft-Thresholding），对标官方 SparseAdamW")
@@ -2366,38 +2237,22 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
             current_sora_lambda_schedule = args.sora_lambda_schedule
             current_sora_sparse_lambda_2 = args.sora_sparse_lambda_2
-            current_lora_ga_batches = args.lora_ga_batches
-            current_lora_ga_stable_gamma = args.lora_ga_stable_gamma
 
             if planned_total_steps < 10000:
                 if current_sora_sparse_lambda_2 >= 1e-3:
                     current_sora_sparse_lambda_2 = 1e-4
-                # 注意: 不再自动将 lora_ga_batches 拉到 32。
-                # 60 个 Linear × 32 batch 的单卡 SVD 计算会超过 NCCL 默认 600s 超时。
-                # 原始 LoRA-GA 论文使用 4~8 batch 即可获得稳定的梯度方向估计。
-                if current_lora_ga_stable_gamma is None:
-                    pass
 
             for method in args.methods:
                 seed_results: List[Dict[str, Any]] = []
                 method_warmup_ratio = float(args.warmup_ratio)
                 method_lr_scheduler_type = "linear"
-                # LoRA-GA 可通过 --lora_ga_lr 单独设置学习率（原始论文 RTE 使用 2e-4，
-                # 与 stable_gamma 初始化兼容；全局 lr 通常对其他方法更优但对 LoRA-GA 偏高）
-                method_lr = float(args.lora_ga_lr) if (method == "lora-ga" and args.lora_ga_lr is not None) else float(args.lr)
-                if method == "lora-ga" and bool(args.lora_ga_use_official_scheduler):
-                    method_warmup_ratio = float(args.lora_ga_official_warmup_ratio)
-                    method_lr_scheduler_type = str(args.lora_ga_official_scheduler_type)
+                method_lr = float(args.lr)
                 for seed in seeds:
                     torch.manual_seed(seed)
                     if torch.cuda.is_available():
                         torch.cuda.manual_seed_all(seed)
 
                     method_model = copy.deepcopy(base_model)
-                    if args.ddp_enabled and torch.cuda.is_available():
-                        lora_ga_dev = torch.device(f"cuda:{args.local_rank}")
-                    else:
-                        lora_ga_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                     method_model, controller, meta = peft_factory(
                         model=method_model,
                         method_name=method,
@@ -2409,16 +2264,12 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         adalora_tfinal=args.adalora_tfinal,
                         adalora_orth_reg_weight=args.adalora_orth_reg_weight,
                         train_loader=train_loader,
-                        lora_ga_batches=current_lora_ga_batches,
                         task_type=args.task_type,
-                        lora_ga_device=lora_ga_dev,
                         is_main_process=args.is_main_process,
                         ddp_enabled=args.ddp_enabled,
                         nlu_regression=nlu_is_glue_regression(task_name),
                         lora_alpha=args.lora_alpha,
                         target_modules_override=args.target_modules,
-                        lora_ga_use_rslora=args.lora_ga_use_rslora,
-                        lora_ga_stable_gamma=current_lora_ga_stable_gamma,
                         evorank_r_max=args.evorank_r_max,
                         evorank_alpha_u=args.evo_alpha_u,
                         evorank_beta_u=args.evo_beta_u,
@@ -2528,13 +2379,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         row["avg_active_rank"] = ""
                         row["warmup_ratio"] = ""
                         row["lr_scheduler_type"] = ""
-                        row["evorank_es_events"] = ""
-                        row["evorank_avg_delta_val_loss"] = ""
                         row["evorank_avg_delta_complexity"] = ""
-                        row["lora_ga_health_events"] = ""
-                        row["lora_ga_health_train_loss_mean"] = ""
-                        row["lora_ga_health_logit_entropy_mean"] = ""
-                        row["lora_ga_health_head_norm_mean"] = ""
                     all_results.extend([mean_row, std_row])
 
     if args.is_main_process:
@@ -2563,13 +2408,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "avg_active_rank",
                     "warmup_ratio",
                     "lr_scheduler_type",
-                    "evorank_es_events",
-                    "evorank_avg_delta_val_loss",
                     "evorank_avg_delta_complexity",
-                    "lora_ga_health_events",
-                    "lora_ga_health_train_loss_mean",
-                    "lora_ga_health_logit_entropy_mean",
-                    "lora_ga_health_head_norm_mean",
                     "total_train_time_sec",
                     "artifact_dir",
                     "final_dir",
@@ -2605,13 +2444,12 @@ if __name__ == "__main__":
 
     try:
         if args.ddp_enabled and torch.cuda.is_available():
-            # 在首次 collective（如 lora_ga 初始化前的 barrier）之前绑定本地 GPU，
+            # 在首次 collective 之前绑定本地 GPU，
             # 避免 NCCL 提示 "devices used by this process are currently unknown"。
             torch.cuda.set_device(args.local_rank)
-        if args.ddp_enabled and not dist.is_initialized():
             dist.init_process_group(
                 backend=args.ddp_backend,
-                timeout=datetime.timedelta(seconds=1800),  # LoRA-GA 单卡 SVD 初始化耗时长，默认 600s 不够
+                timeout=datetime.timedelta(seconds=1800),
             )
 
         torch.manual_seed(args.seed)

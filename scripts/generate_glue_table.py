@@ -56,7 +56,7 @@ def main():
                         data[method][task] = row
 
     # 指定显示的方法顺序
-    methods_order = ["lora", "adalora", "evorank", "lora-ga", "sora"]
+    methods_order = ["lora", "adalora", "evorank", "sora"]
     present_methods = []
     for m in methods_order:
         if m in data:

@@ -16,7 +16,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29520 \
   --task_type nlg \
   --nlg_dataset_name cnn_dailymail \
   --task_name cnn_dailymail \
-  --methods lora adalora evorank lora-ga sora \
+  --methods lora adalora evorank sora \
   --model_name facebook/bart-large \
   --target_rank 8 \
   --lora_alpha 32 \
@@ -32,7 +32,6 @@ nohup torchrun --nproc_per_node=2 --master_port=29520 \
   --max_grad_norm 0.1 \
   --adalora_delta_t 100 \
   --adalora_orth_reg_weight 0.1 \
-  --lora_ga_batches 8 \
   --sora_sparse_lambda 1e-3 \
   --sora_sparse_lambda_2 1e-4 \
   --lambda_c 0.001 \

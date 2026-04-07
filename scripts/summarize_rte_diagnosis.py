@@ -13,10 +13,6 @@ EPOCH_RE = re.compile(
 )
 RANK_HEADER_RE = re.compile(r"^\[(?P<method>[^\]]+)\]\s+=== Rank Distribution")
 RANK_RE = re.compile(r"avg_rank=(?P<avg>[-+0-9.eE]+)\s+total_active=(?P<active>\d+)/(?P<cap>\d+)")
-LORA_GA_HEALTH_RE = re.compile(
-    r"^\[lora-ga\]\[health\]\s+step=(?P<step>\d+)\s+train_loss=(?P<loss>[-+0-9.eE]+)\s+"
-    r"logit_entropy=(?P<entropy>[-+0-9.eE]+)\s+head_weight_norm=(?P<head>[-+0-9.eE]+)"
-)
 EVORANK_ES_RE = re.compile(
     r"^\[evorank\]\[es\]\s+step=(?P<step>\d+).+delta_val_loss=(?P<dval>[-+0-9.eE]+)\s+"
     r"delta_complexity=(?P<dcomp>[-+0-9.eE]+)"
@@ -61,9 +57,6 @@ def parse_rte_log(log_path: Path) -> Dict[str, Dict[str, object]]:
                 "num_eval_points": 0,
                 "stuck_majority_band": "",
                 "_val_hist": [],
-                "_lora_ga_loss": [],
-                "_lora_ga_entropy": [],
-                "_lora_ga_head": [],
                 "_evorank_dval": [],
                 "_evorank_dcomp": [],
             }
@@ -104,20 +97,6 @@ def parse_rte_log(log_path: Path) -> Dict[str, Dict[str, object]]:
                     rec["rank_end"] = avg_rank
                 continue
 
-            m_health = LORA_GA_HEALTH_RE.match(line)
-            if m_health:
-                rec = ensure("lora-ga")
-                loss = _safe_float(m_health.group("loss"))
-                entropy = _safe_float(m_health.group("entropy"))
-                head = _safe_float(m_health.group("head"))
-                if loss is not None:
-                    rec["_lora_ga_loss"].append(loss)
-                if entropy is not None:
-                    rec["_lora_ga_entropy"].append(entropy)
-                if head is not None:
-                    rec["_lora_ga_head"].append(head)
-                continue
-
             m_es = EVORANK_ES_RE.match(line)
             if m_es:
                 rec = ensure("evorank")
@@ -138,15 +117,11 @@ def parse_rte_log(log_path: Path) -> Dict[str, Dict[str, object]]:
         if val_hist:
             low = all(0.4729 - 1e-6 <= v <= 0.5271 + 1e-6 for v in val_hist)
             rec["stuck_majority_band"] = "yes" if low else "no"
-        rec["lora_ga_health_events"] = len(rec.get("_lora_ga_loss", [])) if method == "lora-ga" else ""
-        rec["lora_ga_train_loss_mean_0_200"] = _mean(rec.get("_lora_ga_loss", [])) if method == "lora-ga" else ""
-        rec["lora_ga_logit_entropy_mean_0_200"] = _mean(rec.get("_lora_ga_entropy", [])) if method == "lora-ga" else ""
-        rec["lora_ga_head_norm_mean_0_200"] = _mean(rec.get("_lora_ga_head", [])) if method == "lora-ga" else ""
         rec["evorank_es_events"] = len(rec.get("_evorank_dval", [])) if method == "evorank" else ""
         rec["evorank_delta_val_loss_mean"] = _mean(rec.get("_evorank_dval", [])) if method == "evorank" else ""
         rec["evorank_delta_complexity_mean"] = _mean(rec.get("_evorank_dcomp", [])) if method == "evorank" else ""
         # 清理内部字段
-        for k in ["_val_hist", "_lora_ga_loss", "_lora_ga_entropy", "_lora_ga_head", "_evorank_dval", "_evorank_dcomp"]:
+        for k in ["_val_hist", "_evorank_dval", "_evorank_dcomp"]:
             rec.pop(k, None)
     return summary
 
@@ -162,15 +137,11 @@ def write_csv(summary: Dict[str, Dict[str, object]], out_csv: Path) -> None:
         "rank_delta",
         "num_eval_points",
         "stuck_majority_band",
-        "lora_ga_health_events",
-        "lora_ga_train_loss_mean_0_200",
-        "lora_ga_logit_entropy_mean_0_200",
-        "lora_ga_head_norm_mean_0_200",
         "evorank_es_events",
         "evorank_delta_val_loss_mean",
         "evorank_delta_complexity_mean",
     ]
-    order = ["lora", "adalora", "evorank", "lora-ga", "sora"]
+    order = ["lora", "adalora", "evorank", "sora"]
     with out_csv.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -209,7 +180,7 @@ def write_md(
     lines.append("## Snapshot (from available logs)")
     lines.append("| Method | Main best | Main final | Main rank(start->end) | Stuck in 0.4729~0.5271 |")
     lines.append("|---|---:|---:|---|---|")
-    for method in ["lora", "adalora", "evorank", "lora-ga", "sora"]:
+    for method in ["lora", "adalora", "evorank", "sora"]:
         rec = main_summary.get(method, {})
         best_v = rec.get("best_val")
         final_v = rec.get("final_val")

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# 公平对比: GLUE 主线任务 × DeBERTa-v3-base × 全方法 (lora adalora evorank lora-ga sora)
+# 公平对比: GLUE 主线任务 × DeBERTa-v3-base × 全方法 (lora adalora evorank sora)
 # ----------------------------------------------------------------------------
 # 统一参数参考来源:
 #   - SoRA 主线 no-schedule: lr=8e-4, bsz=8, warmup_ratio=0.06,
@@ -10,7 +10,7 @@
 # 公平原则:
 #   - 训练超参按 SoRA 官方 GLUE 主线统一
 #   - 不再显式传 --target_modules，让各方法走各自论文/官方实现的默认注入协议
-#   - 方法特有参数 (adalora_*, sora_*, lora_ga_*) 仅保留各自论文主线所需自由度
+#   - 方法特有参数 (adalora_*, sora_*) 仅保留各自论文主线所需自由度
 #
 # EvoRank 专用（仅影响 method=evorank；其它方法忽略）:
 #   --mini_val_k   从验证集 loader 取前 K 个 batch 缓存，供每轮 ES trial 上算 reward。
@@ -26,7 +26,7 @@ mkdir -p logs runs artifacts
 nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
-  --methods lora adalora evorank lora-ga sora \
+  --methods lora adalora evorank sora \
   --task_list mnli sst2 cola qqp qnli mrpc stsb \
   --model_list microsoft/deberta-v3-base \
   --target_rank 8 \
@@ -40,7 +40,6 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --max_grad_norm 0.1 \
   --adalora_delta_t 100 \
   --adalora_orth_reg_weight 0.1 \
-  --lora_ga_batches 8 \
   --sora_sparse_lambda 10 \
   --sora_sparse_lambda_2 3e-4 \
   --lambda_c 0.001 \
