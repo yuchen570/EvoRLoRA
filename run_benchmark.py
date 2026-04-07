@@ -1319,13 +1319,13 @@ def run_training_loop(
         _head_params = [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
         
         # LoRA-GA：A/B 与基座权重的抵消对 decay 极敏感，必须为 0。
-        # 标准 LoRA / AdaLoRA：适配器矩阵通常不做 weight_decay（与常见 PEFT 复现一致），
-        # 否则在 GLUE 等小数据、较高 lr 下易出现数值爆炸（logits/loss NaN）。
+        # 标准 LoRA / AdaLoRA：适配器矩阵通常不做 weight_decay，否则在小数据、较高 lr 下易爆炸。
         dynamic_wd_peft = 0.0 if method_name in ("lora-ga", "lora", "adalora", "evorank") else weight_decay
-        # 分类头必须保留 weight_decay 防止权重爆炸
-        # LoRA A/B 的 wd=0 是为了保护基础权重补偿，但分类头没有这个约束。
-        _head_wd = weight_decay
+        # LoRA-GA：分类头原版设置为 0。
+        _head_wd = 0.0 if method_name == "lora-ga" else weight_decay
         _adam_wd = 0.0 if method_name in ("lora-ga", "lora", "adalora", "evorank") else weight_decay
+
+
 
         # fp16 参数（如 DeBERTa classifier）在 eps=1e-8 时易在首步触发分母下溢并数值爆炸；
         # evorank 同样训练 fp16 头 + 适配器，与 lora/adalora/lora-ga 统一 eps。
