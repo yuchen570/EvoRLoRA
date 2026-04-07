@@ -83,6 +83,10 @@ def estimate_lora_ga_init_tensors(
         model.zero_grad(set_to_none=True)
         if task_type == "nlu":
             loss = _forward_loss_nlu(model, batch, loss_fn)
+            # [诊断] 如果首个 batch 的 loss 过高（如 > 5.0），且分类头是随机初始化的，
+            # 意味着梯度估计是在“瞎猜”，此时生成的 LoRA 矩阵质量会很差。
+            if n_used == 0 and loss.item() > 5.0:
+                print(f"[warning] LoRA-GA: 初始 loss={loss.item():.4f} 异常高。如果分类头(classifier/score)是随机初始化的，梯度估计可能不准。")
         elif task_type == "nlg":
             loss = _forward_loss_nlg(model, batch)
         else:
@@ -194,7 +198,8 @@ def apply_lora_ga_init_to_peft(peft_model, init_by_key, target_device):
         la.weight.data.copy_(A_cpu.to(device=target_device, dtype=la.weight.dtype))
         lb.weight.data.copy_(B_cpu.to(device=target_device, dtype=lb.weight.dtype))
         
-        # --- 基础权重补偿（防止表示崩溃的关键步骤） ---
+        # --- 基础权重补偿（核心步骤：W_new = W_pretrained - scaling * (B @ A)） ---
+        # 这样在推理时，W_new + scaling * (B @ A) 刚好等于 W_pretrained，实现 Step 0 无损初始化。
         if hasattr(module, "base_layer") and hasattr(module.base_layer, "weight"):
             base_weight = module.base_layer.weight
             scaling = 1.0

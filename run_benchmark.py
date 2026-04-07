@@ -1258,7 +1258,17 @@ def run_training_loop(
             find_unused_parameters=True,
         )
     # 默认与适配器同 lr；显式提高分类头速率请传 --head_lr（原先 max(lr,5e-4) 易使 pooler/classifier 相对 LoRA 过快更新）。
-    head_lr_val = head_lr if head_lr is not None else lr
+    # 默认与适配器同 lr；显式提高分类头速率请传 --head_lr（原先 max(lr,5e-4) 易使 pooler/classifier 相对 LoRA 过快更新）。
+    # 对于 DeBERTa 系列模型，分类头对高学习率极度敏感，若未指定则兜底使用 1e-4。
+    if head_lr is not None:
+        head_lr_val = head_lr
+    else:
+        m_type = getattr(getattr(model, "config", None), "model_type", "").lower()
+        if "deberta" in m_type and task_type == "nlu":
+            head_lr_val = min(lr, 1e-4)
+        else:
+            head_lr_val = lr
+
 
     if method_name == "sora":
         # 官方 SoRA trainer.py：区分 LayerNorm/bias（无 decay）和其他参数（有 decay），gate 参数独立优化。
