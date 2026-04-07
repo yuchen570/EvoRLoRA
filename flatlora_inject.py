@@ -6,13 +6,18 @@ import torch.nn as nn
 class FlatLoRAHookManager:
     """
     Flat-LoRA Hook 机制实现。
-    
+
     参考论文: Flat-LoRA (ICML 2025)
     理论公式: ε ~ N(0, (γ * ρ / sqrt(n)) * ||W_i||^2)
-    
-    使用 register_forward_pre_hook 和 register_full_backward_hook 
+
+    参数命名说明：
+        flatlora_rho（本仓库参数名，对应命令行 --flatlora_rho）
+            == 论文中的 σ（sigma，扰动强度系数）
+        两者语义完全一致，论文推荐默认值 σ=0.05，即 --flatlora_rho 0.05。
+
+    使用 register_forward_pre_hook 和 register_full_backward_hook
     在微批次运行的底层计算图中进行动态参数随机扰动（高斯噪声）。
-    
+
     本实现的工程优势：
     1. 天然无视 Gradient Accumulation：无需通过 optimizer step 进行硬编码调度。
     2. 混合精度/混合调度原生支持：透传了基座网络 dtype/device。

@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-EvoRLoRA is a research framework implementing **EvoRank-LoRA**, a dynamic rank adaptation method for LoRA based on Evolution Strategies. It benchmarks five PEFT methods (LoRA, AdaLoRA, EvoRank-LoRA, SoRA) on GLUE (NLU) and summarization (NLG) tasks.
+EvoRLoRA is a unified benchmark harness for 7 LoRA variants, with **EvoRank-LoRA** as the core contribution — an evolutionary rank-adaptive LoRA that dynamically adjusts per-layer rank during training using evolutionary strategies (ES).
+
+Supported `--methods`: `lora`, `adalora`, `pissa`, `evorank`, `sora`, `flatlora`, `toplora`
 
 ## Environment Setup
 
@@ -15,91 +17,84 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 pip install -r requirements.txt
 ```
 
+HuggingFace datasets/models cache to `./datasets` and `./models` by default.
+
 ## Running Experiments
 
-**Smoke test (single GPU, ~2 min):**
+**Smoke test (single GPU, ~1 min):**
 ```bash
 python run_benchmark.py \
   --methods lora adalora evorank \
-  --task_name sst2 \
-  --model_name roberta-base \
-  --max_train_steps 50 \
-  --T_es 20 \
-  --seed 42 \
-  --output_dir artifacts \
-  --export_csv results_smoke.csv
-```
-
-**Multi-GPU (DDP):**
-```bash
-torchrun --nproc_per_node=2 --master_port=29500 run_benchmark.py \
-  --ddp --methods lora adalora evorank sora \
   --task_name sst2 --model_name roberta-base \
-  --max_train_steps 20 --T_es 10 --seed 42 --output_dir artifacts
+  --max_train_steps 50 --T_es 20 \
+  --adalora_delta_t 50 --adalora_orth_reg_weight 0.1 \
+  --expand_init_mode gradient --seed 42 \
+  --output_dir artifacts --export_csv results_smoke.csv
 ```
 
-**Full benchmark scripts:**
+**Full GLUE benchmark (canonical, from `scripts/fair_glue_deberta.sh`):**
 ```bash
-bash scripts/fair_glue_deberta.sh          # GLUE 9 tasks, DeBERTa-v3-base, 5 seeds
-bash scripts/fair_glue_deberta_rte.sh      # RTE (special: 50 epochs, batch=32)
-bash scripts/fair_nlg_xsum.sh              # XSum, BART-large
-bash scripts/fair_nlg_cnndailymail.sh      # CNN/DailyMail, BART-large
-bash scripts/ablate_evorank_glue_deberta.sh  # Ablation studies
+nohup torchrun --nproc_per_node=2 --master_port=29500 run_benchmark.py \
+  --ddp \
+  --methods lora adalora evorank sora toplora flatlora pissa \
+  --task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli \
+  --model_list microsoft/deberta-v3-base \
+  --target_rank 8 --lora_alpha 16 --epochs 20 \
+  --batch_size 8 --lr 2e-4 --weight_decay 0.1 \
+  --warmup_ratio 0.06 --max_grad_norm 0.1 \
+  --seed_list 0 21 42 81 100 \
+  --expand_init_mode gradient \
+  --output_dir artifacts --export_csv results_main.csv \
+  > logs/main.out 2>&1 &
 ```
 
-**Aggregate results:**
+RTE uses a separate script (`scripts/fair_glue_deberta_rte.sh`) aligned with the main fair protocol (`epochs=20, batch_size=8, lr=8e-4`; see script).
+
+**Ablation studies:**
 ```bash
+bash scripts/ablate_evorank_glue_deberta.sh
+bash scripts/ablate_evorank_reallocation_efficiency.sh
 python scripts/summarize_evorank_ablation.py
 python scripts/summarize_evorank_reallocation_efficiency.py
 ```
 
 ## Architecture
 
-### Core EvoRank-LoRA
+### Core Files
 
-**`evo_rank_lora.py` — `EvoRankLoRALayer`**
-Rank super-space parameterization: maintains `lora_A` (r_max × in) and `lora_B` (out × r_max) with a binary `active_mask`. Forward pass computes ΔW = Σ m_i · b_i · a_i^T. Key methods: `activate_component()`, `deactivate_component()`, `compute_demand_score()`, `compute_prune_scores()`.
+| File | Role |
+|------|------|
+| `evo_rank_lora.py` | `EvoRankLoRALayer`: rank super-space (r_max), boolean active mask, gradient caching for ES |
+| `rank_evolution_controller.py` | `RankEvolutionController`: expand/prune/reallocate mutations, EMA statistics, dynamic thresholds, cooldown |
+| `train_integration.py` | `inject_evo_lora()` model injection; `train_evo_lora_step()` dual time-scale loop |
+| `run_benchmark.py` | Main entry point (2558 lines): all CLI args, GLUE+NLG data loading, training loop, CSV export |
+| `glue_metrics.py` | Task-specific metrics: Matthews (CoLA), F1 (MRPC/QQP), Pearson+Spearman mean (STS-B), Accuracy (rest) |
+| `sora_inject.py` | `SoRALinear` + `SparseAdamW` proximal gradient optimizer |
+| `toplora_inject.py` | `TopSingularValue` per-token singular value gating |
+| `flatlora_inject.py` | Gaussian noise injection via hooks for flat minima regularization |
+| `adalora_utils.py` | Orthogonal regularization loss + rank budget update helpers |
 
-**`rank_evolution_controller.py` — `RankEvolutionController`**
-Manages ES trials and three mutation types (`ExpandMutation`, `PruneMutation`, `ReallocateMutation`). Uses EMA-smoothed gradient statistics, quantile-based dynamic thresholds, persistent counters with cooldown, and complexity regularization (−λ_c × C(z)). In DDP mode, trial rewards are synchronized via `all_reduce`.
+### Dual Time-Scale Training (EvoRank)
 
-**`train_integration.py`**
-- `inject_evo_lora()`: Replaces target `nn.Linear` layers with `EvoRankLoRAWrapper` (frozen base + `EvoRankLoRALayer`)
-- `train_evo_lora_step()`: Dual-timescale loop — caches gradients, runs ES trial evaluation on a mini validation set, applies/evaluates/undoes mutations, commits elitist selection
+1. **Fast loop** (every step): gradient descent on LoRA weights; gradient stats cached *before* `clip_grad_norm_`
+2. **Slow loop** (every `--T_es` steps): generate candidate mutations → evaluate each on mini validation set → commit best mutation; trial rewards aggregated via `all_reduce` in DDP
 
-### Comparison Methods
+### Output Artifacts
 
-| File | Method | Key mechanism |
-|------|--------|---------------|
-| `sora_inject.py` | SoRA | Learnable sparse gate + `SparseAdamW` proximal optimizer with L1 soft-thresholding |
-| `adalora_utils.py` | AdaLoRA | Wraps HuggingFace PEFT AdaLoRA with orthogonal regularization loss |
+`artifacts/<task>_<backbone>_<method>/`:
+- `metrics.jsonl` — per-step metrics
+- `final/` — adapter weights + tokenizer (self-contained for inference)
+- `checkpoint_epoch_*.pt` — optional intermediate checkpoints (with `--save_every_epoch`)
 
-### Evaluation
+CSV output aggregates across seeds with mean/std rows per `task×backbone×method`.
 
-**`glue_metrics.py`**: Task-specific primary metrics (MCC for CoLA, F1 for MRPC/QQP, Pearson+Spearman avg for STS-B, accuracy for others). Used by `run_benchmark.py` for best-checkpoint tracking.
+## Key Gotchas
 
-**`run_benchmark.py`** (~3000 lines): Unified entry point. Handles data loading, model init, optimizer/scheduler setup, training loop, validation, TensorBoard/W&B/CSV logging, and checkpointing for all 5 methods.
-
-### Output Layout
-
-```
-artifacts/<task>_<backbone>_<method>/
-├── metrics.jsonl          # per-step metrics
-├── final/                 # saved model + tokenizer
-└── checkpoint_epoch_*.pt  # optional per-epoch checkpoints
-results_*.csv              # aggregated mean/std across seeds
-runs/                      # TensorBoard event files
-```
-
-## Key EvoRank Hyperparameters
-
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `--target_rank` | — | Initial active rank (r_init) |
-| `--evorank_r_max` | 16 | Rank super-space ceiling R_max |
-| `--T_es` | 200 | ES population size (steps between ES evaluations) |
-| `--lambda_c` | 0.001 | Complexity regularization weight |
-| `--complexity_mode` | `rank_sum` | `rank_sum` or `size_aware` |
-| `--expand_init_mode` | `zero` | `zero` (cold start) or `gradient` (Prop 3.2) |
-| `--lambda_pop` | 16 | Population subsampling limit |
-| `--evo_max_reallocate_candidates` | 8 | Cross-layer reallocation candidate limit |
+- **`ax` task is unsupported** — HuggingFace GLUE has 10 configs but `ax` has no gold labels; `run_benchmark.py` will explicitly error if `ax` is in `--task_list`. Use the 9 supervised tasks only.
+- **Epoch recommendations differ by task**: large datasets (sst2, mnli, qnli, qqp) converge in 3–5 epochs; small datasets (cola, mrpc, stsb, rte, wnli) need 15–20 epochs.
+- **`--head_lr`**: classifier/score heads are automatically pushed to `max(lr, 5e-4)` to prevent random-init heads from failing to converge on CoLA/MRPC.
+- **AdaLoRA `--adalora_delta_t`**: default is `0.1 * total_steps` (not 0.8) so AdaLoRA has 90% of training for dynamic rank adjustment.
+- **SoRA `--sora_sparse_lambda_2`**: default `3e-4` (not `1e-3`) to prevent aggressive pruning mid-training.
+- **`--expand_init_mode gradient`**: uses projected gradient principal singular vector (Proposition 3.2) for new rank-1 slot initialization; `zero` is cold-start. Only affects `evorank`; safe to pass for all-method runs.
+- **DDP**: validation metrics computed on rank0 over full dev set, then broadcast. Artifacts written by rank0 only.
+- **`--evo_max_reallocate_candidates 8`**: limits cross-layer reallocation candidates to prevent combinatorial explosion; set to `0` for unlimited (ablation only).

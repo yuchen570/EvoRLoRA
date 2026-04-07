@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# 公平对比: GLUE 主线任务 × DeBERTa-v3-base × 全方法 (lora adalora evorank sora)
+# 公平对比: GLUE 主线任务 × DeBERTa-v3-base × 全方法 (lora adalora evorank sora toplora flatlora pissa)
 # ----------------------------------------------------------------------------
 # 统一参数参考来源:
 #   - SoRA 主线 no-schedule: lr=8e-4, bsz=8, warmup_ratio=0.06,
@@ -11,6 +11,7 @@
 #   - 训练超参按 SoRA 官方 GLUE 主线统一
 #   - 不再显式传 --target_modules，让各方法走各自论文/官方实现的默认注入协议
 #   - 方法特有参数 (adalora_*, sora_*) 仅保留各自论文主线所需自由度
+#   - 对比协议使用 controlled_fair：统一 adapter dropout 与模块覆盖口径
 #
 # EvoRank 专用（仅影响 method=evorank；其它方法忽略）:
 #   --mini_val_k   从验证集 loader 取前 K 个 batch 缓存，供每轮 ES trial 上算 reward。
@@ -19,14 +20,17 @@
 #                  配合默认 --population_strategy all 时取 generate_mutations 列表前 N 个。
 #                  省略或设为 <=0 表示不截断（评估全部候选）。曾用 2 可省墙钟，但易漏掉更优剪枝/重分配。
 #   --expand_init_mode  仅 evorank：zero=B 列 cold start；gradient=论文 Prop 3.2 梯度主方向初始化。
-#                       同台五法可统一写上，其它方法忽略。
+#                       同台多法可统一写上，其它方法忽略。
 # ============================================================================
 mkdir -p logs runs artifacts
 
 nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
-  --methods lora adalora evorank sora toplora flatlora \
+  --methods lora adalora evorank sora toplora flatlora pissa \
+  --comparison_protocol controlled_fair \
+  --protocol_dropout 0.05 \
+  --module_preset default \
   --flatlora_rho 0.05 \
   --task_list mnli sst2 cola qqp qnli mrpc stsb \
   --model_list microsoft/deberta-v3-base \

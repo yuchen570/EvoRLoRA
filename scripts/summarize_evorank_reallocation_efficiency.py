@@ -73,6 +73,7 @@ def main() -> None:
         total_time = _safe_float(mean_row.get("total_train_time_sec"))
         peak_mem = _safe_float(mean_row.get("peak_memory_mb"))
         avg_rank = _safe_float(mean_row.get("avg_active_rank"))
+        seed_used = mean_row.get("seed", "")
         if variant == "capped_k8" and total_time is not None:
             base_time = total_time
         rows.append(
@@ -86,6 +87,7 @@ def main() -> None:
                 "total_train_time_sec": f"{total_time:.2f}" if total_time is not None else "-",
                 "relative_time_vs_k8": "",
                 "source_csv": str(csv_path),
+                "seed_info": seed_used,
             }
         )
 
@@ -117,6 +119,7 @@ def main() -> None:
                 "total_train_time_sec",
                 "relative_time_vs_k8",
                 "source_csv",
+                "seed_info",
             ],
         )
         writer.writeheader()
@@ -124,13 +127,13 @@ def main() -> None:
             writer.writerow(row)
 
     md_lines = [
-        "| Variant | Task | Val Metric | Avg Active Rank | Peak Memory (MB) | Train Time (s) | Relative Time vs K=8 |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| Variant | Task | Val Metric | Avg Active Rank | Peak Memory (MB) | Train Time (s) | Relative Time vs K=8 | Seed Info |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
         md_lines.append(
             f"| {row['variant']} | {row['task']} | {row['val_metric']} | {row['avg_active_rank']} | "
-            f"{row['peak_memory_mb']} | {row['total_train_time_sec']} | {row['relative_time_vs_k8']} |"
+            f"{row['peak_memory_mb']} | {row['total_train_time_sec']} | {row['relative_time_vs_k8']} | {row['seed_info']} |"
         )
     md_out = ROOT / "results_evorank_reallocation_efficiency_summary.md"
     md_out.write_text("\n".join(md_lines) + "\n", encoding="utf-8")

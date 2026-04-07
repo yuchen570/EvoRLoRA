@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# 公平对比: RTE 单任务 × DeBERTa-v3-base × 全方法
+# 公平对比: RTE 单任务 × DeBERTa-v3-base × 全方法（含 PiSSA）
 # ----------------------------------------------------------------------------
 # 主表协议（SoRA 参数参考 + 统一公平）:
 #   - 单阶段、同预算、同主超参（参考 SoRA GLUE no-schedule）
@@ -9,6 +9,7 @@
 # 公平原则:
 #   - 训练超参统一，不启用方法特有“额外阶段训练”
 #   - 不再显式传 --target_modules，让各方法走各自论文/官方实现的默认注入协议
+#   - 对比协议使用 controlled_fair：统一 adapter dropout 与模块覆盖口径
 # EvoRank: --expand_init_mode gradient（仅 evorank 生效）
 # ============================================================================
 mkdir -p logs runs artifacts
@@ -16,7 +17,10 @@ mkdir -p logs runs artifacts
 nohup torchrun --nproc_per_node=2 --master_port=29510 \
   run_benchmark.py \
   --ddp \
-  --methods lora adalora evorank sora toplora flatlora \
+  --methods lora adalora evorank sora toplora flatlora pissa \
+  --comparison_protocol controlled_fair \
+  --protocol_dropout 0.05 \
+  --module_preset default \
   --flatlora_rho 0.05 \
   --task_name rte \
   --model_name microsoft/deberta-v3-base \

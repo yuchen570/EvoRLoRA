@@ -11,9 +11,13 @@ mkdir -p logs runs artifacts
 # 2. no_complexity: 去掉 reward 中的复杂度正则
 # 3. zero_init: 扩张从 cold-start 零初始化开始
 # 4. no_ema: 关闭 EMA 平滑
-# 5. no_persist_cooldown: 关闭持久计数器与 cooldown
-# 6. no_reallocation: 去掉跨层重分配
-# 7. no_noop: 去掉 validation-side no-op safeguard
+# 5. no_persist_only: 仅关闭持久计数器门槛
+# 6. no_cooldown_only: 仅关闭 cooldown
+# 7. no_persist_cooldown: 同时关闭持久计数器与 cooldown（历史组合）
+# 8. no_reallocation: 去掉跨层重分配
+# 9. no_noop: 去掉 validation-side no-op safeguard
+# 10. es_budget_light: 搜索预算偏轻（更稀疏触发、更小候选）
+# 11. es_budget_heavy: 搜索预算偏重（更频繁触发、更大候选）
 #
 # 说明:
 # - 主脚本使用 DeBERTa-v3-base + GLUE 主线任务，与当前公平脚本保持同一训练协议。
@@ -70,8 +74,12 @@ run_case full 29600 --lambda_c 0.001
 run_case no_complexity 29601
 run_case zero_init 29602 --expand_init_mode zero
 run_case no_ema 29603 --evo_rho 0.0
-run_case no_persist_cooldown 29604 --evo_H_g 1 --evo_H_p 1 --evo_cooldown_steps 0
-run_case no_reallocation 29605 --no_evo_allow_reallocation
-run_case no_noop 29606 --no_evo_include_noop_candidate
+run_case no_persist_only 29604 --evo_H_g 1 --evo_H_p 1
+run_case no_cooldown_only 29605 --evo_cooldown_steps 0
+run_case no_persist_cooldown 29606 --evo_H_g 1 --evo_H_p 1 --evo_cooldown_steps 0
+run_case no_reallocation 29607 --no_evo_allow_reallocation
+run_case no_noop 29608 --no_evo_include_noop_candidate
+run_case es_budget_light 29609 --T_es 300 --lambda_pop 8 --mini_val_k 4
+run_case es_budget_heavy 29610 --T_es 100 --lambda_pop 32 --mini_val_k 16
 
 echo "All EvoRank main ablations completed."

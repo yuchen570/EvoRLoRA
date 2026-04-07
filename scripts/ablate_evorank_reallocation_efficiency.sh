@@ -12,7 +12,7 @@ mkdir -p logs runs artifacts
 #
 # 说明:
 # - 该脚本主要看效率，不与主精度消融混在一起。
-# - 选择 SST-2 做代表性任务，避免把大规模多任务长尾时间也引入这个效率对照。
+# - 选择 SST-2 做代表性任务；使用多 seed 估计均值/方差，避免单次偶然波动。
 
 COMMON_ARGS=(
   --methods evorank
@@ -43,7 +43,7 @@ COMMON_ARGS=(
   --evo_cooldown_steps 2
   --evo_allow_reallocation
   --evo_include_noop_candidate
-  --seed 42
+  --seed_list 0 42 100
   --verify_n_samples 0
   --output_dir artifacts
 )

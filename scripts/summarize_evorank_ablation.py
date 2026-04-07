@@ -11,9 +11,13 @@ ABLATION_ORDER = [
     "no_complexity",
     "zero_init",
     "no_ema",
+    "no_persist_only",
+    "no_cooldown_only",
     "no_persist_cooldown",
     "no_reallocation",
     "no_noop",
+    "es_budget_light",
+    "es_budget_heavy",
 ]
 
 TASK_ORDER = ["mnli", "sst2", "cola", "qqp", "qnli", "mrpc", "stsb"]
@@ -33,9 +37,13 @@ VARIANT_LABELS = {
     "no_complexity": "w/o Complexity Reward",
     "zero_init": "Zero Init",
     "no_ema": "w/o EMA",
+    "no_persist_only": "w/o Persistence Threshold",
+    "no_cooldown_only": "w/o Cooldown",
     "no_persist_cooldown": "w/o Persistence+Cooldown",
     "no_reallocation": "w/o Reallocation",
     "no_noop": "w/o No-op Candidate",
+    "es_budget_light": "ES Budget Light",
+    "es_budget_heavy": "ES Budget Heavy",
 }
 
 

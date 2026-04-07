@@ -7,6 +7,7 @@
 #     lora_alpha=32, target_modules=q_proj,k_proj,v_proj,out_proj,fc1,fc2,
 #     max_source_length=1024, max_target_length=160, warmup=3000 steps
 # EvoRank: --expand_init_mode gradient（仅 evorank 生效）
+# 协议: controlled_fair（统一 dropout=0.05；模块覆盖由脚本显式 target_modules 控制）
 # ============================================================================
 mkdir -p logs runs artifacts
 
@@ -16,7 +17,10 @@ nohup torchrun --nproc_per_node=2 --master_port=29520 \
   --task_type nlg \
   --nlg_dataset_name cnn_dailymail \
   --task_name cnn_dailymail \
-  --methods lora adalora evorank sora toplora flatlora \
+  --methods lora adalora evorank sora toplora flatlora pissa \
+  --comparison_protocol controlled_fair \
+  --protocol_dropout 0.05 \
+  --module_preset custom \
   --flatlora_rho 0.05 \
   --model_name facebook/bart-large \
   --target_rank 8 \

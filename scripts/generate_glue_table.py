@@ -55,8 +55,8 @@ def main():
                     if task not in data[method] or data[method][task].get("seed") != "mean":
                         data[method][task] = row
 
-    # 指定显示的方法顺序
-    methods_order = ["lora", "adalora", "evorank", "sora", "toplora"]
+    # 指定显示的方法顺序（覆盖当前公平脚本中的全方法集合）
+    methods_order = ["lora", "adalora", "evorank", "sora", "toplora", "flatlora", "pissa"]
     present_methods = []
     for m in methods_order:
         if m in data:

@@ -381,75 +381,82 @@ def setup_data_and_model(
 
         collator = DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt")
 
-        val_loader_eval_full: Optional[Union[DataLoader, Dict[str, DataLoader]]] = None
-        if ddp_enabled and world_size > 1:
-            train_sampler = DistributedSampler(
-                tokenized[train_split],
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=True,
-                seed=seed,
-                drop_last=False,
-            )
-            # 训练内 mini-val（EvoRank trial）保持每卡步数一致，使用 drop_last=True。
-            val_sampler = DistributedSampler(
-                tokenized[val_split],
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=False,
-                seed=seed,
-                drop_last=True,
-            )
-            # 评估指标使用不丢样本的分片验证集，后续 all_gather 聚合。
-            val_eval_sampler = _DistributedEvalSampler(
-                tokenized[val_split],
-                num_replicas=world_size,
-                rank=rank,
-            )
-            train_loader = DataLoader(
-                tokenized[train_split], batch_size=batch_size, sampler=train_sampler, collate_fn=collator
-            )
-            val_loader = DataLoader(
-                tokenized[val_split], batch_size=batch_size, sampler=val_sampler, collate_fn=collator
-            )
-            val_loader_eval = DataLoader(
-                tokenized[val_split], batch_size=batch_size, sampler=val_eval_sampler, collate_fn=collator
-            )
-            if task_name == "mnli":
-                val_m_sampler = _DistributedEvalSampler(
-                    tokenized["validation_matched"],
+        def _make_loaders_nlu(seed: int):
+            """根据给定 seed 重建 NLU DataLoader。
+            多 seed 实验中每个 seed 独立调用，确保 DistributedSampler 采样随机性相互独立。
+            """
+            _val_loader_eval_full: Optional[Union[DataLoader, Dict[str, DataLoader]]] = None
+            if ddp_enabled and world_size > 1:
+                _train_sampler = DistributedSampler(
+                    tokenized[train_split],
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=True,
+                    seed=seed,  # 每个 seed 独立，避免多 seed 实验共享同一 shuffle 顺序
+                    drop_last=False,
+                )
+                # 训练内 mini-val（EvoRank trial）保持每卡步数一致，使用 drop_last=True。
+                _val_sampler = DistributedSampler(
+                    tokenized[val_split],
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=False,
+                    seed=seed,
+                    drop_last=True,
+                )
+                # 评估指标使用不丢样本的分片验证集，后续 all_gather 聚合。
+                _val_eval_sampler = _DistributedEvalSampler(
+                    tokenized[val_split],
                     num_replicas=world_size,
                     rank=rank,
                 )
-                val_mm_sampler = _DistributedEvalSampler(
-                    tokenized["validation_mismatched"],
-                    num_replicas=world_size,
-                    rank=rank,
+                _train_loader = DataLoader(
+                    tokenized[train_split], batch_size=batch_size, sampler=_train_sampler, collate_fn=collator
                 )
-                val_m_loader = DataLoader(
-                    tokenized["validation_matched"],
-                    batch_size=batch_size,
-                    sampler=val_m_sampler,
-                    collate_fn=collator,
+                _val_loader = DataLoader(
+                    tokenized[val_split], batch_size=batch_size, sampler=_val_sampler, collate_fn=collator
                 )
-                val_mm_loader = DataLoader(
-                    tokenized["validation_mismatched"],
-                    batch_size=batch_size,
-                    sampler=val_mm_sampler,
-                    collate_fn=collator,
+                _val_loader_eval = DataLoader(
+                    tokenized[val_split], batch_size=batch_size, sampler=_val_eval_sampler, collate_fn=collator
                 )
-                val_loader_eval_full = {"matched": val_m_loader, "mismatched": val_mm_loader}
+                if task_name == "mnli":
+                    _val_m_sampler = _DistributedEvalSampler(
+                        tokenized["validation_matched"],
+                        num_replicas=world_size,
+                        rank=rank,
+                    )
+                    _val_mm_sampler = _DistributedEvalSampler(
+                        tokenized["validation_mismatched"],
+                        num_replicas=world_size,
+                        rank=rank,
+                    )
+                    _val_m_loader = DataLoader(
+                        tokenized["validation_matched"],
+                        batch_size=batch_size,
+                        sampler=_val_m_sampler,
+                        collate_fn=collator,
+                    )
+                    _val_mm_loader = DataLoader(
+                        tokenized["validation_mismatched"],
+                        batch_size=batch_size,
+                        sampler=_val_mm_sampler,
+                        collate_fn=collator,
+                    )
+                    _val_loader_eval_full = {"matched": _val_m_loader, "mismatched": _val_mm_loader}
+                else:
+                    _val_loader_eval_full = _val_loader_eval
             else:
-                val_loader_eval_full = val_loader_eval
-        else:
-            train_loader = DataLoader(tokenized[train_split], batch_size=batch_size, shuffle=True, collate_fn=collator)
-            val_loader = DataLoader(tokenized[val_split], batch_size=batch_size, shuffle=False, collate_fn=collator)
-            if task_name == "mnli":
-                val_m_loader = DataLoader(tokenized["validation_matched"], batch_size=batch_size, shuffle=False, collate_fn=collator)
-                val_mm_loader = DataLoader(tokenized["validation_mismatched"], batch_size=batch_size, shuffle=False, collate_fn=collator)
-                val_loader_eval_full = {"matched": val_m_loader, "mismatched": val_mm_loader}
-            else:
-                val_loader_eval_full = val_loader
+                _train_loader = DataLoader(tokenized[train_split], batch_size=batch_size, shuffle=True, collate_fn=collator)
+                _val_loader = DataLoader(tokenized[val_split], batch_size=batch_size, shuffle=False, collate_fn=collator)
+                if task_name == "mnli":
+                    _val_m_loader = DataLoader(tokenized["validation_matched"], batch_size=batch_size, shuffle=False, collate_fn=collator)
+                    _val_mm_loader = DataLoader(tokenized["validation_mismatched"], batch_size=batch_size, shuffle=False, collate_fn=collator)
+                    _val_loader_eval_full = {"matched": _val_m_loader, "mismatched": _val_mm_loader}
+                else:
+                    _val_loader_eval_full = _val_loader
+            return _train_loader, _val_loader, _val_loader_eval_full
+
+        train_loader, val_loader, val_loader_eval_full = _make_loaders_nlu(seed)
 
         if task_name == "stsb":
             base_model = AutoModelForSequenceClassification.from_pretrained(
@@ -492,7 +499,7 @@ def setup_data_and_model(
                 },
             )
             # endregion
-        return train_loader, val_loader, val_loader_eval_full, base_model, tokenizer
+        return train_loader, val_loader, val_loader_eval_full, base_model, tokenizer, _make_loaders_nlu
 
     if task_type == "nlg":
         if nlg_dataset_name == "cnn_dailymail":
@@ -528,44 +535,51 @@ def setup_data_and_model(
         collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, label_pad_token_id=-100)
         val_split_name = "validation"
 
-        if ddp_enabled and world_size > 1:
-            train_sampler = DistributedSampler(
-                tokenized["train"],
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=True,
-                seed=seed,
-                drop_last=False,
-            )
-            val_sampler = DistributedSampler(
-                tokenized[val_split_name],
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=False,
-                seed=seed,
-                drop_last=True,
-            )
-            val_eval_sampler = _DistributedEvalSampler(
-                tokenized[val_split_name],
-                num_replicas=world_size,
-                rank=rank,
-            )
-            train_loader = DataLoader(
-                tokenized["train"], batch_size=batch_size, sampler=train_sampler, collate_fn=collator
-            )
-            val_loader = DataLoader(
-                tokenized[val_split_name], batch_size=batch_size, sampler=val_sampler, collate_fn=collator
-            )
-            val_loader_eval_full = DataLoader(
-                tokenized[val_split_name], batch_size=batch_size, sampler=val_eval_sampler, collate_fn=collator
-            )
-        else:
-            train_loader = DataLoader(tokenized["train"], batch_size=batch_size, shuffle=True, collate_fn=collator)
-            val_loader = DataLoader(tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator)
-            val_loader_eval_full = None
+        def _make_loaders_nlg(seed: int):
+            """根据给定 seed 重建 NLG DataLoader。
+            多 seed 实验中每个 seed 独立调用，确保 DistributedSampler 采样随机性相互独立。
+            """
+            if ddp_enabled and world_size > 1:
+                _train_sampler = DistributedSampler(
+                    tokenized["train"],
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=True,
+                    seed=seed,  # 每个 seed 独立，避免多 seed 实验共享同一 shuffle 顺序
+                    drop_last=False,
+                )
+                _val_sampler = DistributedSampler(
+                    tokenized[val_split_name],
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=False,
+                    seed=seed,
+                    drop_last=True,
+                )
+                _val_eval_sampler = _DistributedEvalSampler(
+                    tokenized[val_split_name],
+                    num_replicas=world_size,
+                    rank=rank,
+                )
+                _train_loader = DataLoader(
+                    tokenized["train"], batch_size=batch_size, sampler=_train_sampler, collate_fn=collator
+                )
+                _val_loader = DataLoader(
+                    tokenized[val_split_name], batch_size=batch_size, sampler=_val_sampler, collate_fn=collator
+                )
+                _val_loader_eval_full = DataLoader(
+                    tokenized[val_split_name], batch_size=batch_size, sampler=_val_eval_sampler, collate_fn=collator
+                )
+            else:
+                _train_loader = DataLoader(tokenized["train"], batch_size=batch_size, shuffle=True, collate_fn=collator)
+                _val_loader = DataLoader(tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator)
+                _val_loader_eval_full = None
+            return _train_loader, _val_loader, _val_loader_eval_full
+
+        train_loader, val_loader, val_loader_eval_full = _make_loaders_nlg(seed)
 
         base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, cache_dir=model_cache_dir)
-        return train_loader, val_loader, val_loader_eval_full, base_model, tokenizer
+        return train_loader, val_loader, val_loader_eval_full, base_model, tokenizer, _make_loaders_nlg
 
     raise ValueError(f"未知 task_type: {task_type}")
 
@@ -587,6 +601,9 @@ def peft_factory(
     nlu_regression: bool = False,
     lora_alpha: Optional[float] = None,
     target_modules_override: Optional[str] = None,
+    module_preset: str = "default",
+    comparison_protocol: str = "none",
+    protocol_dropout: float = 0.05,
     evorank_r_max: int = 16,
     evorank_alpha_u: float = 1.0,
     evorank_beta_u: float = 1.0,
@@ -637,9 +654,24 @@ def peft_factory(
 
     model_type = getattr(getattr(model, "config", None), "model_type", "").lower()
 
-    # --target_modules 优先；否则按方法+模型类型选择默认协议
+    # --target_modules 优先；否则按 module_preset / 模型类型自动选择默认协议
     if target_modules_override:
         target_modules = [m.strip() for m in target_modules_override.split(",") if m.strip()]
+    elif module_preset == "all_linear":
+        target_modules = _collect_all_linear_target_modules(model)
+    elif module_preset == "attn_only":
+        if "deberta" in model_type:
+            target_modules = ["query_proj", "key_proj", "value_proj"]
+        elif "roberta" in model_type or "bert" in model_type:
+            target_modules = ["query", "key", "value"]
+        elif "bart" in model_type:
+            target_modules = ["q_proj", "k_proj", "v_proj", "out_proj"]
+        elif "llama" in model_type or "mistral" in model_type:
+            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        elif "t5" in model_type:
+            target_modules = ["q", "k", "v", "o"]
+        else:
+            target_modules = ["query", "key", "value"]
     else:
         target_modules = _default_target_modules(method_name, model_type)
 
@@ -657,6 +689,7 @@ def peft_factory(
         peft_task_type = TaskType.SEQ_CLS
 
     controller: Optional[RankEvolutionController] = None
+    effective_dropout_val: Optional[float] = None
 
     if task_type == "nlu":
         modules_to_save = ["classifier", "score", "pooler"]
@@ -668,11 +701,15 @@ def peft_factory(
     else:
         modules_to_save = None
 
-    if method_name in ("lora", "flatlora"):
+    if method_name in ("lora", "flatlora", "pissa"):
         # DeBERTa：LoRA 梯度幅度随层内激活范数放大，易出现早期数值爆炸（见 huggingface/peft#3073 等讨论）。
         # RSLoRA（alpha/sqrt(r)）可显著缓和该问题；与 AdaLoRA/其他方法对比时仅影响标准 lora 分支。
+        # PiSSA：PEFT 原生 SVD 主成分初始化 + 残差基座冻结，训练循环与标准 LoRA 相同（仅对 pissa 设置 init_lora_weights）。
         _lora_dropout = 0.0 if "deberta" in model_type else 0.1
-        config = LoraConfig(
+        if comparison_protocol == "controlled_fair":
+            _lora_dropout = float(protocol_dropout)
+        effective_dropout_val = float(_lora_dropout)
+        _lora_kw: Dict[str, Any] = dict(
             task_type=peft_task_type,
             r=target_rank,
             lora_alpha=effective_alpha,
@@ -683,6 +720,9 @@ def peft_factory(
             # RSLoRA 与极小 warmup lr 下的 Adam 首步曾在日志中与 classifier 范数发散同时出现；标准缩放先保证稳定。
             use_rslora=False,
         )
+        if method_name == "pissa":
+            _lora_kw["init_lora_weights"] = "pissa"
+        config = LoraConfig(**_lora_kw)
         model = get_peft_model(model, config)
 
     elif method_name == "adalora":
@@ -705,12 +745,17 @@ def peft_factory(
         if init_r_val < target_rank:
             raise ValueError("adalora_init_r 应 >= target_rank（target_r）")
 
+        # 与 LoRA/PiSSA 保持一致：DeBERTa 上 dropout=0.0，其他模型 dropout=0.1
+        _adalora_dropout = 0.0 if "deberta" in model_type else 0.1
+        if comparison_protocol == "controlled_fair":
+            _adalora_dropout = float(protocol_dropout)
+        effective_dropout_val = float(_adalora_dropout)
         adalora_kw: Dict[str, Any] = dict(
             task_type=peft_task_type,
             init_r=init_r_val,
             target_r=target_rank,
             lora_alpha=effective_alpha,
-            lora_dropout=0.1,
+            lora_dropout=_adalora_dropout,
             target_modules=target_modules,
             modules_to_save=modules_to_save,
             bias="none",
@@ -771,24 +816,33 @@ def peft_factory(
                 param.requires_grad = True
 
     elif method_name == "sora":
+        # 与 LoRA/PiSSA 保持一致：DeBERTa 上 dropout=0.0，其他模型 dropout=0.1
+        _sora_dropout = 0.0 if "deberta" in model_type else 0.1
+        if comparison_protocol == "controlled_fair":
+            _sora_dropout = float(protocol_dropout)
+        effective_dropout_val = float(_sora_dropout)
         inject_sora(
             model=model,
             target_modules=target_modules,
             r=target_rank,
             lora_alpha=effective_alpha,
-            lora_dropout=0.1,
+            lora_dropout=_sora_dropout,
         )
 
     elif method_name == "toplora":
         # TopLoRA (NeurIPS 2025): token-wise singular value scaling on LoRA
         # 与 SoRA 同构注入模式，秩固定，不支持 merge
+        _toplora_dropout = float(toplora_dropout)
+        if comparison_protocol == "controlled_fair":
+            _toplora_dropout = float(protocol_dropout)
         inject_toplora(
             model=model,
             target_modules=target_modules,
             r=target_rank,
             lora_alpha=effective_alpha,
-            lora_dropout=toplora_dropout,
+            lora_dropout=_toplora_dropout,
         )
+        effective_dropout_val = float(_toplora_dropout)
 
     else:
         raise ValueError(f"未知 method_name: {method_name}")
@@ -796,7 +850,21 @@ def peft_factory(
     wrapped_model = DictFeatureClassifier(model)
 
     trainable_params = count_trainable_params(wrapped_model)
-    meta = {"trainable_params": trainable_params, "target_modules": list(target_modules)}
+
+    # TopLoRA 每层额外引入 W_λ (d_in × r) 参数，同 rank 下参数量高于 LoRA/PiSSA。
+    # 单独统计并写入 meta，便于 CSV 中披露容量差异（公平对比必须项）。
+    extra_params = 0
+    if method_name == "toplora":
+        for _, m in wrapped_model.named_modules():
+            if type(m).__name__ == "TopLoRALinear":
+                extra_params += m.lora_lambda.weight.numel()
+
+    meta = {
+        "trainable_params": trainable_params,
+        "extra_params": extra_params,  # TopLoRA 专属额外参数量（其他方法为 0）
+        "target_modules": list(target_modules),
+        "effective_dropout": effective_dropout_val,
+    }
     return wrapped_model, controller, meta
 
 
@@ -973,7 +1041,7 @@ def _print_rank_distribution(
     extra_str = f" [{summary['extra_string']}]" if "extra_string" in summary else ""
     print(f"[{method_name}] === Rank Distribution (epoch={epoch}/{epochs}){extra_str} ===")
     
-    if method_name not in ("lora", "toplora"):
+    if method_name not in ("lora", "toplora", "pissa", "flatlora"):
         base_rank = summary.get("base_rank", -1)
         omitted = 0
         for layer_name, eff_r in per_layer.items():
@@ -1096,7 +1164,7 @@ def _save_final_artifact(
         meta["task_name"] = task_name
     with open(os.path.join(final_dir, "training_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
-    if method_name in ["lora", "adalora"] and hasattr(inner, "save_pretrained"):
+    if method_name in ["lora", "adalora", "pissa"] and hasattr(inner, "save_pretrained"):
         inner.save_pretrained(final_dir)
     elif method_name == "toplora":
         # TopLoRA 手动注入，仅保存微调权重
@@ -1286,15 +1354,15 @@ def run_training_loop(
         
         # 标准 LoRA / AdaLoRA / EvoRank：适配器矩阵通常不做 weight_decay（与常见 PEFT 复现一致），
         # 否则在 GLUE 等小数据、较高 lr 下易出现数值爆炸（logits/loss NaN）。
-        dynamic_wd_peft = 0.0 if method_name in ("lora", "adalora", "evorank", "toplora") else weight_decay
+        dynamic_wd_peft = 0.0 if method_name in ("lora", "adalora", "evorank", "toplora", "pissa") else weight_decay
         # 分类头必须保留 weight_decay 防止权重爆炸
         # LoRA A/B 的 wd=0 是为了保护基础权重补偿，但分类头没有这个约束。
         _head_wd = weight_decay
-        _adam_wd = 0.0 if method_name in ("lora", "adalora", "evorank", "toplora") else weight_decay
+        _adam_wd = 0.0 if method_name in ("lora", "adalora", "evorank", "toplora", "pissa") else weight_decay
 
         # fp16 参数（如 DeBERTa classifier）在 eps=1e-8 时易在首步触发分母下溢并数值爆炸；
         # evorank 同样训练 fp16 头 + 适配器，与 lora/adalora 统一 eps。
-        _adam_eps = 1e-6 if method_name in ("lora", "adalora", "evorank", "toplora") else 1e-8
+        _adam_eps = 1e-6 if method_name in ("lora", "adalora", "evorank", "toplora", "pissa") else 1e-8
         optimizer = AdamW(
             [
                 {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
@@ -1304,7 +1372,21 @@ def run_training_loop(
             eps=_adam_eps,
         )
         sparse_optimizer = None
-    if is_main_process and method_name in {"lora", "evorank"} and task_name in {"cola", "rte"}:
+    if is_main_process and method_name in {"lora", "evorank", "pissa", "adalora", "sora", "toplora"} and task_name in {"cola", "rte"}:
+        if method_name == "sora":
+            _dbg_peft_params_cnt = int(sum(
+                p.numel()
+                for n, p in model.named_parameters()
+                if p.requires_grad and not n.endswith(".gate") and not any(k in n for k in _head_keys)
+            ))
+            _dbg_head_params_cnt = int(sum(
+                p.numel()
+                for n, p in model.named_parameters()
+                if p.requires_grad and not n.endswith(".gate") and any(k in n for k in _head_keys)
+            ))
+        else:
+            _dbg_peft_params_cnt = int(sum(p.numel() for p in _peft_params))
+            _dbg_head_params_cnt = int(sum(p.numel() for p in _head_params))
         # region agent log
         _debug_log(
             run_id=f"{task_name}-{method_name}-seed{random_seed}-opt",
@@ -1314,8 +1396,8 @@ def run_training_loop(
             data={
                 "task": task_name,
                 "method": method_name,
-                "peft_params": int(sum(p.numel() for p in _peft_params)) if method_name != "sora" else int(sum(p.numel() for p in _non_gate_peft)),
-                "head_params": int(sum(p.numel() for p in _head_params)) if method_name != "sora" else int(sum(p.numel() for p in _non_gate_head)),
+                "peft_params": _dbg_peft_params_cnt,
+                "head_params": _dbg_head_params_cnt,
                 "trainable_params_total": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
                 "lr": float(lr),
                 "head_lr": float(head_lr_val),
@@ -1364,7 +1446,7 @@ def run_training_loop(
         sora_schedule_stage_steps = max(1, math.ceil(total_train_steps / int(sora_lambda_num)))
     debug_steps = {0, min(99, max(total_train_steps - 1, 0)), max(total_train_steps - 1, 0)}
     # LoRA+GLUE：在已知易发散区间逐步打点，便于确认首个 NaN 出现在哪一步（不仅依赖硬编码的 99）。
-    lora_glue_step_trace = method_name in {"lora", "evorank"} and task_name in {"cola", "rte"}
+    lora_glue_step_trace = method_name in {"lora", "evorank", "pissa"} and task_name in {"cola", "rte"}
     lora_glue_early_steps = frozenset({1, 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 39})
     if lr_scheduler_type == "linear":
         lr_lambda_fn = _linear_warmup_decay_lr_lambda(warmup_steps, total_train_steps)
@@ -1532,7 +1614,7 @@ def run_training_loop(
                         grad_norm_total = float(_gn.detach().item()) if isinstance(_gn, torch.Tensor) else float(_gn)
                     if (
                         is_main_process
-                        and method_name in {"lora", "evorank"}
+                        and method_name in {"lora", "evorank", "pissa"}
                         and task_name in {"cola", "rte"}
                         and (
                             global_step in debug_steps
@@ -1606,7 +1688,7 @@ def run_training_loop(
                     optimizer.step()
                     if (
                         is_main_process
-                        and method_name in {"lora", "evorank"}
+                        and method_name in {"lora", "evorank", "pissa"}
                         and task_name in {"cola", "rte"}
                         and global_step == 0
                     ):
@@ -1768,7 +1850,7 @@ def run_training_loop(
                         best_val_metrics = metrics_dict_val
                     elif val_metric == best_val_acc and not best_val_metrics:
                         best_val_metrics = metrics_dict_val
-                    if method_name in {"lora", "evorank"} and task_name in {"cola", "rte"} and epoch in {0, epochs - 1}:
+                    if method_name in {"lora", "evorank", "pissa"} and task_name in {"cola", "rte"} and epoch in {0, epochs - 1}:
                         pred_list = [int(x) for x in y_pred_main]
                         true_list = [int(x) for x in y_true_main]
                         pred_dist = {str(k): int(sum(1 for x in pred_list if x == k)) for k in sorted(set(pred_list))}
@@ -1800,7 +1882,7 @@ def run_training_loop(
                         target_rank=int(next(
                             (p.size(0) for n, p in _unwrap_for_save(model).named_parameters()
                              if "lora_A" in n and p.numel() > 0), 8
-                        )) if method_name == "lora" else 8,
+                        )) if method_name in ("lora", "pissa", "flatlora") else 8,
                     )
                     _print_rank_distribution(rank_info, method_name, epoch + 1, epochs)
                     if writer is not None:
@@ -1893,7 +1975,7 @@ def run_training_loop(
                         target_rank=int(next(
                             (p.size(0) for n, p in _unwrap_for_save(model).named_parameters()
                              if "lora_A" in n and p.numel() > 0), 8
-                        )) if method_name == "lora" else 8,
+                        )) if method_name in ("lora", "pissa", "flatlora") else 8,
                     )
                     _print_rank_distribution(rank_info, method_name, epoch + 1, epochs)
                     if writer is not None:
@@ -2039,6 +2121,7 @@ def run_training_loop(
 
     result = {
         "method": method_name,
+        "optimizer_type": "AdamW+SparseAdamW" if method_name == "sora" else "AdamW",
         "total_train_time_sec": total_time,
         "peak_memory_mb": peak_mem_mb,
         "avg_active_rank": final_avg_active_rank,
@@ -2083,8 +2166,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_cache_dir", type=str, default="datasets", help="数据集缓存目录（建议仓库内相对路径）")
     parser.add_argument("--model_cache_dir", type=str, default="models", help="模型缓存目录（建议仓库内相对路径）")
     parser.add_argument("--model_name", type=str, default="roberta-base")
-    parser.add_argument("--methods", nargs="+", default=["lora", "adalora", "evorank", "sora", "flatlora"])
-    parser.add_argument("--flatlora_rho", type=float, default=0.05, help="Flat-LoRA 扰动方差/强度参数 (默认: 0.05)")
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        default=["lora", "adalora", "evorank", "sora", "flatlora", "pissa"],
+        help="对比方法：含 lora / adalora / evorank / sora / flatlora / toplora / pissa（PEFT PiSSA 初始化）。",
+    )
+    parser.add_argument("--flatlora_rho", type=float, default=0.05, help="Flat-LoRA 扰动强度参数，对应论文中的 sigma（σ），推荐默认值 0.05")
     parser.add_argument("--target_rank", type=int, default=8)
     parser.add_argument(
         "--lora_alpha",
@@ -2098,7 +2186,27 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="逗号分隔的注入模块后缀列表，如 'query,key,value,intermediate'。"
-             "未指定时按方法+模型类型自动选择默认协议：LoRA 走较窄默认，AdaLoRA/SoRA 走论文主线宽注入。",
+             "未指定时按 --module_preset 与模型类型自动选择默认协议。",
+    )
+    parser.add_argument(
+        "--module_preset",
+        type=str,
+        default="default",
+        choices=["default", "attn_only", "all_linear", "custom"],
+        help="全局模块预设。default=按模型默认；attn_only=仅注意力投影；all_linear=除分类头外全部线性层；custom=配合 --target_modules 使用。",
+    )
+    parser.add_argument(
+        "--comparison_protocol",
+        type=str,
+        default="none",
+        choices=["none", "controlled_fair", "author_defaults"],
+        help="对比协议。controlled_fair=严格控制变量；author_defaults=按论文推荐超参；none=保持当前脚本显式参数。",
+    )
+    parser.add_argument(
+        "--protocol_dropout",
+        type=float,
+        default=0.05,
+        help="comparison_protocol=controlled_fair 时统一的 adapter dropout（推荐 0.05）。",
     )
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -2238,7 +2346,10 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="训练结束后主进程从验证集打印前 K 条 [Gold] vs [Pred]（NLU）或一条生成摘要片段（NLG）；0 关闭",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.module_preset == "custom" and not args.target_modules:
+        raise ValueError("module_preset=custom 时必须同时提供 --target_modules")
+    return args
 
 
 def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
@@ -2259,8 +2370,10 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
     for task_name in tasks:
         for model_name in models:
-            # 数据加载在种子循环外（数据集与种子无关，避免重复下载/tokenize）
-            train_loader, val_loader, val_loader_eval_full, base_model, tokenizer = setup_data_and_model(
+            # 数据集 tokenize 在种子循环外（避免重复下载/tokenize），
+            # 但 DataLoader（含 DistributedSampler seed）在每个 seed 内重建，
+            # 保证多 seed 实验的采样随机性相互独立。
+            train_loader, val_loader, val_loader_eval_full, base_model, tokenizer, make_loaders = setup_data_and_model(
                 task_name=task_name,
                 model_name=model_name,
                 batch_size=args.batch_size,
@@ -2296,6 +2409,10 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     if torch.cuda.is_available():
                         torch.cuda.manual_seed_all(seed)
 
+                    # 每个 seed 重建 DataLoader，确保 DistributedSampler 使用当前 seed
+                    # 而非固定的 seeds[0]，保证多 seed 实验采样随机性相互独立。
+                    train_loader, val_loader, val_loader_eval_full = make_loaders(seed)
+
                     method_model = copy.deepcopy(base_model)
                     method_model, controller, meta = peft_factory(
                         model=method_model,
@@ -2314,6 +2431,9 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         nlu_regression=nlu_is_glue_regression(task_name),
                         lora_alpha=args.lora_alpha,
                         target_modules_override=args.target_modules,
+                        module_preset=args.module_preset,
+                        comparison_protocol=args.comparison_protocol,
+                        protocol_dropout=args.protocol_dropout,
                         evorank_r_max=args.evorank_r_max,
                         evorank_alpha_u=args.evo_alpha_u,
                         evorank_beta_u=args.evo_beta_u,
@@ -2386,7 +2506,15 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         {
                             "task": task_name,
                             "backbone": model_name,
+                            "target_rank": args.target_rank,
                             "trainable_params": meta["trainable_params"],
+                            "extra_params": meta.get("extra_params", 0),
+                            "target_modules": ",".join(meta.get("target_modules", [])),
+                            "effective_dropout": (
+                                meta.get("effective_dropout", "")
+                                if meta.get("effective_dropout", None) is not None
+                                else ""
+                            ),
                             "seed": seed,
                         }
                     )
@@ -2438,7 +2566,12 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "method",
                     "seed",
                     "val_metric_key",
+                    "target_rank",
                     "trainable_params",
+                    "extra_params",
+                    "target_modules",
+                    "effective_dropout",
+                    "optimizer_type",
                     "matthews_corrcoef",
                     "accuracy",
                     "accuracy_m",
