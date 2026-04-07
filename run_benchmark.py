@@ -1258,16 +1258,19 @@ def run_training_loop(
             find_unused_parameters=True,
         )
     # 默认与适配器同 lr；显式提高分类头速率请传 --head_lr（原先 max(lr,5e-4) 易使 pooler/classifier 相对 LoRA 过快更新）。
-    # 默认与适配器同 lr；显式提高分类头速率请传 --head_lr（原先 max(lr,5e-4) 易使 pooler/classifier 相对 LoRA 过快更新）。
-    # 对于 DeBERTa 系列模型，分类头对高学习率极度敏感，若未指定则兜底使用 1e-4。
+    # 对于 DeBERTa 系列模型，分类头对高学习率极度敏感，且由于 DDP 可能导致属性检测失效。
     if head_lr is not None:
         head_lr_val = head_lr
     else:
-        m_type = getattr(getattr(model, "config", None), "model_type", "").lower()
+        # DDP 模式下实际模型位于 .module 属性中
+        inner_m = getattr(model, "module", model)
+        m_type = getattr(getattr(inner_m, "config", None), "model_type", "").lower()
         if "deberta" in m_type and task_type == "nlu":
-            head_lr_val = min(lr, 1e-4)
+            # RTE 任务特别小且容易坍缩，默认使用更保守的 5e-5
+            head_lr_val = min(lr, 5e-5) if task_name == "rte" else min(lr, 1e-4)
         else:
             head_lr_val = lr
+
 
 
     if method_name == "sora":
@@ -1550,6 +1553,7 @@ def run_training_loop(
                             (-(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1).mean()).item()
                         )
                     head_weight_norm = float("nan")
+                    head_grad_norm = float("nan")
                     for n, p in model.named_parameters():
                         if (
                             p.requires_grad
@@ -1557,12 +1561,15 @@ def run_training_loop(
                             and n.endswith(".weight")
                         ):
                             head_weight_norm = float(p.detach().float().norm().item())
+                            if p.grad is not None:
+                                head_grad_norm = float(p.grad.detach().float().norm().item())
                             break
                     rec = {
                         "step": float(global_step),
                         "train_loss": float(loss.detach().item()),
                         "logit_entropy": logit_entropy,
                         "head_weight_norm": head_weight_norm,
+                        "head_grad_norm": head_grad_norm,
                     }
                     if global_step < 200:
                         lora_ga_health_records.append(rec)
@@ -1580,6 +1587,7 @@ def run_training_loop(
                         print(
                             f"[lora-ga][health] step={global_step} train_loss={rec['train_loss']:.6f} "
                             f"logit_entropy={rec['logit_entropy']:.6f} head_weight_norm={rec['head_weight_norm']:.6f} "
+                            f"head_grad_norm={rec['head_grad_norm']:.6f} "
                             f"lr_peft={_opt_lr_peft:.2e} wd_peft={_opt_wd_peft:.4f} "
                             f"lr_head={_opt_lr_head:.2e} wd_head={_opt_wd_head:.4f}"
                         )

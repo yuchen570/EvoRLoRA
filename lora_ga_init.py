@@ -215,14 +215,24 @@ def apply_lora_ga_init_to_peft(peft_model, init_by_key, target_device):
             # 防止 base_weight -= offset 后权重被严重扭曲导致训练爆炸。
             w_abs_max = base_weight.data.float().abs().max()
             o_abs_max = offset.abs().max()
+            
+            # [监控] 计算范数比例，帮助观察初始化强度
+            w_norm = base_weight.data.float().norm().item()
+            o_norm = offset.norm().item()
+            ratio_norm = o_norm / max(w_norm, 1e-12)
+            if ratio_norm > 0.1:  # 如果补偿分量超过原始权重的 10%，记录警告
+                print(f"[warning] LoRA-GA: layer={key} offset_norm/weight_norm={ratio_norm:.4f} 较大，可能破坏预训练特征。")
+
             if o_abs_max > 0 and w_abs_max / o_abs_max < 1.0:
                 ratio = (w_abs_max / o_abs_max).item()
+                print(f"[info] LoRA-GA: layer={key} clipping offset by ratio={ratio:.4f}")
                 offset *= ratio
                 sqrt_ratio = math.sqrt(ratio)
                 la.weight.data.mul_(sqrt_ratio)
                 lb.weight.data.mul_(sqrt_ratio)
 
             base_weight.data.sub_(offset.to(dtype=base_weight.dtype))
+
             
         applied += 1
     if applied == 0:
