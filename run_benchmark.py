@@ -1240,7 +1240,7 @@ def run_training_loop(
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         if not torch.cuda.is_available():
             raise RuntimeError("DDP 目前仅支持 CUDA，但未检测到 CUDA")
-        # 关键：每个进程必须绑定到自己的 local GPU，避免 NCCL Duplicate GPU
+        # 关键：每个进程必须绑定 to 自己的 local GPU，避免 NCCL Duplicate GPU
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
     else:
@@ -1254,7 +1254,6 @@ def run_training_loop(
     if method_name == "lora-ga":
         pass
 
-
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         model = DDP(
             model,
@@ -1262,24 +1261,39 @@ def run_training_loop(
             output_device=local_rank,
             find_unused_parameters=True,
         )
-    # 默认与适配器同 lr；显式提高分类头速率请传 --head_lr（原先 max(lr,5e-4) 易使 pooler/classifier 相对 LoRA 过快更新）。
+
+    # --- [Phase 8] 分类头学习率解耦与深度解包 ---
+    # 默认与适配器同 lr；显式提高分类头速率请传 --head_lr。
     # 对于 DeBERTa 系列模型，分类头对高学习率极度敏感，且由于 DDP 可能导致属性检测失效。
-    inner_m = getattr(model, "module", model)
-    m_config = getattr(inner_m, "config", None)
+    _m = getattr(model, "module", model)
+    # 深度解包：DDP -> DictFeatureClassifier -> PeftModel -> BaseModel
+    if hasattr(_m, "inner"): 
+        _m = _m.inner
+    if hasattr(_m, "base_model") and hasattr(_m.base_model, "model"):
+        _m = _m.base_model.model
+    
+    m_config = getattr(_m, "config", None)
     m_type = getattr(m_config, "model_type", "").lower() if m_config else "unknown"
     
     if head_lr is not None:
         head_lr_val = head_lr
     else:
-        if "deberta" in m_type and task_type == "nlu":
-            # RTE 任务特别小且容易坍缩，默认使用更保守的 5e-5
-            head_lr_val = min(lr, 5e-5) if task_name == "rte" else min(lr, 1e-4)
+        # 安全网：即使检测失败，如果是 RTE 任务且未显式指定 head_lr，仍使用保守值
+        if ("deberta" in m_type or "unknown" == m_type) and task_type == "nlu" and task_name == "rte":
+            head_lr_val = min(lr, 5e-5)
+        elif "deberta" in m_type and task_type == "nlu":
+            head_lr_val = min(lr, 1e-4)
         else:
             head_lr_val = lr
     
     if is_main_process:
         print(f"[debug] Optimizer setup: model_type={m_type}, task_type={task_type}, task_name={task_name}, base_lr={lr:.2e}, head_lr_val={head_lr_val:.2e}")
-        print(f"[debug] Classifier/Head parameter paths: {[n for n, p in model.named_parameters() if any(k in n for k in ['classifier', 'score', 'lm_head', 'shared', 'pooler'])]}")
+        # 获取分类头参数名，确保我们找对了
+        _head_params_names = [n for n, p in model.named_parameters() if any(k in n for k in ['classifier', 'score', 'lm_head', 'shared', 'pooler'])]
+        print(f"[debug] Classifier/Head parameter paths: {_head_params_names}")
+
+
+
 
 
 
@@ -1565,7 +1579,6 @@ def run_training_loop(
                             (-(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1).mean()).item()
                         )
                     head_weight_norm = float("nan")
-                    head_grad_norm = float("nan")
                     for n, p in model.named_parameters():
                         if (
                             p.requires_grad
@@ -1573,24 +1586,46 @@ def run_training_loop(
                             and n.endswith(".weight")
                         ):
                             head_weight_norm = float(p.detach().float().norm().item())
-                            if p.grad is not None:
-                                head_grad_norm = float(p.grad.detach().float().norm().item())
                             break
+                    
+                    # 预创建记录字典，梯度范数稍后填入
                     rec = {
                         "step": float(global_step),
                         "train_loss": float(loss.detach().item()),
                         "logit_entropy": logit_entropy,
                         "head_weight_norm": head_weight_norm,
-                        "head_grad_norm": head_grad_norm,
+                        "head_grad_norm": float("nan"),
                     }
+                
+                loss.backward()
+
+                # [Phase 8] 在 backward 之后提取梯度范数
+                if method_name == "lora-ga":
+                    _h_gn = 0.0
+                    _found_grad = False
+                    for n, p in model.named_parameters():
+                        if (
+                            p.requires_grad 
+                            and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])
+                            and p.grad is not None
+                        ):
+                            _h_gn += p.grad.detach().float().norm().item() ** 2
+                            _found_grad = True
+                    if _found_grad:
+                        rec["head_grad_norm"] = _h_gn ** 0.5
+                    
                     if global_step < 200:
                         lora_ga_health_records.append(rec)
+                    
                     if writer is not None:
                         writer.add_scalar("lora_ga_health/train_loss", rec["train_loss"], global_step)
                         if not math.isnan(rec["logit_entropy"]):
                             writer.add_scalar("lora_ga_health/logit_entropy", rec["logit_entropy"], global_step)
                         if not math.isnan(rec["head_weight_norm"]):
                             writer.add_scalar("lora_ga_health/head_weight_norm", rec["head_weight_norm"], global_step)
+                        if not math.isnan(rec["head_grad_norm"]):
+                            writer.add_scalar("lora_ga_health/head_grad_norm", rec["head_grad_norm"], global_step)
+
                     if is_main_process and (global_step % 50 == 0 or global_step < 5):
                         _opt_lr_peft = float(optimizer.param_groups[0]["lr"])
                         _opt_wd_peft = float(optimizer.param_groups[0].get("weight_decay", 0.0))
@@ -1603,20 +1638,7 @@ def run_training_loop(
                             f"lr_peft={_opt_lr_peft:.2e} wd_peft={_opt_wd_peft:.4f} "
                             f"lr_head={_opt_lr_head:.2e} wd_head={_opt_wd_head:.4f}"
                         )
-                        _debug_log(
-                            run_id=f"{task_name}-{method_name}-seed{random_seed}-health",
-                            hypothesis_id="H-LG",
-                            location="run_benchmark.py:lora_ga_health",
-                            message="early_training_health",
-                            data={
-                                "task": task_name,
-                                "global_step": int(global_step),
-                                "train_loss": rec["train_loss"],
-                                "logit_entropy": rec["logit_entropy"],
-                                "head_weight_norm": rec["head_weight_norm"],
-                            },
-                        )
-                loss.backward()
+
                 grad_norm_total: Optional[float] = None
                 if max_grad_norm is not None and max_grad_norm > 0:
                     _gn = torch.nn.utils.clip_grad_norm_(
