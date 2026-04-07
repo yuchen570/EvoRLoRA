@@ -1998,6 +1998,8 @@ def run_training_loop(
         return float(sum(vals) / len(vals))
 
     evorank_es_events = len(evorank_es_records)
+    evorank_delta_val_loss_mean = _mean_numeric(evorank_es_records, "delta_val_loss")
+    evorank_delta_complexity_mean = _mean_numeric(evorank_es_records, "delta_complexity")
 
     result = {
         "method": method_name,
@@ -2011,7 +2013,6 @@ def run_training_loop(
         "val_metric_key": val_metric_key_str,
         "evorank_es_events": evorank_es_events if method_name == "evorank" else "",
         "evorank_avg_delta_val_loss": evorank_delta_val_loss_mean if method_name == "evorank" else "",
-        "evorank_avg_delta_complexity": evorank_delta_complexity_mean if method_name == "evorank" else "",
         "evorank_avg_delta_complexity": evorank_delta_complexity_mean if method_name == "evorank" else "",
         
         "matthews_corrcoef": best_val_metrics.get("matthews_corrcoef", "") if task_type == "nlu" else "",
