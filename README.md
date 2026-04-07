@@ -15,6 +15,7 @@
 | `adalora` | HuggingFace PEFT AdaLoRA（含 RankAllocator 步后 `update_and_allocate`；正交正则因本脚本只取 logits 在外部 CE 上显式加入，系数 `--adalora_orth_reg_weight`，默认 0.1 与论文脚本 `reg_orth_coef` 常见设置一致；可调 `--adalora_init_r` / `--adalora_tinit` / `--adalora_tfinal` / `--adalora_delta_t`） |
 | `evorank` | 本仓库 EvoRank-LoRA；扩张初始化见 `--expand_init_mode`（`zero` / `gradient`，后者对应论文 Proposition 3.2） |
 | `sora` | 带 `gate` 的稀疏低秩旁路；训练时需在主损失上加 L1（脚本已用 `--sora_sparse_lambda`，可选 `--sora_lambda_warmup_steps` / `--sora_lambda_schedule`） |
+| `flatlora` | Flat-LoRA (ICML 2025)：基于过滤方向二范数的贝叶斯期望高斯噪声注入；通过 Hook 实现在微批次内实时扰动，支持 DDP 同步；默认扰动强度 `--flatlora_rho 0.05` |
 | `toplora` | TopLoRA (NeurIPS 2025)：引入 token-wise 奇异值缩放 (TopSingularValue)；秩固定；不支持 merge；默认使用 `--toplora_dropout 0.05` |
 | `mtl-lora` | 未实现：需联合多任务与 task id，与当前 `--task_list` 串行协议不对齐 |
 
@@ -24,6 +25,7 @@
 - **AdaLoRA**：主要在 GLUE（如选用 DeBERTaV3-base）与一些特定的生成式任务（如 XSum、SQuADv2，选用 BART-large 或 DeBERTaV3）上进行了验证。**参数特点**：初始探测秩 `lora_r` 往往设为目标保留秩 `target_rank` 的 1.5 倍或数倍，正交正则化系数 `reg_orth_coef=0.1`，并采用基于指数移动平均(EMA)的预热调度（`init_warmup`, `final_warmup`, `mask_interval`）。
 - **SoRA**：在 GLUE 上将自身与基础模型的全参数微调 (Full Fine-Tune)、Adapter 以及 BitFit 进行了详尽的基准对比。**参数特点**：在 Loss 上增加了带阈值的稀疏正则化惩罚，核心参数为 `sparse_lambda`（对应论文中的 $\eta_t$）、`sparse_lambda_2`（对应 $\xi$），初始最大探测秩 `lora_r`（$r_{max}$），以及动态稀疏退火策略如 `linear` 并附带相应的更新步数设定（`lambda_num`）。
 - **TopLoRA (NeurIPS 2025)**：提出 token-wise 的输入输出投影，通过 λ(x) = exp(RMSNorm(x @ W_λ)) 实现逐 token 的奇异值缩放。**参数特点**：秩固定，额外引入 `d_in * r` 的参数量。默认 dropout 0.05。
+- **Flat-LoRA (ICML 2025)**：针对 LoRA 容易陷入尖锐极小值导致泛化能力下降的问题，提出基于参数矩阵行方向范数缩放的贝叶斯正则化。**参数特点**：主要引入扰动强度参数 `rho` (对应脚本 `--flatlora_rho`，原始文献建议默认 0.05)。本仓库在实现上进行了大幅加固，采用 Hook + CPU 缓存实时重演的方式注入高斯噪声，从根本上免疫了因大微批（梯度累加）以及多卡同步（DDP 并行）可能带来的数学性质崩坏与梯度发散问题。
 
 > [!NOTE]
 > **验证策略说明**：尽管上述对比算法在论文中还执行了预训练大语言模型（LLM）指令微调、量化训练、或者与全参数微调、BitFit / Adapter 比较，**但在我们的 EVO 框架（EvoRLoRA）评估体系下，只需要跑其余的这些 PEFT 同类对比算法（`lora`, `adalora`, `sora`）并与 EvoRank 进行同台对比即可充分验证 EvoRank 的效果**。也就是直接使用我们在各个脚本中统一的验证协议进行评测即可，无需去复刻它们全参或量化的环境。
@@ -86,6 +88,7 @@
 | `--target_modules` | `None`（自动推断） | 逗号分隔的注入模块后缀，如 `query_proj,key_proj,value_proj,intermediate.dense,output.dense` |
 | `--max_grad_norm` | `None`（不裁剪） | 梯度裁剪阈值；SoRA 论文使用 `0.1` |
 | `--seed_list` | `None` | 多种子串行运行，如 `--seed_list 0 21 42 81 100`；CSV 自动追加均值/标准差汇总行 |
+| `--flatlora_rho` | `0.05` | Flat-LoRA 独占参数：基于高斯噪声对基础权重的动态扰动强度系数 |
 | `--sora_lambda_schedule` | `None` | SoRA lambda 调度策略（如 `linear`）；`None` 为 no-schedule 主线 |
 | `--sora_max_lambda` | `10.0` | SoRA schedule 最大 lambda |
 | `--sora_lambda_num` | `5` | SoRA schedule 步数 |
@@ -212,7 +215,7 @@ python run_benchmark.py \
 
 ```bash
 python run_benchmark.py \
-  --methods lora adalora evorank sora toplora \
+  --methods lora adalora evorank sora toplora flatlora \
   --task_name sst2 \
   --model_name roberta-base \
   --max_train_steps 50 \
@@ -222,6 +225,7 @@ python run_benchmark.py \
   --adalora_orth_reg_weight 0.1 \
   --sora_sparse_lambda 1e-3 \
   --sora_lambda_warmup_steps 0 \
+  --flatlora_rho 0.05 \
   --expand_init_mode gradient \
   --seed 42 \
   --log_dir runs/smoke_full \
@@ -282,7 +286,7 @@ torchrun --nproc_per_node=2 --master_port=29500 \
   --ddp \
   --task_name sst2 \
   --model_name roberta-base \
-  --methods lora adalora evorank sora toplora \
+  --methods lora adalora evorank sora toplora flatlora \
   --max_train_steps 20 \
   --T_es 10 \
   --warmup_ratio 0.1 \
@@ -290,6 +294,7 @@ torchrun --nproc_per_node=2 --master_port=29500 \
   --adalora_orth_reg_weight 0.1 \
   --sora_sparse_lambda 1e-3 \
   --mini_val_k 4 \
+  --flatlora_rho 0.05 \
   --expand_init_mode gradient \
   --seed 42 \
   --log_dir runs/ddp_smoke_full \
@@ -317,7 +322,7 @@ torchrun --nproc_per_node=2 --master_port=29500 \
 nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
-  --methods lora adalora evorank sora toplora \
+  --methods lora adalora evorank sora toplora flatlora \
   --task_list sst2 mnli qnli qqp \
   --model_list roberta-base \
   --target_rank 8 \
@@ -335,6 +340,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --lambda_c 0.0 \
   --complexity_mode rank_sum \
   --population_strategy all \
+  --flatlora_rho 0.05 \
   --expand_init_mode gradient \
   --seed 42 \
   --log_dir runs/main_results_large_ddp \
@@ -350,7 +356,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
-  --methods lora adalora evorank sora toplora \
+  --methods lora adalora evorank sora toplora flatlora \
   --task_list cola mrpc stsb rte wnli \
   --model_list roberta-base \
   --target_rank 8 \
@@ -368,6 +374,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --lambda_c 0.0 \
   --complexity_mode rank_sum \
   --population_strategy all \
+  --flatlora_rho 0.05 \
   --expand_init_mode gradient \
   --seed 42 \
   --log_dir runs/main_results_small_ddp \
@@ -705,6 +712,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 | `sora_sparse_lambda` | 10 | SoRA `sparse_lambda=10` |
 | `sora_sparse_lambda_2` | 3e-4 | SoRA `sparse_lambda_2=3e-4` |
 | `toplora_dropout` | 0.05 | TopLoRA 默认 |
+| `flatlora_rho` | 0.05 | Flat-LoRA 原文默认主线参数 |
 > [!IMPORTANT]
 > **RTE 任务例外**：部分原始脚本在 RTE 上使用更高学习率；本仓库 `fair_glue_deberta_rte.sh` 为与其他方法公平横向对比，采用 **`epochs=50`、`batch_size=32`、`lr=2e-4`**（见该脚本头部注释）。若要贴近对比论文的 RTE 配置，可自行改 `lr` 等并单独记录协议。
 
