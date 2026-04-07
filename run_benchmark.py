@@ -28,7 +28,7 @@ from transformers import (
 from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
 
 from adalora_utils import adalora_update_and_allocate, compute_adalora_orthogonal_loss, get_adalora_orth_reg_weight, unwrap_inner_from_training_model
-from lora_ga_init import apply_lora_ga_init_to_peft, run_lora_ga_init_pipeline
+from lora_ga_init import apply_lora_ga_init_to_peft, run_lora_ga_init_pipeline, estimate_lora_ga_init_tensors
 from rank_evolution_controller import RankEvolutionController
 from sora_inject import SparseAdamW, inject_sora
 from train_integration import inject_evo_lora, train_evo_lora_step

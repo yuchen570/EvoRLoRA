@@ -221,15 +221,24 @@ def apply_lora_ga_init_to_peft(peft_model, init_by_key, target_device):
             o_norm = offset.norm().item()
             ratio_norm = o_norm / max(w_norm, 1e-12)
             
-            # [Phase 5] 增强调试输出：由于用户要求更多调试信息，此处对每一层都输出初始化快照
+            # [Phase 6] 增加强力范数保护：如果补偿量超过原始权重的 10%，则进行等比例等比例缩放。
+            # 这是为了防止在随机分类头产生的“噪声梯度”下，LoRA-GA 强行抹除预训练层的特征（日志显示部分层比例甚至 > 100%）。
+            MAX_RATIO = 0.1
+            if ratio_norm > MAX_RATIO:
+                scale_ratio = MAX_RATIO / ratio_norm
+                print(f"[warning] LoRA-GA layer={key}: ratio={ratio_norm:.2%} > {MAX_RATIO:.1%}, scaling down by {scale_ratio:.4f}")
+                offset *= scale_ratio
+                # A 和 B 各自承担 sqrt(scale_ratio) 的缩放量
+                sqrt_scale = math.sqrt(scale_ratio)
+                la.weight.data.mul_(sqrt_scale)
+                lb.weight.data.mul_(sqrt_scale)
+                o_norm = offset.norm().item()
+                ratio_norm = o_norm / max(w_norm, 1e-12)
+
             la_norm = la.weight.data.float().norm().item()
             lb_norm = lb.weight.data.float().norm().item()
             msg = f"[debug] LoRA-GA init layer={key}: w_norm={w_norm:.4f}, offset_norm={o_norm:.4f}, ratio={ratio_norm:.4%}, A_norm={la_norm:.4f}, B_norm={lb_norm:.4f}"
-            
-            if ratio_norm > 0.1:
-                print(f"{msg} [warning: large offset]")
-            else:
-                print(msg)
+            print(msg)
 
             if o_abs_max > 0 and w_abs_max / o_abs_max < 1.0:
                 ratio = (w_abs_max / o_abs_max).item()
@@ -238,6 +247,7 @@ def apply_lora_ga_init_to_peft(peft_model, init_by_key, target_device):
                 sqrt_ratio = math.sqrt(ratio)
                 la.weight.data.mul_(sqrt_ratio)
                 lb.weight.data.mul_(sqrt_ratio)
+
 
             base_weight.data.sub_(offset.to(dtype=base_weight.dtype))
 
