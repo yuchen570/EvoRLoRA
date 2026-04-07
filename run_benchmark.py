@@ -1252,26 +1252,8 @@ def run_training_loop(
     model = model.to(device)
 
     if method_name == "lora-ga":
-        # [Phase 2] LoRA-GA 初始化必须在 DDP 包装前完成，因为补偿逻辑会修改 requires_grad=False 的基座权重。
-        # 在 DDP 之前修改可确保 DDP 第一次广播 (Broadcast) 时，所有 Rank 拿到的基座权重是“补偿后”的一致状态。
-        print(f"[debug] Rank {local_rank}: Starting LoRA-GA initialization before DDP wrap (method=lora-ga)...")
-        # 直接复用已有的 train_loader 进行梯度估计
-        init_tensors = estimate_lora_ga_init_tensors(
-            model=model,
-            data_loader=train_loader,
-            target_modules=peft_meta.get("lora_target_modules", []),
-            lora_r=peft_meta.get("target_rank", 8),
-            lora_ga_batches=peft_meta.get("lora_ga_batches", 10),
-            task_type=task_type,
-            device=device,
-            stable_gamma=16.0,
-            aggregate_across_ranks=True,
-            svd_on_this_rank=(local_rank == 0),
-        )
-        apply_lora_ga_init_to_peft(model, init_tensors, target_device=device)
-        print(f"[debug] Rank {local_rank}: LoRA-GA initialization done.")
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
+        pass
+
 
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         model = DDP(
