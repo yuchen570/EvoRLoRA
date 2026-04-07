@@ -200,11 +200,23 @@ def apply_lora_ga_init_to_peft(peft_model, init_by_key, target_device):
             scaling = 1.0
             if hasattr(module, "scaling") and adapter in module.scaling:
                 scaling = module.scaling[adapter]
-                
+
             A_f32 = A_cpu.to(device=target_device, dtype=torch.float32)
             B_f32 = B_cpu.to(device=target_device, dtype=torch.float32)
             offset = (B_f32 @ A_f32) * float(scaling)
-            
+
+            # --- norm_clip：对齐原始 LoRA-GA 实现（layer.py:266-274, run_exp.py:223-231） ---
+            # 当 offset 最大值超过原始权重最大值时，按比例裁剪 offset 和 A/B，
+            # 防止 base_weight -= offset 后权重被严重扭曲导致训练爆炸。
+            w_abs_max = base_weight.data.float().abs().max()
+            o_abs_max = offset.abs().max()
+            if o_abs_max > 0 and w_abs_max / o_abs_max < 1.0:
+                ratio = (w_abs_max / o_abs_max).item()
+                offset *= ratio
+                sqrt_ratio = math.sqrt(ratio)
+                la.weight.data.mul_(sqrt_ratio)
+                lb.weight.data.mul_(sqrt_ratio)
+
             base_weight.data.sub_(offset.to(dtype=base_weight.dtype))
             
         applied += 1
