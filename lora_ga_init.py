@@ -123,13 +123,23 @@ def estimate_lora_ga_init_tensors(
     result = {}
     for full_name, linear in targets:
         linear.weight.requires_grad = False
+        # 计算平均梯度
         G = (grad_sums[full_name] / float(n_used)).detach().cpu().float()
+        
         # 使用 svd_lowrank 以匹配原始 LoRA-GA (q = min(4*r, min(shape)), niter=4)
         q_svd = min(4 * lora_r, min(G.shape))
-        U, S, V = torch.svd_lowrank(G, q=q_svd, niter=4)
-        V = V.T  # V 现在是 (n, q) -> 转置为 (q, n) 以进行行索引
+        try:
+            U, S, V = torch.svd_lowrank(G, q=q_svd, niter=4)
+            V = V.T  # V 现在是 (q, n)
+        except Exception as e:
+            print(f"[error] LoRA-GA SVD failed for {full_name}: {e}")
+            # 回退到随机初始化或全 0
+            B = torch.zeros((G.shape[0], lora_r))
+            A = torch.zeros((lora_r, G.shape[1]))
+            result[full_name] = (A, B)
+            continue
 
-        # 方向选择：完全匹配原始 LoRA-GA layer.py
+        # 方向选择策略：匹配原始 LoRA-GA layer.py
         if direction == "ArBr":
             B = U[:, 0: 2 * lora_r: 2]
             A = V[1: 2 * lora_r: 2, :]
@@ -150,19 +160,20 @@ def estimate_lora_ga_init_tensors(
             raise ValueError(f"Unknown direction: {direction}")
 
         if stable_gamma is not None:
-            # stable 缩放：完全匹配原始 LoRA-GA stable 分支
-            # B = B * m**0.25 / gamma**0.5,  A = A * m**0.25 / gamma**0.5
+            # Stable 缩放策略：B = B * m**0.25 / gamma**0.5, A = A * m**0.25 / gamma**0.5
             gamma = float(stable_gamma)
-            m = G.shape[0]  # out_features（梯度矩阵的行数）
-            scale = m ** 0.25 / gamma ** 0.5
-            lora_B = (B * scale).to(dtype=linear.weight.dtype)
-            lora_A = (A * scale).to(dtype=linear.weight.dtype)
+            m = G.shape[0]  # out_features
+            scale = (m ** 0.25) / (gamma ** 0.5)
+            lora_B = B * scale
+            lora_A = A * scale
         else:
-            # 备选方案：按奇异值的平方根加权
+            # 默认：按奇异值平方根缩放
             sqrt_s = torch.sqrt(torch.clamp(S[:lora_r], min=0.0))
-            lora_B = (B * sqrt_s.unsqueeze(0)).to(dtype=linear.weight.dtype)
-            lora_A = (sqrt_s.unsqueeze(1) * A).to(dtype=linear.weight.dtype)
+            lora_B = B * sqrt_s.unsqueeze(0)
+            lora_A = sqrt_s.unsqueeze(1) * A
+            
         result[full_name] = (lora_A.contiguous(), lora_B.contiguous())
+        
     model.zero_grad(set_to_none=True)
     return result
 
@@ -206,40 +217,32 @@ def apply_lora_ga_init_to_peft(peft_model, init_by_key, target_device):
             if hasattr(module, "scaling") and adapter in module.scaling:
                 scaling = module.scaling[adapter]
 
-            A_f32 = A_cpu.to(device=target_device, dtype=torch.float32)
-            B_f32 = B_cpu.to(device=target_device, dtype=torch.float32)
-            offset = (B_f32 @ A_f32) * float(scaling)
-
-            # --- norm_clip：对齐原始 LoRA-GA 实现（layer.py:266-274, run_exp.py:223-231） ---
-            # 当 offset 最大值超过原始权重最大值时，按比例裁剪 offset 和 A/B，
-            # 防止 base_weight -= offset 后权重被严重扭曲导致训练爆炸。
+            # --- 计算初始范数和最大值，用于后续裁剪判断 ---
             w_abs_max = base_weight.data.float().abs().max()
             o_abs_max = offset.abs().max()
-            
-            # [监控] 计算范数比例，帮助观察初始化强度
             w_norm = base_weight.data.float().norm().item()
             o_norm = offset.norm().item()
             ratio_norm = o_norm / max(w_norm, 1e-12)
-            
-            # [Phase 6] 增加强力范数保护：如果补偿量超过原始权重的 10%，则进行等比例等比例缩放。
-            # 这是为了防止在随机分类头产生的“噪声梯度”下，LoRA-GA 强行抹除预训练层的特征（日志显示部分层比例甚至 > 100%）。
+
+            # --- 第一重保护：10% 范数裁剪 (Phase 6/9) ---
+            # 如果补偿量 (offset) 超过原始权重的 10%，说明估计梯度干扰过大，需按比例压制。
             MAX_RATIO = 0.1
             if ratio_norm > MAX_RATIO:
                 scale_ratio = MAX_RATIO / ratio_norm
                 print(f"[warning] LoRA-GA layer={key}: ratio={ratio_norm:.2%} > {MAX_RATIO:.1%}, scaling down by {scale_ratio:.4f}")
                 offset *= scale_ratio
-                # A 和 B 各自承担 sqrt(scale_ratio) 的缩放量
+                # 必须同步缩放 A 和 B 分量，否则 A@B 会失去比例
                 sqrt_scale = math.sqrt(scale_ratio)
                 la.weight.data.mul_(sqrt_scale)
                 lb.weight.data.mul_(sqrt_scale)
+                
+                # 重要：缩放后需重新计算 o_norm 和 o_abs_max，供下一重保护使用
                 o_norm = offset.norm().item()
+                o_abs_max = offset.abs().max()
                 ratio_norm = o_norm / max(w_norm, 1e-12)
 
-            la_norm = la.weight.data.float().norm().item()
-            lb_norm = lb.weight.data.float().norm().item()
-            msg = f"[debug] LoRA-GA init layer={key}: w_norm={w_norm:.4f}, offset_norm={o_norm:.4f}, ratio={ratio_norm:.4%}, A_norm={la_norm:.4f}, B_norm={lb_norm:.4f}"
-            print(msg)
-
+            # --- 第二重保护：abs_max 阈值裁剪 (对齐 peft 官方/原始实现) ---
+            # 确保 offset 的最大元素不超过权重矩阵的最大元素，防止局部权重被削成负数后发散。
             if o_abs_max > 0 and w_abs_max / o_abs_max < 1.0:
                 ratio = (w_abs_max / o_abs_max).item()
                 print(f"[info] LoRA-GA: layer={key} clipping offset by ratio={ratio:.4f} (abs_max guard)")
@@ -248,7 +251,7 @@ def apply_lora_ga_init_to_peft(peft_model, init_by_key, target_device):
                 la.weight.data.mul_(sqrt_ratio)
                 lb.weight.data.mul_(sqrt_ratio)
 
-
+            # --- 执行补偿：W_new = W_pretrained - offset ---
             base_weight.data.sub_(offset.to(dtype=base_weight.dtype))
 
 
@@ -296,36 +299,33 @@ def build_lora_ga_estimation_loader(train_loader, ddp_enabled: bool):
     )
 
 def run_lora_ga_init_pipeline(base_model, train_loader, target_modules, lora_r, lora_ga_batches, task_type, device, is_main_process, ddp_enabled, loss_fn=None, stable_gamma=None, direction="ArB2r"):
-    if ddp_enabled and dist.is_available() and dist.is_initialized():
-        dist.barrier()
+    # --- 只在计算主 Rank 执行初始化估计 ---
+    # 虽然各 Rank 都有聚合梯度，但为了绝对保证位级别一致性，我们强制 Rank 0 做 SVD 并广播。
     payload = None
-    dl = build_lora_ga_estimation_loader(train_loader, ddp_enabled=ddp_enabled)
-    est_model = copy.deepcopy(base_model)
-    payload = estimate_lora_ga_init_tensors(
-        est_model,
-        dl,
-        target_modules,
-        lora_r,
-        lora_ga_batches,
-        task_type,
-        device,
-        loss_fn,
-        stable_gamma=stable_gamma,
-        direction=direction,
-        aggregate_across_ranks=bool(ddp_enabled and dist.is_available() and dist.is_initialized()),
-        # 为避免把 LoRA-GA 的重计算都压到 rank0，
-        # DDP 下各 rank 在 all_reduce 后都执行同等 SVD 计算。
-        svd_on_this_rank=True,
-    )
-    del est_model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    if ddp_enabled and dist.is_available() and dist.is_initialized():
-        # 各 rank 已完成同口径聚合 + SVD，直接使用本地结果，避免额外把任务集中到 rank0。
-        assert payload is not None
-        out = {k: (v[0].clone(), v[1].clone()) for k, v in payload.items()}
-    else:
-        out = broadcast_lora_ga_payload(payload, src=0)
+    if is_main_process:
+        dl = build_lora_ga_estimation_loader(train_loader, ddp_enabled=ddp_enabled)
+        est_model = copy.deepcopy(base_model)
+        payload = estimate_lora_ga_init_tensors(
+            est_model,
+            dl,
+            target_modules,
+            lora_r,
+            lora_ga_batches,
+            task_type,
+            device,
+            loss_fn,
+            stable_gamma=stable_gamma,
+            direction=direction,
+            aggregate_across_ranks=bool(ddp_enabled and dist.is_available() and dist.is_initialized()),
+            svd_on_this_rank=True,
+        )
+        del est_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    # 将 Rank 0 计算的结果广播到所有节点
+    payload = broadcast_lora_ga_payload(payload, src=0)
+    
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         dist.barrier()
-    return out
+    return payload

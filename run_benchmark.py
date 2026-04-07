@@ -1343,18 +1343,16 @@ def run_training_loop(
         _peft_params = [p for n, p in model.named_parameters() if p.requires_grad and not any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
         _head_params = [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in ["classifier", "score", "lm_head", "shared", "pooler"])]
         
-        # LoRA-GA：A/B 与基座权重的抵消对 decay 极敏感，必须为 0。
-        # 标准 LoRA / AdaLoRA：适配器矩阵通常不做 weight_decay，否则在小数据、较高 lr 下易爆炸。
-        dynamic_wd_peft = 0.0 if method_name in ("lora-ga", "lora", "adalora", "evorank") else weight_decay
-        # LoRA-GA：分类头原版设置为 0。
-        _head_wd = 0.0 if method_name == "lora-ga" else weight_decay
-        _adam_wd = 0.0 if method_name in ("lora-ga", "lora", "adalora", "evorank") else weight_decay
-
-
+        # LoRA-GA：A/B 与基座权重的补偿对 decay 极敏感（原始权重已被抵消），必须设为 0。
+        # 同时，在 RTE 等小数据集上，我们将分类头的 WD 也设为 0 以对齐原始实现。
+        is_lora_ga = (method_name == "lora-ga")
+        dynamic_wd_peft = 0.0 if (is_lora_ga or method_name in ("lora", "adalora", "evorank")) else weight_decay
+        _head_wd = 0.0 if is_lora_ga else weight_decay
+        _adam_wd = 0.0 if (is_lora_ga or method_name in ("lora", "adalora", "evorank")) else weight_decay
 
         # fp16 参数（如 DeBERTa classifier）在 eps=1e-8 时易在首步触发分母下溢并数值爆炸；
-        # evorank 同样训练 fp16 头 + 适配器，与 lora/adalora/lora-ga 统一 eps。
-        _adam_eps = 1e-6 if method_name in ("lora-ga", "lora", "adalora", "evorank") else 1e-8
+        # 对 LoRA-GA 来说，初始梯度较大，使用稳定的 eps=1e-6 能显著增强稳定性。
+        _adam_eps = 1e-6 if (is_lora_ga or method_name in ("lora", "adalora", "evorank")) else 1e-8
         optimizer = AdamW(
             [
                 {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
