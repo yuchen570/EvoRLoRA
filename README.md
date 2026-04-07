@@ -342,6 +342,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --population_strategy all \
   --flatlora_rho 0.05 \
   --expand_init_mode gradient \
+  --verify_n_samples 0 \
   --seed 42 \
   --log_dir runs/main_results_large_ddp \
   --output_dir artifacts \
@@ -376,6 +377,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --population_strategy all \
   --flatlora_rho 0.05 \
   --expand_init_mode gradient \
+  --verify_n_samples 0 \
   --seed 42 \
   --log_dir runs/main_results_small_ddp \
   --output_dir artifacts \
@@ -402,6 +404,7 @@ python run_benchmark.py \
   --lambda_pop 16 \
   --population_strategy all \
   --expand_init_mode gradient \
+  --verify_n_samples 0 \
   --seed 42 \
   --log_dir runs/ablation/full \
   --output_dir artifacts \
@@ -427,6 +430,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --lambda_pop 16 \
   --population_strategy all \
   --expand_init_mode gradient \
+  --verify_n_samples 0 \
   --seed 42 \
   --log_dir runs/ablation_full_ddp \
   --output_dir artifacts \
@@ -452,6 +456,7 @@ python run_benchmark.py \
   --lambda_pop 16 \
   --population_strategy all \
   --expand_init_mode zero \
+  --verify_n_samples 0 \
   --seed 42 \
   --log_dir runs/ablation/expand_zero \
   --output_dir artifacts \
@@ -472,6 +477,7 @@ python run_benchmark.py \
   --lambda_pop 16 \
   --population_strategy all \
   --expand_init_mode gradient \
+  --verify_n_samples 0 \
   --seed 42 \
   --log_dir runs/ablation/expand_gradient \
   --output_dir artifacts \
@@ -497,6 +503,7 @@ python run_benchmark.py \
   --population_strategy all \
   --expand_init_mode gradient \
   --evo_max_reallocate_candidates 0 \
+  --verify_n_samples 0 \
   --seed 42 \
   --log_dir runs/ablation/reallocate_unlimited \
   --output_dir artifacts \
@@ -530,6 +537,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --lambda_pop 16 \
   --population_strategy all \
   --expand_init_mode gradient \
+  --verify_n_samples 0 \
   --seed 42 \
   --log_dir runs/efficiency_large_ddp \
   --output_dir artifacts \
