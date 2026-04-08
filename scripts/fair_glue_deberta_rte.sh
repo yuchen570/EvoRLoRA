@@ -45,7 +45,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29510 \
   --evo_H_p 4 \
   --evo_max_reallocate_candidates 16 \
   --verify_n_samples 0 \
-  --seed 48 \
+  --seed_list 0 21 42 81 100 \
   --log_dir runs/fair_glue_deberta_rte_ddp \
   --output_dir artifacts \
   --export_csv results_fair_glue_deberta_rte_ddp.csv \

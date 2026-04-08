@@ -54,6 +54,7 @@ COMMON_ARGS=(
   --evo_max_reallocate_candidates 8
   --evo_include_noop_candidate
   --seed_list 0 21 42 81 100
+  --verify_n_samples 0
   --output_dir artifacts
 )
 

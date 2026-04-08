@@ -43,6 +43,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29530 \
   --expand_init_mode gradient \
   --evo_max_reallocate_candidates 8 \
   --seed 42 \
+  --verify_n_samples 0 \
   --log_dir runs/fair_nlg_xsum_ddp \
   --output_dir artifacts \
   --export_csv results_fair_nlg_xsum_ddp.csv \
