@@ -45,16 +45,16 @@
 | `mnli` | 自然语言推理（前提–假设） | `validation_matched` | **Accuracy** |
 | `qnli` | 问答蕴含 | `validation` | **Accuracy** |
 | `rte` | 文本蕴含 | `validation` | **Accuracy** |
-| `wnli` | Winograd 式蕴含（极小集） | `validation` | **Accuracy** |
+| `wnli` | Winograd 式蕴含（极小集，不建议） | `validation` | **Accuracy** |
 | `ax` | 诊断集（MNLI 风格；见下 **HF 无金标**） | — | **Accuracy**（需自带金标数据源） |
 **注意：**
 
-- **`ax`（HuggingFace `datasets` 的 `glue`/`ax`）**：`test` **标签全部为 `-1`（不公开金标）**，无法用本脚本的交叉熵训练或计算验证主指标；若指定 `--task_name ax` 或把 `ax` 写入 `--task_list`，`setup_data_and_model` 会 **显式报错**。GLUE「10 个配置」在 Hub 上均可 `load_dataset`，但 **有监督跑法仅适用于其余 9 项**；一键多任务命令里请使用 **`cola sst2 mrpc qqp stsb mnli qnli rte wnli`**（不要含 `ax`），除非自行提供带金标的 AX 数据管线。
+- **`ax`（HuggingFace `datasets` 的 `glue`/`ax`）**：`test` **标签全部为 `-1`（不公开金标）**，无法用本脚本的交叉熵训练或计算验证主指标；若指定 `--task_name ax` 或把 `ax` 写入 `--task_list`，`setup_data_and_model` 会 **显式报错**。GLUE「10 个配置」在 Hub 上均可 `load_dataset`，但 **有监督跑法仅适用于其余 8 项**；一键多任务命令里请使用 **`cola sst2 mrpc qqp stsb mnli qnli rte`**（不要含 `ax`）。
 - **`stsb`**：训练为 MSE 回归；验证在**完整 dev 集**上算 Pearson 与 Spearman，主标量为二者**算术平均**（与 GLUE 总分里该任务的常见合成方式一致）。
 - **DDP**：与 NLG 相同，验证指标仅在 **rank0** 上对**全量** dev 集计算，再 `broadcast` 到各卡，避免 `DistributedSampler` 子集偏差。
 - CSV 列名仍为 **`best_val_accuracy`**，语义为「该任务验证主指标」（不限于 accuracy）；TensorBoard 为 **`val/<指标名>`**（如 `val/matthews_corrcoef`、`val/f1`、`val/pearson_spearman_mean`）。`metrics.jsonl` 含字段 **`glue_metric`** 标明指标键名。
-- **`--task_list`** 可串行跑多个 `task_name`。**有监督训练/验证**请使用 **9 项**（勿含 `ax`，原因见上表 `ax` 说明）：  
-  `--task_list cola sst2 mrpc qqp stsb mnli qnli rte wnli`（顺序可任意）。`ax` 仍列在表中仅表示 Hub 配置存在，与本脚本可跑任务集合不同。
+- **`--task_list`** 可串行跑多个 `task_name`。**有监督训练/验证**请使用 **8 项**（勿含 `ax`；也不建议含 `wnli`，数据集过小）：
+  `--task_list cola sst2 mrpc qqp stsb mnli qnli rte`（顺序可任意）。`ax`,`wnli` 仍列在表中仅表示 Hub 配置存在，与本脚本可跑任务集合不同。
 
 ---
 
@@ -70,7 +70,7 @@
 - Reward 复杂度正则：`-lambda_c * C(z)`，支持 `rank_sum` / `size_aware`
 - ES population 子采样：`--lambda_pop` / `--population_strategy all|random`
 - 学术协议批量运行：`--task_list` / `--model_list` / `--export_csv`
-- GLUE：Hub 上 **10 个配置**均可加载；**有监督验证**为 **9 项**（不含 `ax`），均使用 **官方主指标**（CoLA→Matthews，MRPC/QQP→F1，STS-B→Pearson 与 Spearman 均值，其余分类→Accuracy），见 `glue_metrics.py`
+- GLUE：Hub 上 **10 个配置**均可加载；**有监督验证**默认使用 **8 项**（不含 `ax`；也不建议含 `wnli`，数据集过小），均使用 **官方主指标**（CoLA→Matthews，MRPC/QQP→F1，STS-B→Pearson 与 Spearman 均值，其余分类→Accuracy），见 `glue_metrics.py`
 - EvoRank：`run_benchmark.py` 暴露 `--evorank_r_max`（每层秩超空间上限，默认 16）、`--evo_alpha_u` / `--evo_beta_u`（容量统计组合系数，默认均为 1.0）、`--expand_init_mode zero|gradient`（扩张初始化：`zero` 为 B 列 cold start；`gradient` 为论文 Proposition 3.2，在 backward 后缓存的投影梯度上做 power iteration 得主奇异方向）；`--target_rank` 对应注入时的初始活跃秩 `r_init`。每层演化上下界还与控制器内 `r_min=2` 及 `r_max=evorank_r_max` 一致
 - 双时间尺度步内：`train_evo_lora_step` 在 **`clip_grad_norm_` 之前** 写入层统计/梯度缓存，再执行裁剪与 `optimizer.step()`，与当前实现一致
 - 训练产物与 checkpoint（与 `--log_dir` 分离）：`--output_dir artifacts`，子目录 `artifacts/<task>_<backbone>_<method>/`，含 `metrics.jsonl`、可选 checkpoint、`final/`（PEFT `save_pretrained` 或 `model_state.pt` + tokenizer）
@@ -310,7 +310,7 @@ torchrun --nproc_per_node=2 --master_port=29500 \
 > **关于不同 GLUE 任务的 Epoch 设置建议**
 > 根据评测日志分析，统一设置 3 个或 5 个 Epoch 对于所有任务**是不合理**的。不同任务应设置不同的 Epoch 才能确保充分训练以及稳定的数值表现：
 > - **严重欠拟合的任务（需 15 ~ 20 Epochs）**：`stsb`, `cola`, `rte`。这些子集数据量小且所需更新步数少，如果在 5 个 Epoch 内停止会导致明显欠拟合或严重震荡。
-> - **极小数据集易波动任务（需 10 ~ 20 Epochs）**：`mrpc`, `wnli`。非常容易出现大幅震荡或直接崩溃（如 WNLI 预测多数类别）。建议充分 Warmup 并放长训练轮数，最好配合 Early Stopping。
+> - **极小数据集易波动任务（需 10 ~ 20 Epochs）**：`mrpc`（以及 GLUE 的 `wnli` 这类极小任务）。非常容易出现大幅震荡或直接崩溃（如预测多数类别）。建议充分 Warmup 并放长训练轮数，最好配合 Early Stopping。
 > - **大数据集易收敛的任务（3 ~ 5 Epochs 即可）**：`sst2`, `mnli`, `qnli`, `qqp`。这些数据量大的任务在 3~5 轮时通常已展现完美的收敛平台，为了最高精度最多尝试 5~10 轮。
 > 如果你需要同时对所有子集跑 `--task_list ...`，建议为大规模和小规模数据集分别设置不同的训练脚本。
 
@@ -358,7 +358,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
   --methods lora adalora evorank sora toplora flatlora pissa \
-  --task_list cola mrpc stsb rte wnli \
+  --task_list cola mrpc stsb rte \
   --model_list roberta-base \
   --target_rank 8 \
   --epochs 20 \
@@ -519,7 +519,7 @@ python run_benchmark.py \
 nohup torchrun --nproc_per_node=2 --master_port=29500 \
   run_benchmark.py \
   --ddp \
-  --methods lora adalora evorank sora pissa \
+  --methods lora adalora evorank sora toplora flatlora pissa \
   --task_list sst2 mnli qnli qqp \
   --model_list roberta-base \
   --target_rank 8 \
@@ -571,7 +571,7 @@ python run_benchmark.py \
   --nlg_dataset_name cnn_dailymail \
   --task_name cnn_dailymail \
   --model_name t5-small \
-  --methods lora adalora evorank sora toplora pissa \
+  --methods lora adalora evorank sora toplora flatlora pissa \
   --target_rank 8 \
   --epochs 1 \
   --batch_size 4 \
@@ -602,7 +602,7 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
   --nlg_dataset_name cnn_dailymail \
   --task_name cnn_dailymail \
   --model_name t5-small \
-  --methods lora adalora evorank sora toplora pissa \
+  --methods lora adalora evorank sora toplora flatlora pissa \
   --target_rank 8 \
   --epochs 1 \
   --batch_size 4 \
@@ -696,7 +696,6 @@ nohup torchrun --nproc_per_node=2 --master_port=29500 \
 | MNLI | Multi-Genre Natural Language Inference | 句对三分类 | 蕴含 / 中立 / 矛盾 | Accuracy |
 | QNLI | Question Natural Language Inference | 句对二分类 | 判断句子是否包含问题答案 | Accuracy |
 | RTE | Recognizing Textual Entailment | 句对二分类 | 判断前提是否蕴含假设 | Accuracy |
-| WNLI | Winograd Natural Language Inference | 句对二分类 | 代词指代消歧 + 蕴含判断 | Accuracy |
 
 > `run_benchmark.py` 通过 `glue_metrics.py` 自动为每个任务选择对应的官方主指标（CSV 列 `val_metric_key`），无需手动指定。
 
