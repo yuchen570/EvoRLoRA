@@ -98,3 +98,5 @@ CSV output aggregates across seeds with mean/std rows per `task×backbone×metho
 - **`--expand_init_mode gradient`**: uses projected gradient principal singular vector (Proposition 3.2) for new rank-1 slot initialization; `zero` is cold-start. Only affects `evorank`; safe to pass for all-method runs.
 - **DDP**: validation metrics computed on rank0 over full dev set, then broadcast. Artifacts written by rank0 only.
 - **`--evo_max_reallocate_candidates 8`**: limits cross-layer reallocation candidates to prevent combinatorial explosion; set to `0` for unlimited (ablation only).
+- **EvoRank warmup cap**: EvoRank 的 LR warmup 和 ES warmup 均被限制为 `min(warmup_steps, max(20, 10% × steps_per_epoch))`。LoRA B=0 零初始化 + 长 warmup（如 6% × 6240 = 374 步）下 ΔW ∝ LR² 二次增长阻滞会导致训练崩溃；cap 后 warmup 约 30 步，B 在第一 epoch 内充分增长，ES 统计量可靠。LR 衰减段不变。
+- **`--evorank_use_rslora`**: 默认 False（标准 LoRA 缩放 α/r），可选 True 开启 rsLoRA（α/√r）。注意 rsLoRA 在小数据集 + 高 lr 下可能导致训练不稳定。

@@ -605,6 +605,7 @@ def peft_factory(
     comparison_protocol: str = "none",
     protocol_dropout: float = 0.05,
     evorank_r_max: int = 16,
+    evorank_use_rslora: bool = False,
     evorank_alpha_u: float = 1.0,
     evorank_beta_u: float = 1.0,
     evorank_rho: float = 0.9,
@@ -790,7 +791,12 @@ def peft_factory(
         controller = inject_evo_lora(
             model=model,
             target_modules=target_modules,
-            layer_kwargs={"r_max": er_max, "r_init": target_rank, "lora_alpha": effective_alpha},
+            layer_kwargs={
+                "r_max": er_max,
+                "r_init": target_rank,
+                "lora_alpha": effective_alpha,
+                "use_rslora": bool(evorank_use_rslora),
+            },
             controller_kwargs={
                 "rho": float(evorank_rho),
                 "p_g": float(evorank_p_g),
@@ -1372,6 +1378,18 @@ def run_training_loop(
             eps=_adam_eps,
         )
         sparse_optimizer = None
+    
+    # Calculate warmup steps early so they can be used in debug logging
+    total_train_steps = max_train_steps if max_train_steps is not None else epochs * len(train_loader)
+    warmup_steps = int(total_train_steps * warmup_ratio)
+    steps_per_epoch = len(train_loader)
+    # EvoRank warmup cap：LoRA B=0 零初始化 + 长 warmup 的 ΔW ∝ LR² 二次增长阻滞
+    # 会导致训练崩溃（日志实证：warmup=374 → 0.47, warmup=18 → 0.82）。
+    # 同时 cap LR warmup 和 ES warmup，上限取 10% epoch（≈30 步），保证 B 在第一
+    # epoch 内充分增长、ES 统计量可靠。LR 衰减段不变（仍基于 total_train_steps）。
+    evo_warmup_cap = max(20, int(0.1 * steps_per_epoch))
+    evo_warmup_steps = min(warmup_steps, evo_warmup_cap) if method_name == "evorank" else warmup_steps
+    
     if is_main_process and method_name in {"lora", "evorank", "pissa", "adalora", "sora", "toplora"} and task_name in {"cola", "rte"}:
         if method_name == "sora":
             _dbg_peft_params_cnt = int(sum(
@@ -1409,6 +1427,9 @@ def run_training_loop(
                 "pooler_trainable_params": int(sum(p.numel() for n, p in model.named_parameters() if p.requires_grad and "pooler" in n)),
                 "pooler_trainable_dtypes": sorted({str(p.dtype) for n, p in model.named_parameters() if p.requires_grad and "pooler" in n}),
                 "peft_target_modules": list(peft_meta.get("target_modules", [])) if peft_meta else [],
+                "lr_warmup_steps": int(warmup_steps),
+                "es_warmup_steps": int(evo_warmup_steps) if method_name == "evorank" else None,
+                "evo_warmup_cap": int(evo_warmup_cap) if method_name == "evorank" else None,
             },
         )
         # endregion
@@ -1434,8 +1455,6 @@ def run_training_loop(
     else:
         raise ValueError(f"未知 task_type: {task_type}")
 
-    total_train_steps = max_train_steps if max_train_steps is not None else epochs * len(train_loader)
-    warmup_steps = int(total_train_steps * warmup_ratio)
     sora_schedule_stage_steps: Optional[int] = None
     if (
         method_name == "sora"
@@ -1448,10 +1467,11 @@ def run_training_loop(
     # LoRA+GLUE：在已知易发散区间逐步打点，便于确认首个 NaN 出现在哪一步（不仅依赖硬编码的 99）。
     lora_glue_step_trace = method_name in {"lora", "evorank", "pissa"} and task_name in {"cola", "rte"}
     lora_glue_early_steps = frozenset({1, 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 39})
+    _lr_warmup = evo_warmup_steps if method_name == "evorank" else warmup_steps
     if lr_scheduler_type == "linear":
-        lr_lambda_fn = _linear_warmup_decay_lr_lambda(warmup_steps, total_train_steps)
+        lr_lambda_fn = _linear_warmup_decay_lr_lambda(_lr_warmup, total_train_steps)
     elif lr_scheduler_type == "cosine":
-        lr_lambda_fn = _cosine_warmup_decay_lr_lambda(warmup_steps, total_train_steps)
+        lr_lambda_fn = _cosine_warmup_decay_lr_lambda(_lr_warmup, total_train_steps)
     else:
         raise ValueError(f"未知 lr_scheduler_type: {lr_scheduler_type}")
 
@@ -1533,7 +1553,7 @@ def run_training_loop(
                         val_batch=mini_val_batches,
                         loss_fn=loss_fn,
                         step=global_step,
-                        warmup_steps=warmup_steps,
+                        warmup_steps=evo_warmup_steps,
                         T_es=T_es,
                         lambda_c=lambda_c,
                         complexity_mode=complexity_mode,
@@ -2252,6 +2272,11 @@ def parse_args() -> argparse.Namespace:
         help="EvoRank 每层秩超空间上限 R_max（与论文默认 16 一致）",
     )
     parser.add_argument(
+        "--evorank_use_rslora",
+        action="store_true",
+        help="EvoRank 缩放改为 rsLoRA(alpha/sqrt(r))。默认关闭，使用标准 LoRA 缩放(alpha/r)。",
+    )
+    parser.add_argument(
         "--evo_alpha_u",
         type=float,
         default=1.0,
@@ -2435,6 +2460,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         comparison_protocol=args.comparison_protocol,
                         protocol_dropout=args.protocol_dropout,
                         evorank_r_max=args.evorank_r_max,
+                        evorank_use_rslora=args.evorank_use_rslora,
                         evorank_alpha_u=args.evo_alpha_u,
                         evorank_beta_u=args.evo_beta_u,
                         evorank_rho=args.evo_rho,

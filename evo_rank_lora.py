@@ -20,8 +20,8 @@ class EvoRankLoRALayer(nn.Module):
 
     实现说明：
     1. 秩超空间：lora_A (r_max × in), lora_B (out × r_max)，掩码选择活跃组件。
-    2. 缩放：采用 rsLoRA (α/√r)——论文原文 ΔW = BA 无缩放，此处为工程兼容
-       添加并在 expand/reduce 时做补偿（乘 √(r_new/r_old)），保持 ΔW 输出连续。
+    2. 缩放：默认标准 LoRA (α/r)，可选 rsLoRA (α/√r, use_rslora=True)；
+       expand/reduce 时做补偿 (乘 s(r_old)/s(r_new))，保持 ΔW 输出连续。
     3. 高效评价：避免实例化 G = ∂L/∂ΔW (out × in 巨矩阵)，利用 A.grad 和 B.grad
        的 trace trick 计算 g_ℓ 和 s^red_{ℓ,i}。
     4. 本层保持无状态；EMA/计数器/冷却期由 RankEvolutionController 管理。
@@ -39,6 +39,7 @@ class EvoRankLoRALayer(nn.Module):
         r_init: int,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.0,
+        use_rslora: bool = False,
         debug: bool = False,
     ):
         super().__init__()
@@ -47,6 +48,7 @@ class EvoRankLoRALayer(nn.Module):
         self.out_features = out_features
         self.r_max = r_max
         self.lora_alpha = lora_alpha
+        self.use_rslora = bool(use_rslora)
         self.debug = debug  # 调试模式：开启后会检查全零梯度（触发 GPU->CPU 同步，DDP 下慎用）
         
         if r_init > r_max:
@@ -84,14 +86,17 @@ class EvoRankLoRALayer(nn.Module):
         return self.active_mask.sum().item()
         
     def get_scaling_factor(self, r: int) -> float:
-        """rsLoRA 风格的缩放因子: alpha / sqrt(r)"""
-        return self.lora_alpha / math.sqrt(max(r, 1))
+        """缩放因子：默认 LoRA(alpha/r)；可选 rsLoRA(alpha/sqrt(r))。"""
+        rank = max(r, 1)
+        if self.use_rslora:
+            return self.lora_alpha / math.sqrt(rank)
+        return self.lora_alpha / rank
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         前向传播（论文 Eq. 100–104）：
           ΔW_ℓ = Σ_{i: m_i=1} b_i a_i^T  →  等价于 B_active @ A_active
-          output = x · ΔW^T · s       （s = α/√r, rsLoRA 缩放）
+          output = x · ΔW^T · s       （s = α/r 或 α/√r）
 
         实现：仅提取 active_mask=1 的行/列做矩阵乘，不实例化 R_max 维完整乘积。
         """
@@ -158,14 +163,13 @@ class EvoRankLoRALayer(nn.Module):
             nn.init.zeros_(self.lora_B.weight[:, index])
         
         # Double Scaling 防护：应用补偿因子
-        # 缩放因子从 alpha/sqrt(prev_rank) 降为 alpha/sqrt(new_rank)，
+        # 缩放因子从 s(prev_rank) 降为 s(new_rank)，
         # 要保持旧组件的 DeltaW = B * A 总幅值不变，需要放大旧权重。
         # 关键：只补偿 B 一侧！若同时乘到 A 和 B 上，实际效果是 c^2，会导致激活值炸飞。
-        # c = sqrt(new_rank / prev_rank)
+        # c = s(prev) / s(new)  →  rsLoRA: sqrt(new/prev), 标准: new/prev
         if prev_rank > 0:
-             compensation_factor = math.sqrt(new_rank / prev_rank)
+             compensation_factor = self.get_scaling_factor(prev_rank) / self.get_scaling_factor(new_rank)
              old_indices = [i for i, m in enumerate(self.active_mask.tolist()) if m and i != index]
-             # 仅补偿 B，绝对不能同时补偿 A 和 B！
              self.lora_B.weight[:, old_indices] *= compensation_factor
 
     @torch.no_grad()
@@ -188,12 +192,11 @@ class EvoRankLoRALayer(nn.Module):
         
         self.active_mask[index] = False
         
-        # 反向补偿：rsLoRA 缩放因子从 alpha/sqrt(prev_rank) 变为 alpha/sqrt(new_rank)（变大），
-        # 留下来的组件输出会被放大约 sqrt(prev/new) 倍（例如 5->4 时放大 ~11.8%）。
-        # 为了防止微调后期 Loss 突然毛刺，对留下来的组件乘以衰减系数进行对冲。
-        # c = sqrt(new_rank / prev_rank) < 1
+        # 反向补偿：缩放因子从 s(prev_rank) 变为 s(new_rank)（变大），
+        # 留下来的组件输出会被放大。为了防止微调后期 Loss 突然毛刺，对留下来的组件乘以衰减系数对冲。
+        # c = s(prev) / s(new) < 1  →  rsLoRA: sqrt(new/prev), 标准: new/prev
         if new_rank > 0:
-            compensation_factor = math.sqrt(new_rank / prev_rank)
+            compensation_factor = self.get_scaling_factor(prev_rank) / self.get_scaling_factor(new_rank)
             remaining_indices = self.get_active_indices()  # index 已被去激活
             self.lora_B.weight[:, remaining_indices] *= compensation_factor
         
