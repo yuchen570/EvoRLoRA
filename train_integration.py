@@ -325,6 +325,7 @@ def train_evo_lora_step(
 
             was_training = model.training
             model.eval()
+            unwrapped_model = getattr(model, "module", model)
 
             rewards: List[Tuple[float, Optional[ModuleMutation], float, float]] = []
             with torch.no_grad():
@@ -332,7 +333,7 @@ def train_evo_lora_step(
                 for val_inputs, val_targets in val_batches:
                     val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
                     val_targets_dev = val_targets.to(model_device)
-                    base_logits = model(val_inputs_dev)
+                    base_logits = unwrapped_model(val_inputs_dev)
                     base_eval_losses.append(loss_fn(base_logits, val_targets_dev).detach())
                 base_eval_loss = torch.stack(base_eval_losses).mean()
                 if dist.is_available() and dist.is_initialized():
@@ -359,7 +360,7 @@ def train_evo_lora_step(
                         for val_inputs, val_targets in val_batches:
                             val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
                             val_targets_dev = val_targets.to(model_device)
-                            val_logits = model(val_inputs_dev)
+                            val_logits = unwrapped_model(val_inputs_dev)
                             batch_eval_loss = loss_fn(val_logits, val_targets_dev)
                             eval_losses.append(batch_eval_loss.detach())
 
