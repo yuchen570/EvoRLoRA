@@ -104,7 +104,7 @@ class EvoRankLoRALayer(nn.Module):
         
         # 若所有组件都被 de-activate（通常由 r_min 控制避免发生），直接返回 0
         if len(active_indices) == 0:
-            return torch.zeros((x.size(0), self.out_features), device=x.device, dtype=x.dtype)
+            return torch.zeros((*x.shape[:-1], self.out_features), device=x.device, dtype=x.dtype)
             
         x = self.lora_dropout(x)
         

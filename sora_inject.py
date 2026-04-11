@@ -159,8 +159,6 @@ class SparseAdamW(torch.optim.AdamW):
                 # Soft-thresholding: θ ← sign(θ) · max(|θ| - λ, 0)
                 # 阈值直接使用 sparse_lambda（不乘以 lr），与原始 sparse_optimizer.py 一致
                 if self.sparse_lambda > 0:
-                    p.data[p.data > self.sparse_lambda] -= self.sparse_lambda
-                    p.data[p.data < -self.sparse_lambda] += self.sparse_lambda
-                    p.data[p.data.abs() < self.sparse_lambda] = 0.0
+                    p.data = torch.sign(p.data) * torch.clamp(p.data.abs() - self.sparse_lambda, min=0.0)
 
         return loss
