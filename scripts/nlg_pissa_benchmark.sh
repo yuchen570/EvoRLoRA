@@ -10,7 +10,7 @@
 
 mkdir -p logs runs artifacts/nlg
 
-MODELS=("meta-llama/Llama-2-7b-hf" "mistralai/Mistral-7B-v0.1" "google/gemma-7b")
+MODELS=("models/meta-llama/Llama-2-7b-hf" "models/mistralai/Mistral-7B-v0.1" "models/google/gemma-7b")
 TASKS=("metamath:100000" "python" "conversation")
 METHODS=("lora" "lora_kaiming" "pissa" "evorank" "adalora" "sora" "flatlora" "toplora")
 SEEDS=(42 123 321)
@@ -18,7 +18,7 @@ SEEDS=(42 123 321)
 # === 如果你想在 1 台拥有 8 个 GPU 的机器上跑完整评测，循环全部即可 ===
 # 但是单次耗时非常久，建议先使用单模型、单任务、单种子跑一遍冒烟测试：
 
-MODEL="meta-llama/Llama-2-7b-hf"
+MODEL="models/meta-llama/Llama-2-7b-hf"
 TASK="metamath:100000"
 SEED=42
 

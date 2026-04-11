@@ -37,6 +37,29 @@ from glue_metrics import collect_nlu_predictions, compute_glue_primary_metric, g
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+def check_local_model(model_name_or_path, cache_dir="models"):
+    """检查模型是否已存在于本地缓存中，以决定是否开启 offline 模式"""
+    if os.path.exists(model_name_or_path) and os.path.isdir(model_name_or_path):
+        return True
+    # 简单的 heuristic：检查 cache_dir 下是否有对应的 slug 文件夹
+    slug = model_name_or_path.replace("/", "--")
+    if os.path.exists(os.path.join(cache_dir, f"models--{slug}")):
+        return True
+    return False
+
+def check_local_dataset(path, name=None, cache_dir="datasets"):
+    """检查数据集是否已存在于本地缓存中"""
+    if os.path.exists(path) and os.path.isdir(path):
+        return True
+    slug = path.replace("/", "--")
+    dataset_path = os.path.join(cache_dir, slug)
+    if name:
+        dataset_path = os.path.join(dataset_path, name)
+    # Datasets 缓存结构较复杂，这里仅做基本目录检查
+    if os.path.exists(dataset_path):
+        return True
+    return False
+
 
 def _linear_warmup_decay_lr_lambda(num_warmup_steps: int, num_training_steps: int):
     """
@@ -343,10 +366,28 @@ def setup_data_and_model(
 ) -> Tuple[DataLoader, DataLoader, Optional[Union[DataLoader, Dict[str, DataLoader]]], nn.Module, AutoTokenizer]:
     os.makedirs(dataset_cache_dir, exist_ok=True)
     os.makedirs(model_cache_dir, exist_ok=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=model_cache_dir)
+    
+    use_local_model = check_local_model(model_name, model_cache_dir)
+    
+    # DDP 环境下让 Rank 0 先下载
+    if ddp_enabled and world_size > 1 and rank != 0:
+        dist.barrier()
+        
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, 
+        cache_dir=model_cache_dir, 
+        local_files_only=use_local_model
+    )
 
     if task_type == "nlu":
-        dataset = load_dataset("glue", task_name, cache_dir=dataset_cache_dir)
+        # 如果是 GLUE 任务，load_dataset("glue", task_name)
+        use_local_ds = check_local_dataset("glue", task_name, dataset_cache_dir)
+        dataset = load_dataset(
+            "glue", 
+            task_name, 
+            cache_dir=dataset_cache_dir, 
+            local_files_only=use_local_ds
+        )
 
         if task_name not in GLUE_TASK_SENTENCE_KEYS:
             raise ValueError(
@@ -464,6 +505,7 @@ def setup_data_and_model(
                 num_labels=1,
                 problem_type="regression",
                 cache_dir=model_cache_dir,
+                local_files_only=use_local_model,
             )
         else:
             label_feature = dataset[train_split].features.get("label", None)
@@ -475,7 +517,12 @@ def setup_data_and_model(
                 model_name,
                 num_labels=num_labels,
                 cache_dir=model_cache_dir,
+                local_files_only=use_local_model,
             )
+        
+        # Rank 0 完成加载/下载后释放其它进程
+        if ddp_enabled and world_size > 1 and rank == 0:
+            dist.barrier()
         if rank == 0 and task_name in {"cola", "rte"}:
             train_labels = dataset[train_split]["label"]
             val_labels = dataset[val_split]["label"]
@@ -503,11 +550,22 @@ def setup_data_and_model(
 
     if task_type == "nlg":
         if nlg_dataset_name == "cnn_dailymail":
-            dataset = load_dataset("cnn_dailymail", "3.0.0", cache_dir=dataset_cache_dir)
+            use_local_ds = check_local_dataset("cnn_dailymail", "3.0.0", dataset_cache_dir)
+            dataset = load_dataset(
+                "cnn_dailymail", 
+                "3.0.0", 
+                cache_dir=dataset_cache_dir,
+                local_files_only=use_local_ds
+            )
             text_key = "article"
             target_key = "highlights"
         elif nlg_dataset_name == "xsum":
-            dataset = load_dataset("xsum", cache_dir=dataset_cache_dir)
+            use_local_ds = check_local_dataset("xsum", None, dataset_cache_dir)
+            dataset = load_dataset(
+                "xsum", 
+                cache_dir=dataset_cache_dir,
+                local_files_only=use_local_ds
+            )
             text_key = "document"
             target_key = "summary"
         else:
@@ -578,7 +636,16 @@ def setup_data_and_model(
 
         train_loader, val_loader, val_loader_eval_full = _make_loaders_nlg(seed)
 
-        base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, cache_dir=model_cache_dir)
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name, 
+            cache_dir=model_cache_dir,
+            local_files_only=use_local_model
+        )
+
+        # Rank 0 完成加载/下载后释放其它进程
+        if ddp_enabled and world_size > 1 and rank == 0:
+            dist.barrier()
+            
         return train_loader, val_loader, val_loader_eval_full, base_model, tokenizer, _make_loaders_nlg
 
     raise ValueError(f"未知 task_type: {task_type}")
