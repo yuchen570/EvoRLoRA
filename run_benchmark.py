@@ -1339,12 +1339,16 @@ def run_training_loop(
         _gate = [p for n, p in model.named_parameters() if p.requires_grad and n.endswith(".gate")]
 
         sora_wd = 0.1 if weight_decay == 0.01 else weight_decay
+        dynamic_wd_peft = sora_wd
+        _head_wd = sora_wd
+        _adam_wd = sora_wd
+        _adam_eps = 1e-6
 
         optimizer = AdamW([
             {"params": _non_gate_peft_decay, "lr": lr, "weight_decay": sora_wd},
             {"params": _non_gate_peft_no_decay, "lr": lr, "weight_decay": 0.0},
             {"params": _non_gate_head, "lr": head_lr_val, "weight_decay": sora_wd},
-        ], weight_decay=sora_wd, eps=1e-6)  # DeBERTa fp16 参数需要 eps=1e-6 防止分母下溢
+        ], weight_decay=_adam_wd, eps=_adam_eps)  # DeBERTa fp16 参数需要 eps=1e-6 防止分母下溢
         sparse_optimizer = SparseAdamW(
             _gate,
             lr=lr,
