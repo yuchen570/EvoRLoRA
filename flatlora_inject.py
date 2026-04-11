@@ -71,12 +71,13 @@ class FlatLoRAHookManager:
             data_equiv = md.data + scaling * (weight_B @ weight_A)
             
             # W'_{i,:} 的二范数计算（针对 out_features 进行 Row-wise/Filter-wise 计算）
-            norm_sq = torch.norm(data_equiv, dim=1, keepdim=True)
-            filter_norm = factor * (self.flatlora_rho + 1e-16) / math.sqrt(data_equiv.shape[1]) * norm_sq
+            # 强制用 fp32 算 norm 防止 fp16/bf16 下溢或 NaN
+            norm_sq = torch.norm(data_equiv.float(), dim=1, keepdim=True).to(data_equiv.dtype)
+            filter_norm = (factor * (self.flatlora_rho + 1e-16) / math.sqrt(data_equiv.shape[1]) * norm_sq).nan_to_num(0.0).clamp(min=1e-8)
 
             # 重置随机状态，使用统一 dtype/device
             torch.manual_seed(cur_seed)
-            tmp = torch.normal(0, filter_norm.repeat(1, md.shape[1])).to(dtype=md.dtype, device=md.device)
+            tmp = torch.normal(mean=0.0, std=filter_norm.repeat(1, md.shape[1])).to(dtype=md.dtype, device=md.device)
             md.data += tmp
 
             # 把极低的负担移交给 CPU 侧的字典中
@@ -100,7 +101,7 @@ class FlatLoRAHookManager:
                 # 重新应用相同的种子重建随机矩阵进行还原
                 torch.manual_seed(cur_seed)
                 filter_norm = filter_norm_cpu.to(device=md.device, dtype=md.dtype)
-                tmp = torch.normal(0, filter_norm.repeat(1, md.shape[1])).to(dtype=md.dtype, device=md.device)
+                tmp = torch.normal(mean=0.0, std=filter_norm.repeat(1, md.shape[1])).to(dtype=md.dtype, device=md.device)
                 
                 md.data -= tmp
 
