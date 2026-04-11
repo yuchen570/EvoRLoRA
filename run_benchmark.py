@@ -382,12 +382,15 @@ def setup_data_and_model(
     if task_type == "nlu":
         # 如果是 GLUE 任务，load_dataset("glue", task_name)
         use_local_ds = check_local_dataset("glue", task_name, dataset_cache_dir)
+        if use_local_ds:
+            os.environ["HF_DATASETS_OFFLINE"] = "1"
         dataset = load_dataset(
             "glue", 
             task_name, 
-            cache_dir=dataset_cache_dir, 
-            local_files_only=use_local_ds
+            cache_dir=dataset_cache_dir
         )
+        if use_local_ds:
+            os.environ.pop("HF_DATASETS_OFFLINE", None)
 
         if task_name not in GLUE_TASK_SENTENCE_KEYS:
             raise ValueError(
@@ -551,21 +554,27 @@ def setup_data_and_model(
     if task_type == "nlg":
         if nlg_dataset_name == "cnn_dailymail":
             use_local_ds = check_local_dataset("cnn_dailymail", "3.0.0", dataset_cache_dir)
+            if use_local_ds:
+                os.environ["HF_DATASETS_OFFLINE"] = "1"
             dataset = load_dataset(
                 "cnn_dailymail", 
                 "3.0.0", 
-                cache_dir=dataset_cache_dir,
-                local_files_only=use_local_ds
+                cache_dir=dataset_cache_dir
             )
+            if use_local_ds:
+                os.environ.pop("HF_DATASETS_OFFLINE", None)
             text_key = "article"
             target_key = "highlights"
         elif nlg_dataset_name == "xsum":
             use_local_ds = check_local_dataset("xsum", None, dataset_cache_dir)
+            if use_local_ds:
+                os.environ["HF_DATASETS_OFFLINE"] = "1"
             dataset = load_dataset(
                 "xsum", 
-                cache_dir=dataset_cache_dir,
-                local_files_only=use_local_ds
+                cache_dir=dataset_cache_dir
             )
+            if use_local_ds:
+                os.environ.pop("HF_DATASETS_OFFLINE", None)
             text_key = "document"
             target_key = "summary"
         else:
