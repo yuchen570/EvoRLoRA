@@ -706,7 +706,11 @@ def peft_factory(
         # DeBERTa：LoRA 梯度幅度随层内激活范数放大，易出现早期数值爆炸（见 huggingface/peft#3073 等讨论）。
         # RSLoRA（alpha/sqrt(r)）可显著缓和该问题；与 AdaLoRA/其他方法对比时仅影响标准 lora 分支。
         # PiSSA：PEFT 原生 SVD 主成分初始化 + 残差基座冻结，训练循环与标准 LoRA 相同（仅对 pissa 设置 init_lora_weights）。
-        _lora_dropout = 0.0 if "deberta" in model_type else 0.1
+        # PiSSA 要求 dropout=0：主成分奇异向量被 dropout 随机丢弃会破坏 SVD 初始化优势（见 PiSSA/README.md）。
+        if method_name == "pissa":
+            _lora_dropout = 0.0
+        else:
+            _lora_dropout = 0.0 if "deberta" in model_type else 0.1
         if comparison_protocol == "controlled_fair":
             _lora_dropout = float(protocol_dropout)
         effective_dropout_val = float(_lora_dropout)
@@ -722,7 +726,8 @@ def peft_factory(
             use_rslora=False,
         )
         if method_name == "pissa":
-            _lora_kw["init_lora_weights"] = "pissa"
+            init_method = getattr(args, "pissa_init_method", "pissa") if args else "pissa"
+            _lora_kw["init_lora_weights"] = init_method
         config = LoraConfig(**_lora_kw)
         model = get_peft_model(model, config)
 
@@ -2249,6 +2254,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="AdaLoRA 末尾不调秩阶段步数 tfinal，默认 floor(0.1*total_step)（与 peft_factory 实际默认一致）",
+    )
+    parser.add_argument(
+        "--pissa_init_method",
+        type=str,
+        default="pissa",
+        choices=["pissa", "pissa_niter_16"],
+        help="PiSSA SVD 初始化方式。'pissa' 为标准完整 SVD，'pissa_niter_16' 为幂迭代快速SVD（适合大模型和生成任务，大大加快初始化）。",
     )
     parser.add_argument(
         "--adalora_orth_reg_weight",

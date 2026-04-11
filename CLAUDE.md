@@ -58,6 +58,17 @@ python scripts/summarize_evorank_ablation.py
 python scripts/summarize_evorank_reallocation_efficiency.py
 ```
 
+**NLG summarization benchmarks:**
+```bash
+bash scripts/fair_nlg_cnndailymail.sh   # BART-large × CNN/DailyMail, 2GPU
+bash scripts/fair_nlg_xsum.sh           # BART-large × XSum, 2GPU
+```
+
+**Generate paper-format GLUE table:**
+```bash
+python scripts/generate_glue_table.py   # reads results_fair_glue_deberta_*.csv from cwd
+```
+
 ## Architecture
 
 ### Core Files
@@ -68,11 +79,26 @@ python scripts/summarize_evorank_reallocation_efficiency.py
 | `rank_evolution_controller.py` | `RankEvolutionController`: expand/prune/reallocate mutations, EMA statistics, dynamic thresholds, cooldown |
 | `train_integration.py` | `inject_evo_lora()` model injection; `train_evo_lora_step()` dual time-scale loop |
 | `run_benchmark.py` | Main entry point (2558 lines): all CLI args, GLUE+NLG data loading, training loop, CSV export |
+| `run_nlg_benchmark.py` | NLG entry point: SFT on instruction-following datasets; single `--method` per invocation (not a multi-method sweep); targets CausalLM (Llama-2-7b default); no CSV export, different CLI conventions from `run_benchmark.py` |
 | `glue_metrics.py` | Task-specific metrics: Matthews (CoLA), F1 (MRPC/QQP), Pearson+Spearman mean (STS-B), Accuracy (rest) |
-| `sora_inject.py` | `SoRALinear` + `SparseAdamW` proximal gradient optimizer |
-| `toplora_inject.py` | `TopSingularValue` per-token singular value gating |
-| `flatlora_inject.py` | Gaussian noise injection via hooks for flat minima regularization |
+| `sora_inject.py` | `SoRALinear` (per-rank soft-threshold gate); `SparseAdamW`: full AdamW update with proximal soft-thresholding on gate params (threshold = `sparse_lambda`, not `lr × sparse_lambda`); supports `linear`/`log_linear`/`exp_linear` lambda schedules |
+| `toplora_inject.py` | `TopSingularValue`: token-wise scaling `λ(x) = exp(RMSNorm(x @ W_λ))`, `W_λ ∈ R^{d_in × r}`, Kaiming fan_out init; applied between lora_A and lora_B projections; extra param cost = `d_in × r` per layer |
+| `flatlora_inject.py` | `FlatLoRAHookManager`: cosine-increasing noise schedule `factor = 0.5(1 − cos(πt/T))`; per-row norm scaling; noise added in `forward_pre_hook`, subtracted deterministically in `full_backward_hook` via stored seed — O(out_features) memory |
 | `adalora_utils.py` | Orthogonal regularization loss + rank budget update helpers |
+| `configs/ds_config_zero2_no_offload.json` | DeepSpeed ZeRO-2 (bf16, no CPU offload, `overlap_comm=True`); used by `run_nlg_benchmark.py` with large CausalLMs; not used by `run_benchmark.py` (native DDP) |
+
+### Reference Implementations (not part of harness)
+
+The following subdirectories contain original paper source code for algorithm verification only. Do not import from them in new code.
+
+| Directory | Source |
+|-----------|--------|
+| `AdaLoRA/` | Official AdaLoRA repo (NLU/ and NLG_QA/ branches) |
+| `LoRA/` | Original LoRA loralib |
+| `PiSSA/` | PiSSA training scripts and utilities |
+| `SoRA/` | TsinghuaC3I/SoRA reference |
+| `Flat-LoRA/` | Flat-LoRA ICML 2025 reference |
+| `toplora-neurips25/` | TopLoRA NeurIPS 2025 reference |
 
 ### Dual Time-Scale Training (EvoRank)
 
@@ -98,5 +124,14 @@ CSV output aggregates across seeds with mean/std rows per `task×backbone×metho
 - **`--expand_init_mode gradient`**: uses projected gradient principal singular vector (Proposition 3.2) for new rank-1 slot initialization; `zero` is cold-start. Only affects `evorank`; safe to pass for all-method runs.
 - **DDP**: validation metrics computed on rank0 over full dev set, then broadcast. Artifacts written by rank0 only.
 - **`--evo_max_reallocate_candidates 8`**: limits cross-layer reallocation candidates to prevent combinatorial explosion; set to `0` for unlimited (ablation only).
-- **EvoRank warmup cap**: EvoRank 的 LR warmup 和 ES warmup 均被限制为 `min(warmup_steps, max(20, 10% × steps_per_epoch))`。LoRA B=0 零初始化 + 长 warmup（如 6% × 6240 = 374 步）下 ΔW ∝ LR² 二次增长阻滞会导致训练崩溃；cap 后 warmup 约 30 步，B 在第一 epoch 内充分增长，ES 统计量可靠。LR 衰减段不变。
-- **`--evorank_use_rslora`**: 默认 False（标准 LoRA 缩放 α/r），可选 True 开启 rsLoRA（α/√r）。注意 rsLoRA 在小数据集 + 高 lr 下可能导致训练不稳定。
+- **EvoRank warmup cap**: Both LR warmup and ES warmup are capped to `min(warmup_steps, max(20, 10% × steps_per_epoch))`. With LoRA B=0 zero-init, a long warmup (e.g., 6% × 6240 = 374 steps) causes quadratic ΔW ∝ LR² growth stall that collapses training. The cap brings warmup to ~30 steps so lora_B grows meaningfully within the first epoch and ES statistics become reliable. The LR decay phase is unaffected.
+- **`--evorank_use_rslora`**: Defaults to `False` (standard LoRA scaling α/r). Set to `True` to enable rsLoRA (α/√r). rsLoRA can cause training instability on small datasets with high learning rates.
+
+## Engineering Decisions (Paper–Code Gaps)
+
+These implementation choices deviate from a naive reading of the paper and are not obvious from the algorithm description alone.
+
+- **Optimizer state reset on rank change**: When a mutation is committed, AdamW `exp_avg` and `exp_avg_sq` are zeroed for the affected rank-1 slot (columns of lora_B, rows of lora_A). Without this, stale momentum from a previously-pruned slot corrupts the newly-activated one.
+- **Gradient lower bound uses projected r×k matrix, not full d×k**: `_compute_gradient_rank1_direction()` runs power iteration on the implicit product of `∂L/∂B[:, active]` and `(A^T A + εI)^{-1} A^T`, avoiding materializing the full `(out, in)` gradient approximation — O(r(out+in)) per iteration, prevents OOM on large layers.
+- **EMA initialization is direct assignment on first call**: On the first invocation of `update_statistics()`, `ema_u` and `ema_s` are set to the raw values directly (not `0.1 × value`). Cold-start fix to avoid the tracker spending many steps recovering from a zero-initialized state before the first rank decision.
+- **Power iteration for rank-1 init runs 5 iterations**: `_power_iteration_rank1()` defaults to `num_iters=5`, sufficient for a reliable principal singular vector estimate at O(r(out+in)) per iter. Full SVD is never called on the weight gradient.

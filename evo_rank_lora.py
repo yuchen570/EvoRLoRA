@@ -291,18 +291,20 @@ class EvoRankLoRALayer(nn.Module):
             return None
 
         idx_t = torch.as_tensor(active_idx, device=self.lora_A.weight.device, dtype=torch.long)
-        gb = self.lora_B.weight.grad.index_select(1, idx_t).float()
-        a = self.lora_A.weight.index_select(0, idx_t).float()
-
-        N = gb / s                    # (out, r)
-        at = a.T                      # (in, r)
-        ata = at.T @ at               # (r, r)
-        M = torch.linalg.solve(
-            ata + 1e-6 * torch.eye(ata.size(0), device=ata.device, dtype=ata.dtype),
-            at.T,
-        )                             # (r, in)
-
-        return self._power_iteration_rank1(N, M)
+        
+        with torch.autocast(device_type=self.lora_A.weight.device.type if self.lora_A.weight.device.type != "meta" else "cpu", enabled=False):
+            gb = self.lora_B.weight.grad.index_select(1, idx_t).float()
+            a = self.lora_A.weight.index_select(0, idx_t).float()
+    
+            N = gb / s                    # (out, r)
+            at = a.T                      # (in, r)
+            ata = at.T @ at               # (r, r)
+            M = torch.linalg.solve(
+                ata + 1e-6 * torch.eye(ata.size(0), device=ata.device, dtype=ata.dtype),
+                at.T,
+            )                             # (r, in)
+    
+            return self._power_iteration_rank1(N, M)
 
     @torch.no_grad()
     def compute_gradient_rank1_direction(
@@ -438,20 +440,22 @@ class EvoRankLoRALayer(nn.Module):
             return 0.0
 
         idx_t = torch.as_tensor(active_idx, device=self.lora_A.weight.device, dtype=torch.long)
-        gb = self.lora_B.weight.grad.index_select(1, idx_t).float()
-        a = self.lora_A.weight.index_select(0, idx_t).float()
-        n = gb / s
-        at = a.T  # (in_features, r_active)
-        # 正则化正规方程替代 SVD 伪逆，避免 pinv 底层 SVD 的瞬间显存峰值：
-        # A^+ = (A^T A + εI)^{-1} A^T，其中 A^T A 仅为 (r, r) 极小矩阵。
-        ata = at.T @ at  # (r, r)
-        m = torch.linalg.solve(
-            ata + 1e-6 * torch.eye(ata.size(0), device=ata.device, dtype=ata.dtype),
-            at.T,
-        )  # (r, in_features)
-        s_mtx = n.T @ n
-        t_mtx = m @ m.T
-        gf_sq = torch.trace(s_mtx @ t_mtx).clamp(min=0.0)
+        
+        with torch.autocast(device_type=self.lora_A.weight.device.type if self.lora_A.weight.device.type != "meta" else "cpu", enabled=False):
+            gb = self.lora_B.weight.grad.index_select(1, idx_t).float()
+            a = self.lora_A.weight.index_select(0, idx_t).float()
+            n = gb / s
+            at = a.T  # (in_features, r_active)
+            # 正则化正规方程替代 SVD 伪逆，避免 pinv 底层 SVD 的瞬间显存峰值：
+            # A^+ = (A^T A + εI)^{-1} A^T，其中 A^T A 仅为 (r, r) 极小矩阵。
+            ata = at.T @ at  # (r, r)
+            m = torch.linalg.solve(
+                ata + 1e-6 * torch.eye(ata.size(0), device=ata.device, dtype=ata.dtype),
+                at.T,
+            )  # (r, in_features)
+            s_mtx = n.T @ n
+            t_mtx = m @ m.T
+            gf_sq = torch.trace(s_mtx @ t_mtx).clamp(min=0.0)
         return float(torch.sqrt(gf_sq).item())
 
     def merge(self, W: nn.Parameter):
