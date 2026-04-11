@@ -17,7 +17,7 @@ def format_metric(val):
 def main():
     # 查找所有可能的 CSV 结果文件
     csv_files = glob.glob("artifacts/*.csv") + glob.glob("*.csv")
-    target_csvs = ["results_fair_glue_deberta_ddp.csv", "results_fair_glue_deberta_rte_ddp.csv"]
+    target_csvs = ["results_fair_glue_deberta_large_ddp.csv", "results_fair_glue_deberta_small_ddp.csv"]
     valid_csvs = [f for f in target_csvs if os.path.exists(f)]
     
     if not valid_csvs:
