@@ -692,6 +692,7 @@ def peft_factory(
     evorank_cooldown_steps: int = 2,
     evorank_allow_reallocation: bool = True,
     evorank_max_reallocate_candidates: int = 8,
+    evorank_compensation_mode: str = "B",
     toplora_dropout: float = 0.05,
 ) -> Tuple[nn.Module, Optional[RankEvolutionController], Dict[str, Any]]:
     def _collect_all_linear_target_modules(m: nn.Module) -> List[str]:
@@ -877,6 +878,7 @@ def peft_factory(
                 "r_init": target_rank,
                 "lora_alpha": effective_alpha,
                 "use_rslora": bool(evorank_use_rslora),
+                "compensation_mode": evorank_compensation_mode, # 补偿模式：B, A, 或 Both
             },
             controller_kwargs={
                 "rho": float(evorank_rho),
@@ -2408,6 +2410,13 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="EvoRank 默认的跨层 reallocation 候选上限。候选按 top-k cross 顺序生成，并在达到该上限后停止。设为 0 或负数可关闭限流（允许组合爆炸消融）。",
     )
+    parser.add_argument(
+        "--evo_compensation_mode",
+        type=str,
+        default="B",
+        choices=["B", "A", "Both"],
+        help="EvoRank 秩变更时的等价变换补偿模式。'B': 只对 B 补偿（默认）；'A': 只对 A 补偿；'Both': A/B 各补偿 sqrt(c)。",
+    )
     parser.add_argument("--lambda_pop", type=int, default=None)
     parser.add_argument("--population_strategy", type=str, default="all", choices=["all", "random"])
     parser.add_argument("--seed", type=int, default=42)
@@ -2563,6 +2572,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         evorank_cooldown_steps=args.evo_cooldown_steps,
                         evorank_allow_reallocation=args.evo_allow_reallocation,
                         evorank_max_reallocate_candidates=args.evo_max_reallocate_candidates,
+                        evorank_compensation_mode=args.evo_compensation_mode, # 传递评价中使用的补偿策略
                         toplora_dropout=args.toplora_dropout,
                     )
                     checkpoint_root: Optional[str] = None

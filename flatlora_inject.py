@@ -30,11 +30,16 @@ class FlatLoRAHookManager:
         
         self.global_step = 0
         self.seed_cache = {}
+        self.device_generators = {}
         self.hooks_handles = []
+        
+    def update_step(self, step: int):
+        self.global_step = step
 
-    def update_step(self, global_step: int):
-        """主训练循环同步调用该方法来广播当前的训练步（挂钩调度器）。"""
-        self.global_step = global_step
+    def _get_generator(self, device):
+        if device not in self.device_generators:
+            self.device_generators[device] = torch.Generator(device=device)
+        return self.device_generators[device]
 
     def _flatlora_pre_forward_hook(self, module, args):
         if not module.training:
@@ -44,8 +49,6 @@ class FlatLoRAHookManager:
         # 严格执行: cosine-increasing 调度策略（平缓增大随机性）
         factor = 0.5 * (1 - math.cos(step / self.total_train_steps * math.pi))
         
-        # 使用 global_step 和固定的 module_idx 共同构造确定性的随机种子，
-        # 既能保证不同层之间的噪声相互独立，又能确保在多卡 DDP 训练时各卡的扰动严格一致，避免梯度发散。
         module_idx = getattr(module, "_flatlora_module_idx", 0)
         cur_seed = (step * 9973 + module_idx) % (2**32 - 1)
 
@@ -56,7 +59,6 @@ class FlatLoRAHookManager:
             md = module.weight
 
         with torch.no_grad():
-            # 兼容 Huggingface PEFT 不同的版本抽象 (如 dict 与 ModuleDict)
             if isinstance(module.lora_A, (dict, nn.ModuleDict)):
                 adapter_name = "default" if "default" in module.lora_A else next(iter(module.lora_A.keys()))
                 weight_A = module.lora_A[adapter_name].weight
@@ -70,49 +72,42 @@ class FlatLoRAHookManager:
             # W' = W + s * BA
             data_equiv = md.data + scaling * (weight_B @ weight_A)
             
-            # W'_{i,:} 的二范数计算（针对 out_features 进行 Row-wise/Filter-wise 计算）
-            # 强制用 fp32 算 norm 防止 fp16/bf16 下溢或 NaN
+            # W'_{i,:} 的二范数计算
             norm_sq = torch.norm(data_equiv.float(), dim=1, keepdim=True).to(data_equiv.dtype)
             filter_norm = (factor * (self.flatlora_rho + 1e-16) / math.sqrt(data_equiv.shape[1]) * norm_sq).nan_to_num(0.0).clamp(min=1e-8)
 
-            # 重置随机状态，使用统一 dtype/device
-            torch.manual_seed(cur_seed)
-            tmp = torch.normal(mean=0.0, std=filter_norm.repeat(1, md.shape[1])).to(dtype=md.dtype, device=md.device)
-            md.data += tmp
-
-            # 把极低的负担移交给 CPU 侧的字典中
-            self.seed_cache[id(module)] = (cur_seed, filter_norm.cpu())
+            # 使用独立 Generator 生成噪声，避免干扰模型内的 Dropout
+            gen = self._get_generator(md.device)
+            gen.manual_seed(cur_seed)
+            tmp = torch.normal(mean=0.0, std=filter_norm.repeat(1, md.shape[1]), generator=gen).to(dtype=md.dtype)
+            
+            # 记录原始的高精度权重
+            self.seed_cache[id(module)] = md.data
+            md.data = md.data + tmp
             
         return args
 
-    def _flatlora_post_backward_hook(self, module, grad_input, grad_output):
+    def _flatlora_post_forward_hook(self, module, inputs, output):
+        # Forward执行完后立刻恢复基网络权重，避免污染且无需依赖不可靠的 Backward Hook
         if not module.training:
-            return
-
+            return output
         if id(module) in self.seed_cache:
-            cur_seed, filter_norm_cpu = self.seed_cache.pop(id(module))
-
+            original_data = self.seed_cache.pop(id(module))
             if hasattr(module, "base_layer"):
-                md = module.base_layer.weight
+                module.base_layer.weight.data = original_data
             else:
-                md = module.weight
-
-            with torch.no_grad():
-                # 重新应用相同的种子重建随机矩阵进行还原
-                torch.manual_seed(cur_seed)
-                filter_norm = filter_norm_cpu.to(device=md.device, dtype=md.dtype)
-                tmp = torch.normal(mean=0.0, std=filter_norm.repeat(1, md.shape[1])).to(dtype=md.dtype, device=md.device)
-                
-                md.data -= tmp
+                module.weight.data = original_data
+        return output
 
     def attach_hooks(self):
-        """遍历模型寻找所有的 LoraLinear，并植入前向与反向钩子。"""
+        """遍历模型寻找所有的 LoraLinear，并植入前向与反向恢复钩子。"""
         module_idx = 0
         for n, module in self.model.named_modules():
             if type(module).__name__ == "Linear" and hasattr(module, "lora_A"):
                 module._flatlora_module_idx = module_idx
                 h1 = module.register_forward_pre_hook(self._flatlora_pre_forward_hook)
-                h2 = module.register_full_backward_hook(self._flatlora_post_backward_hook)
+                # 使用 forward_hook 恢复，确保在 loss 产生前完美恢复干净状态
+                h2 = module.register_forward_hook(self._flatlora_post_forward_hook)
                 self.hooks_handles.extend([h1, h2])
                 module_idx += 1
 

@@ -249,7 +249,17 @@ def train_evo_lora_step(
     optimizer.zero_grad(set_to_none=True)
     logits = model(inputs)
     train_loss = loss_fn(logits, targets)
-    train_loss.backward()
+    
+    if torch.isnan(train_loss).any() or torch.isinf(train_loss).any():
+        print(f"[FATAL] train_loss is NaN/Inf at step {step}!")
+        print(f"[FATAL] logits has NaNs: {torch.isnan(logits).any()}")
+        
+    try:
+        train_loss.backward()
+    except RuntimeError as e:
+        print(f"[FATAL] Backward failed at step {step} with error: {e}")
+        print(f"[FATAL] Logits NaN? {torch.isnan(logits).any()}, Train Loss NaN? {torch.isnan(train_loss).any()}")
+        raise e
 
     result: Dict[str, Any] = {
         "train_loss": float(train_loss.detach().item()),

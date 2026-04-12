@@ -40,6 +40,7 @@ class EvoRankLoRALayer(nn.Module):
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.0,
         use_rslora: bool = False,
+        compensation_mode: str = "B",
         debug: bool = False,
     ):
         super().__init__()
@@ -49,6 +50,7 @@ class EvoRankLoRALayer(nn.Module):
         self.r_max = r_max
         self.lora_alpha = lora_alpha
         self.use_rslora = bool(use_rslora)
+        self.compensation_mode = compensation_mode # "B", "A", 或 "Both"
         self.debug = debug  # 调试模式：开启后会检查全零梯度（触发 GPU->CPU 同步，DDP 下慎用）
         
         if r_init > r_max:
@@ -162,15 +164,24 @@ class EvoRankLoRALayer(nn.Module):
             nn.init.kaiming_uniform_(self.lora_A.weight[index:index + 1, :], a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight[:, index])
         
-        # Double Scaling 防护：应用补偿因子
-        # 缩放因子从 s(prev_rank) 降为 s(new_rank)，
-        # 要保持旧组件的 DeltaW = B * A 总幅值不变，需要放大旧权重。
-        # 关键：只补偿 B 一侧！若同时乘到 A 和 B 上，实际效果是 c^2，会导致激活值炸飞。
-        # c = s(prev) / s(new)  →  rsLoRA: sqrt(new/prev), 标准: new/prev
+        # Double Scaling 防护：应用等价变换（Function-Preserving Transformation）
+        # 缩放因子从 s(prev_rank) 降为 s(new_rank)，为了保持 ΔW = s * B * A 输出不变，需补偿旧权重。
+        # c = s(prev) / s(new)
         if prev_rank > 0:
-             compensation_factor = self.get_scaling_factor(prev_rank) / self.get_scaling_factor(new_rank)
-             old_indices = [i for i, m in enumerate(self.active_mask.tolist()) if m and i != index]
-             self.lora_B.weight[:, old_indices] *= compensation_factor
+            c = self.get_scaling_factor(prev_rank) / self.get_scaling_factor(new_rank)
+            old_indices = [i for i, m in enumerate(self.active_mask.tolist()) if m and i != index]
+            
+            if self.compensation_mode == "B":
+                # 方案 1：只补偿 B（默认，最安全，B 为零初值 gate）
+                self.lora_B.weight[:, old_indices] *= c
+            elif self.compensation_mode == "A":
+                # 方案 2：只补偿 A
+                self.lora_A.weight[old_indices, :] *= c
+            elif self.compensation_mode == "Both":
+                # 方案 3：同时补偿 A 和 B，各取 sqrt(c) 以防数值爆炸
+                c_half = math.sqrt(c)
+                self.lora_B.weight[:, old_indices] *= c_half
+                self.lora_A.weight[old_indices, :] *= c_half
 
     @torch.no_grad()
     def deactivate_component(self, index: int):
@@ -193,12 +204,20 @@ class EvoRankLoRALayer(nn.Module):
         self.active_mask[index] = False
         
         # 反向补偿：缩放因子从 s(prev_rank) 变为 s(new_rank)（变大），
-        # 留下来的组件输出会被放大。为了防止微调后期 Loss 突然毛刺，对留下来的组件乘以衰减系数对冲。
-        # c = s(prev) / s(new) < 1  →  rsLoRA: sqrt(new/prev), 标准: new/prev
+        # 留下来的组件输出会被放大。为了保持输出连续性，需按 compensation_mode 进行对冲。
+        # c = s(prev) / s(new) < 1
         if new_rank > 0:
-            compensation_factor = self.get_scaling_factor(prev_rank) / self.get_scaling_factor(new_rank)
+            c = self.get_scaling_factor(prev_rank) / self.get_scaling_factor(new_rank)
             remaining_indices = self.get_active_indices()  # index 已被去激活
-            self.lora_B.weight[:, remaining_indices] *= compensation_factor
+            
+            if self.compensation_mode == "B":
+                self.lora_B.weight[:, remaining_indices] *= c
+            elif self.compensation_mode == "A":
+                self.lora_A.weight[remaining_indices, :] *= c
+            elif self.compensation_mode == "Both":
+                c_half = math.sqrt(c)
+                self.lora_B.weight[:, remaining_indices] *= c_half
+                self.lora_A.weight[remaining_indices, :] *= c_half
         
     def get_active_indices(self) -> List[int]:
         """使用原生 nonzero() 避免 CPU-GPU 同步和列表转换开销"""
