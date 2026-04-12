@@ -784,12 +784,13 @@ def peft_factory(
         # RSLoRA（alpha/sqrt(r)）可显著缓和该问题；与 AdaLoRA/其他方法对比时仅影响标准 lora 分支。
         # PiSSA：PEFT 原生 SVD 主成分初始化 + 残差基座冻结，训练循环与标准 LoRA 相同（仅对 pissa 设置 init_lora_weights）。
         # PiSSA 要求 dropout=0：主成分奇异向量被 dropout 随机丢弃会破坏 SVD 初始化优势（见 PiSSA/README.md）。
-        if method_name == "pissa":
-            _lora_dropout = 0.0
-        else:
-            _lora_dropout = 0.0 if "deberta" in model_type else 0.1
         if comparison_protocol == "controlled_fair":
             _lora_dropout = float(protocol_dropout)
+        else:
+            _lora_dropout = 0.0 if "deberta" in model_type else 0.1
+        # PiSSA 必须固定 dropout=0，不受统一 protocol_dropout 覆盖
+        if method_name == "pissa":
+            _lora_dropout = 0.0
         effective_dropout_val = float(_lora_dropout)
         _lora_kw: Dict[str, Any] = dict(
             task_type=peft_task_type,
@@ -1605,7 +1606,6 @@ def run_training_loop(
         from flatlora_inject import FlatLoRAHookManager
         total_steps_for_factor = max_train_steps if max_train_steps is not None else epochs * len(train_loader)
         flatlora_manager = FlatLoRAHookManager(model, flatlora_rho, total_steps_for_factor)
-        flatlora_manager.attach_hooks()
     # ==================================
     
     try:
@@ -1624,7 +1624,7 @@ def run_training_loop(
                 train_loader.sampler.set_epoch(epoch)
             for batch in train_loader:
                 if flatlora_manager is not None:
-                    flatlora_manager.update_step(global_step)
+                    flatlora_manager.prepare_step(global_step)
     
                 batch = batch_to_device(batch, device)
                 features, labels = extract_features_and_labels(batch, task_type=task_type)
@@ -1681,6 +1681,8 @@ def run_training_loop(
                     optimizer.zero_grad(set_to_none=True)
                     if sparse_optimizer is not None:
                         sparse_optimizer.zero_grad(set_to_none=True)
+                    if flatlora_manager is not None:
+                        flatlora_manager.perturb_before_forward()
                     logits = model(features)
                     loss = loss_fn(logits, labels)
                     if method_name == "adalora":
@@ -1712,7 +1714,11 @@ def run_training_loop(
                                 f"gate|abs| min={float(_gate_vals.min().item()):.4e} max={float(_gate_vals.max().item()):.4e} "
                                 f"mean={float(_gate_vals.mean().item()):.4e} zero_ratio={_gate_zero_ratio:.4f}"
                             )
-                    loss.backward()
+                    try:
+                        loss.backward()
+                    finally:
+                        if flatlora_manager is not None:
+                            flatlora_manager.restore_after_backward()
                     grad_norm_total: Optional[float] = None
                     if max_grad_norm is not None and max_grad_norm > 0:
                         _gn = torch.nn.utils.clip_grad_norm_(

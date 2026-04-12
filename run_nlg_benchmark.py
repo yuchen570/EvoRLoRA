@@ -420,7 +420,6 @@ def run_sft_training(args, method: str):
     flatlora_manager = None
     if method == "flatlora":
         flatlora_manager = FlatLoRAHookManager(model, args.flatlora_rho, total_steps)
-        flatlora_manager.attach_hooks()
 
     # ======= 训练循环 =======
     global_step = 0
@@ -441,7 +440,7 @@ def run_sft_training(args, method: str):
             batch = {k: v.to(device) for k, v in batch.items()}
             
             if flatlora_manager is not None:
-                flatlora_manager.update_step(global_step)
+                flatlora_manager.prepare_step(global_step)
                 
             if method == "evorank":
                 # EvoRank 的自定义步（仅限前向和反向）
@@ -471,6 +470,8 @@ def run_sft_training(args, method: str):
                 loss = torch.tensor(out["train_loss"], device=device)
             else:
                 with torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", dtype=dtype):
+                    if flatlora_manager is not None:
+                        flatlora_manager.perturb_before_forward()
                     outputs = model(**batch)
                     loss = outputs.loss
                 
@@ -483,7 +484,11 @@ def run_sft_training(args, method: str):
                     gate_numel = max(1, sum(p.numel() for n, p in model.named_parameters() if n.endswith(".gate")))
                     loss = loss + 1e-3 * l1_penalty / gate_numel
                     
-                (loss / args.gradient_accumulation_steps).backward()
+                try:
+                    (loss / args.gradient_accumulation_steps).backward()
+                finally:
+                    if flatlora_manager is not None:
+                        flatlora_manager.restore_after_backward()
 
             accum_loss += loss.detach().item()
 
