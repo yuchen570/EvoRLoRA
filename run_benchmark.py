@@ -4,9 +4,11 @@ import csv
 import datetime
 import json
 import os
+import random
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1700,7 +1702,10 @@ def run_training_loop(
                     if flatlora_manager is not None:
                         flatlora_manager.perturb_before_forward()
                     logits = model(features)
-                    loss = loss_fn(logits, labels)
+                    # 某些环境下 DeBERTa 头部/适配器参数可能为 fp16，直接把 half logits
+                    # 喂给损失函数会在反传路径上触发 dtype 冲突（Float vs Half）。
+                    # 统一在 loss 入口使用 fp32，可保持数值稳定并避免该类报错。
+                    loss = loss_fn(logits.float(), labels)
                     if method_name == "adalora":
                         inner = unwrap_inner_from_training_model(model)
                         ow = get_adalora_orth_reg_weight(inner)
@@ -2642,6 +2647,8 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     if args.is_main_process:
                         print(f"[pissa] 使用 --pissa_lr={method_lr} 覆盖全局 lr={args.lr}")
                 for seed in seeds:
+                    random.seed(seed)
+                    np.random.seed(seed)
                     torch.manual_seed(seed)
                     if torch.cuda.is_available():
                         torch.cuda.manual_seed_all(seed)
@@ -2937,6 +2944,8 @@ if __name__ == "__main__":
                 timeout=datetime.timedelta(seconds=1800),
             )
 
+        random.seed(args.seed)
+        np.random.seed(args.seed)
         torch.manual_seed(args.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)

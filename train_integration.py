@@ -201,13 +201,14 @@ def train_evo_lora_step(
         mutations: List[ModuleMutation],
         pop_size: Optional[int],
         strategy: str,
+        current_step: int = 0,
     ) -> List[ModuleMutation]:
         if pop_size is None or pop_size <= 0 or pop_size >= len(mutations):
             return mutations
         if strategy == "all":
             return mutations[:pop_size]
         if strategy == "random":
-            rng = random.Random(random_seed)
+            rng = random.Random((random_seed or 0) ^ current_step)
             return rng.sample(mutations, k=pop_size)
         raise ValueError(f"未知 population_strategy: {strategy}")
 
@@ -248,7 +249,9 @@ def train_evo_lora_step(
 
     optimizer.zero_grad(set_to_none=True)
     logits = model(inputs)
-    train_loss = loss_fn(logits, targets)
+    # 与 run_benchmark.py 非 EvoRank 分支对齐：loss 入口统一 fp32，
+    # 避免 half logits 在特定环境下触发 Float/Half 反传冲突。
+    train_loss = loss_fn(logits.float(), targets)
     
     if torch.isnan(train_loss).any() or torch.isinf(train_loss).any():
         print(f"[FATAL] train_loss is NaN/Inf at step {step}!")
@@ -312,7 +315,7 @@ def train_evo_lora_step(
         tau_grow, tau_prune = controller.compute_thresholds()
         controller.tick_evolution_state(tau_grow=tau_grow, tau_prune=tau_prune)
         mutations = controller.generate_mutations()
-        mutations = _select_population(mutations, lambda_pop, population_strategy)
+        mutations = _select_population(mutations, lambda_pop, population_strategy, current_step=step)
 
         result["did_evolution"] = True
         result["num_mutations"] = len(mutations)

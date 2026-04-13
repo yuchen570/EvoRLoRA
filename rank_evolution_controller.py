@@ -75,19 +75,23 @@ class PruneMutation(ModuleMutation):
         self.layer_name = layer_name
         self.layer = layer
         self.index = index
-        self.cached_B = None # 去激活只补偿 B
+        self.cached_A = None
+        self.cached_B = None
         
     def apply(self):
+        self.cached_A = self.layer.lora_A.weight.data.clone()
         self.cached_B = self.layer.lora_B.weight.data.clone()
         self.layer.deactivate_component(self.index)
         
     def undo(self):
-        if self.cached_B is not None:
+        if self.cached_A is not None and self.cached_B is not None:
             self.layer.active_mask[self.index] = True
+            self.layer.lora_A.weight.data.copy_(self.cached_A)
             self.layer.lora_B.weight.data.copy_(self.cached_B)
-            self.cached_B = None
+            self.cached_A, self.cached_B = None, None
 
     def clear_cache(self):
+        self.cached_A = None
         self.cached_B = None
 
 class ReallocateMutation(ModuleMutation):

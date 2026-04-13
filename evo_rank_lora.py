@@ -266,7 +266,9 @@ class EvoRankLoRALayer(nn.Module):
         Returns (u1, v1, sigma1) or None on degenerate input.
         """
         in_dim = M.size(1)
-        v = torch.randn(in_dim, device=N.device, dtype=N.dtype)
+        # 使用确定性初始向量（而非 torch.randn），确保 DDP 下各 GPU
+        # 在相同的 N、M 输入上产生完全一致的 power iteration 结果。
+        v = torch.ones(in_dim, device=N.device, dtype=N.dtype)
         v = v / (v.norm() + 1e-12)
 
         for _ in range(num_iters):
