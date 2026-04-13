@@ -834,11 +834,37 @@ def peft_factory(
             tfinal = max(int(0.1 * planned_steps), tinit + 1)
         else:
             tfinal = max(int(adalora_tfinal), tinit + 1)
+        # 需满足 tinit < planned_steps - tfinal（中间段至少留 1 步做动态秩）。
+        # 官方 AdaLoRA 脚本的 tinit/tfinal 常按单卡或更长 total_step 设定；DDP 下每 epoch 步数减半会导致
+        # total_step 变短而与固定 tinit/tfinal 冲突。此处按比例收紧并告警，而非直接崩溃。
         if tinit >= planned_steps - tfinal:
-            raise ValueError(
-                f"AdaLoRA 调度无效：需满足 tinit < total_step - tfinal，当前 total_step={planned_steps}, "
-                f"tinit={tinit}, tfinal={tfinal}。请减小 --adalora_tinit/--adalora_tfinal 或增大训练步数。"
-            )
+            orig_tinit, orig_tfinal = tinit, tfinal
+            cap = planned_steps - 2  # 严格保留 tinit、tfinal 与至少 1 步中间段
+            if cap < 2:
+                raise ValueError(
+                    f"AdaLoRA 调度无效：total_step={planned_steps} 过短，无法满足 tinit/tfinal。"
+                    f"当前 tinit={tinit}, tfinal={tfinal}。请增大 --epochs 或减小 --adalora_tinit/--adalora_tfinal。"
+                )
+            sum_ab = tinit + tfinal
+            scale = float(cap) / float(max(sum_ab, 1))
+            tinit = max(1, int(tinit * scale))
+            tfinal = max(tinit + 1, int(tfinal * scale))
+            if tinit + tfinal > cap:
+                tfinal = cap - tinit
+            tfinal = max(tfinal, tinit + 1)
+            if tinit + tfinal >= planned_steps:
+                tinit = max(1, planned_steps // 3)
+                tfinal = max(tinit + 1, min(orig_tfinal, planned_steps - tinit - 1))
+            if tinit >= planned_steps - tfinal:
+                raise ValueError(
+                    f"AdaLoRA 调度无效：需满足 tinit < total_step - tfinal，当前 total_step={planned_steps}, "
+                    f"tinit={tinit}, tfinal={tfinal}（已尝试按步数收紧仍失败）。请增大训练步数或显式调小 --adalora_tinit/--adalora_tfinal。"
+                )
+            if is_main_process:
+                print(
+                    f"[adalora] tinit/tfinal 与 total_step={planned_steps} 不兼容（官方值常针对更长训练），"
+                    f"已按比例收紧: tinit {orig_tinit}->{tinit}, tfinal {orig_tfinal}->{tfinal}。"
+                )
         init_r_val = int(adalora_init_r) if adalora_init_r is not None else target_rank * 2
         if init_r_val < target_rank:
             raise ValueError("adalora_init_r 应 >= target_rank（target_r）")
