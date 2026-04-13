@@ -22,6 +22,9 @@
 #   - warmup_ratio 统一 0.06（SoRA/AdaLoRA 均用此值）
 #   - seed_list 沿用 SoRA 论文的 5 种子：0 21 42 81 100
 #   - SoRA 特有参数按论文 no-schedule 主线
+#   - 8 个 GLUE 任务分批并行（PARALLEL_JOBS 控制每批同时跑几个任务，默认 2）。
+#     每个任务内部 nproc_per_node=2（双卡 DDP），多个任务共享同一对 GPU。
+#     DeBERTa-v3-base 单任务约 4-8GB/卡，A800 80GB 可轻松并行 2-4 个任务。
 # ============================================================================
 
 set -euo pipefail
@@ -33,27 +36,32 @@ SEEDS="0 21 42 81 100"
 PROTOCOL="controlled_fair"
 PROTOCOL_DROPOUT=0.05
 
-PORT=29500
+# 每批同时跑几个任务（每个任务内部仍为 2 卡 DDP），按显存余量调整
+PARALLEL_JOBS="${PARALLEL_JOBS:-2}"
+# 并行时每个 torchrun 必须使用不同 master_port
+BASE_MASTER_PORT="${BASE_MASTER_PORT:-29500}"
+MASTER_PORT_STEP="${MASTER_PORT_STEP:-100}"
 
-# ---- 启动单个任务 ----
+# ---- 启动单个任务（第一个参数为该作业的 master_port）----
 run_task() {
-  local TASK=$1
-  local LR=$2
-  local EPOCHS=$3
-  local MAX_LEN=$4
-  local ALPHA=$5
-  local WD=$6
-  local TINIT=$7          # adalora_tinit  (= AdaLoRA init_warmup)
-  local TFINAL=$8         # adalora_tfinal (= AdaLoRA final_warmup)
-  local DELTA_T=$9        # adalora_delta_t (= AdaLoRA mask_interval)
-  local ORTH_REG=${10}    # adalora_orth_reg_weight (= AdaLoRA reg_orth_coef)
+  local MASTER_PORT=$1
+  local TASK=$2
+  local LR=$3
+  local EPOCHS=$4
+  local MAX_LEN=$5
+  local ALPHA=$6
+  local WD=$7
+  local TINIT=$8          # adalora_tinit  (= AdaLoRA init_warmup)
+  local TFINAL=$9         # adalora_tfinal (= AdaLoRA final_warmup)
+  local DELTA_T=${10}     # adalora_delta_t (= AdaLoRA mask_interval)
+  local ORTH_REG=${11}    # adalora_orth_reg_weight (= AdaLoRA reg_orth_coef)
 
   echo "================================================================"
-  echo " Task: $TASK | lr=$LR epochs=$EPOCHS maxlen=$MAX_LEN alpha=$ALPHA wd=$WD"
+  echo " Task: $TASK | master_port=$MASTER_PORT | lr=$LR epochs=$EPOCHS maxlen=$MAX_LEN alpha=$ALPHA wd=$WD"
   echo " AdaLoRA: tinit=$TINIT tfinal=$TFINAL deltaT=$DELTA_T orth=$ORTH_REG"
   echo "================================================================"
 
-  nohup torchrun --nproc_per_node=2 --master_port=$PORT \
+  nohup torchrun --nproc_per_node=2 --master_port="$MASTER_PORT" \
     run_benchmark.py \
     --ddp \
     --methods $METHODS \
@@ -91,8 +99,6 @@ run_task() {
     --output_dir artifacts \
     --export_csv results_fair_glue_deberta_${TASK}.csv \
     > logs/fair_glue_deberta_${TASK}.out 2>&1
-
-  PORT=$((PORT + 1))
 }
 
 # ============================================================================
@@ -113,29 +119,43 @@ run_task() {
 # │ stsb   │ 2.2e-3 │ 25     │ 128    │ 32    │ 0.1  │ 800      │ 2000       │ 10           │ 0.3      │
 # └────────┴────────┴────────┴────────┴───────┴──────┴──────────┴────────────┴──────────────┴──────────┘
 
-# --- CoLA ---
-run_task cola   8e-4    25   64   32  0.01   800   3500   10   0.1
+# --- 8 个任务分批并行（PARALLEL_JOBS 个一批，共享双卡）---
+# 任务列表：port_offset  task   lr      epochs maxlen alpha wd    tinit tfinal delta_t orth
+TASKS=(
+  "0  cola   8e-4    25   64   32  0.01   800   3500   10   0.1"
+  "1  mnli   5e-4    7    256  16  0.01   8000  50000  100  0.1"
+  "2  mrpc   1e-3    30   320  32  0.01   600   1800   1    0.1"
+  "3  qqp    8e-4    5    320  16  0.01   8000  25000  100  0.1"
+  "4  qnli   5e-4    5    512  32  0.01   2000  8000   100  0.1"
+  "5  rte    1.2e-3  50   320  32  0.01   600   1800   1    0.3"
+  "6  sst2   8e-4    24   128  16  0.01   6000  22000  100  0.1"
+  "7  stsb   2.2e-3  25   128  32  0.1    800   2000   10   0.3"
+)
 
-# --- MNLI ---
-run_task mnli   5e-4    7    256  16  0.01   8000  50000  100  0.1
+TOTAL=${#TASKS[@]}
+FAIL=0
 
-# --- MRPC ---
-run_task mrpc   1e-3    30   320  32  0.01   600   1800   1    0.1
-
-# --- QQP ---
-run_task qqp    8e-4    5    320  16  0.01   8000  25000  100  0.1
-
-# --- QNLI ---
-run_task qnli   5e-4    5    512  32  0.01   2000  8000   100  0.1
-
-# --- RTE ---
-run_task rte    1.2e-3  50   320  32  0.01   600   1800   1    0.3
-
-# --- SST-2 ---
-run_task sst2   8e-4    24   128  16  0.01   6000  22000  100  0.1
-
-# --- STS-B ---
-run_task stsb   2.2e-3  25   128  32  0.1    800   2000   10   0.3
+for ((START=0; START<TOTAL; START+=PARALLEL_JOBS)); do
+  PIDS=()
+  BATCH_NAMES=()
+  for ((J=START; J<START+PARALLEL_JOBS && J<TOTAL; J++)); do
+    read -r IDX TASK LR EPOCHS MAX_LEN ALPHA WD TINIT TFINAL DELTA_T ORTH_REG <<< "${TASKS[$J]}"
+    PORT=$((BASE_MASTER_PORT + IDX * MASTER_PORT_STEP))
+    BATCH_NAMES+=("$TASK")
+    run_task "$PORT" "$TASK" "$LR" "$EPOCHS" "$MAX_LEN" "$ALPHA" "$WD" "$TINIT" "$TFINAL" "$DELTA_T" "$ORTH_REG" &
+    PIDS+=($!)
+  done
+  echo ""
+  echo ">>> Batch [$(( START/PARALLEL_JOBS + 1 ))]: ${BATCH_NAMES[*]} (PIDs: ${PIDS[*]}). Waiting..."
+  for pid in "${PIDS[@]}"; do
+    wait "$pid" || FAIL=1
+  done
+  echo ">>> Batch [$(( START/PARALLEL_JOBS + 1 ))]: ${BATCH_NAMES[*]} done."
+done
 
 echo ""
-echo "All 8 GLUE tasks launched sequentially. Check logs/fair_glue_deberta_*.out"
+if [ "$FAIL" -ne 0 ]; then
+  echo "One or more tasks failed. Check logs/fair_glue_deberta_*.out"
+  exit 1
+fi
+echo "All 8 GLUE tasks finished successfully. Check logs/fair_glue_deberta_*.out"
