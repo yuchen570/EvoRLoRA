@@ -718,8 +718,9 @@ def peft_factory(
 
     def _default_target_modules(method: str, model_type_name: str) -> List[str]:
         # 公平对比：所有方法使用相同的 target_modules，确保可训练参数量一致。
+        # DeBERTa 6 类模块与 AdaLoRA/SoRA 官方对齐：Q,K,V + attention output + FFN×2
         if "deberta" in model_type_name:
-            return ["query_proj", "key_proj", "value_proj", "intermediate.dense", "output.dense"]
+            return ["query_proj", "key_proj", "value_proj", "attention.output.dense", "intermediate.dense", "output.dense"]
         if "roberta" in model_type_name or "bert" in model_type_name:
             return ["query", "key", "value", "intermediate.dense", "output.dense"]
         if "bart" in model_type_name:
@@ -792,10 +793,21 @@ def peft_factory(
         if method_name == "pissa":
             _lora_dropout = 0.0
         effective_dropout_val = float(_lora_dropout)
+        # PiSSA 论文要求 lora_alpha == r（scaling=1）以保证 SVD 初始化的有效权重 == 预训练权重。
+        # alpha != r 时虽然 PEFT 会在 SVD 分解中补偿初始值，但 scaling 仍会放大训练梯度，
+        # 导致 PiSSA 的非零 A/B 初始化在小数据集上剧烈震荡甚至崩溃（CoLA/RTE 实测 MCC=0）。
+        _pissa_alpha = effective_alpha
+        if method_name == "pissa":
+            _pissa_alpha = float(target_rank)
+            if is_main_process and abs(_pissa_alpha - effective_alpha) > 0.01:
+                print(
+                    f"[pissa] lora_alpha 自动覆盖: {effective_alpha} -> {_pissa_alpha} "
+                    f"(PiSSA 要求 alpha==r={target_rank} 保证 scaling=1)"
+                )
         _lora_kw: Dict[str, Any] = dict(
             task_type=peft_task_type,
             r=target_rank,
-            lora_alpha=effective_alpha,
+            lora_alpha=_pissa_alpha if method_name == "pissa" else effective_alpha,
             lora_dropout=_lora_dropout,
             target_modules=target_modules,
             modules_to_save=modules_to_save,
@@ -1448,15 +1460,16 @@ def run_training_loop(
         
         # 标准 LoRA / AdaLoRA / EvoRank：适配器矩阵通常不做 weight_decay（与常见 PEFT 复现一致），
         # 否则在 GLUE 等小数据、较高 lr 下易出现数值爆炸（logits/loss NaN）。
-        dynamic_wd_peft = 0.0 if method_name in ("lora", "adalora", "evorank", "toplora", "pissa") else weight_decay
+        # flatlora：与 nblt/Flat-LoRA 官方训练脚本一致，adapter 侧 weight_decay=0（utils.train_text_to_text_model）
+        dynamic_wd_peft = 0.0 if method_name in ("lora", "adalora", "evorank", "toplora", "pissa", "flatlora") else weight_decay
         # 分类头必须保留 weight_decay 防止权重爆炸
         # LoRA A/B 的 wd=0 是为了保护基础权重补偿，但分类头没有这个约束。
         _head_wd = weight_decay
-        _adam_wd = 0.0 if method_name in ("lora", "adalora", "evorank", "toplora", "pissa") else weight_decay
+        _adam_wd = 0.0 if method_name in ("lora", "adalora", "evorank", "toplora", "pissa", "flatlora") else weight_decay
 
         # fp16 参数（如 DeBERTa classifier）在 eps=1e-8 时易在首步触发分母下溢并数值爆炸；
         # evorank 同样训练 fp16 头 + 适配器，与 lora/adalora 统一 eps。
-        _adam_eps = 1e-6 if method_name in ("lora", "adalora", "evorank", "toplora", "pissa") else 1e-8
+        _adam_eps = 1e-6 if method_name in ("lora", "adalora", "evorank", "toplora", "pissa", "flatlora") else 1e-8
         optimizer = AdamW(
             [
                 {"params": _peft_params, "lr": lr, "weight_decay": dynamic_wd_peft},
@@ -1553,7 +1566,7 @@ def run_training_loop(
         sora_schedule_stage_steps = max(1, math.ceil(total_train_steps / int(sora_lambda_num)))
     debug_steps = {0, min(99, max(total_train_steps - 1, 0)), max(total_train_steps - 1, 0)}
     # LoRA+GLUE：在已知易发散区间逐步打点，便于确认首个 NaN 出现在哪一步（不仅依赖硬编码的 99）。
-    lora_glue_step_trace = method_name in {"lora", "evorank", "pissa"} and task_name in {"cola", "rte"}
+    lora_glue_step_trace = method_name in {"lora", "evorank", "pissa", "flatlora"} and task_name in {"cola", "rte"}
     lora_glue_early_steps = frozenset({1, 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35, 38, 39})
     _lr_warmup = evo_warmup_steps if method_name == "evorank" else warmup_steps
     if lr_scheduler_type == "linear":
@@ -1605,7 +1618,10 @@ def run_training_loop(
     if method_name == "flatlora" and flatlora_rho > 0:
         from flatlora_inject import FlatLoRAHookManager
         total_steps_for_factor = max_train_steps if max_train_steps is not None else epochs * len(train_loader)
-        flatlora_manager = FlatLoRAHookManager(model, flatlora_rho, total_steps_for_factor)
+        flatlora_manager = FlatLoRAHookManager(
+            model, flatlora_rho, total_steps_for_factor,
+            is_main_process=is_main_process, local_rank=local_rank,
+        )
     # ==================================
     
     try:
@@ -1690,6 +1706,36 @@ def run_training_loop(
                         ow = get_adalora_orth_reg_weight(inner)
                         if ow > 0:
                             loss = loss + ow * compute_adalora_orthogonal_loss(inner)
+                    # --- PiSSA / Flat-LoRA 步级诊断 ---
+                    if (
+                        is_main_process
+                        and method_name in {"pissa", "flatlora"}
+                        and (global_step < 5 or global_step % 50 == 0)
+                    ):
+                        _fl_loss_val = float(loss.detach().item())
+                        _fl_logits_mean = float(logits.detach().float().mean().item())
+                        _fl_logits_std = float(logits.detach().float().std().item())
+                        _fl_finite = bool(torch.isfinite(loss).item())
+                        print(
+                            f"[{method_name}][step] step={global_step} loss={_fl_loss_val:.4f} "
+                            f"finite={_fl_finite} logits_mean={_fl_logits_mean:.4f} logits_std={_fl_logits_std:.4f}"
+                        )
+                        if not _fl_finite:
+                            print(f"[{method_name}][WARNING] loss 不是有限值！训练可能已崩溃。")
+                    # --- PiSSA 深度诊断（forward 阶段）：参数范数 & 预测分布 ---
+                    _pissa_deep_diag = (
+                        is_main_process
+                        and method_name == "pissa"
+                        and (global_step < 5 or global_step % 100 == 0)
+                    )
+                    if _pissa_deep_diag:
+                        _pred_classes = logits.detach().argmax(dim=-1)
+                        _pred_vals, _pred_cnts = _pred_classes.cpu().unique(return_counts=True)
+                        _pred_dist_str = " ".join(f"c{int(v)}={int(c)}" for v, c in zip(_pred_vals, _pred_cnts))
+                        print(
+                            f"[pissa][pred] step={global_step} batch_pred_dist=[{_pred_dist_str}] "
+                            f"batch_size={int(logits.size(0))}"
+                        )
                     if method_name == "sora":
                         lam = float(sora_sparse_lambda)
                         if sora_lambda_schedule is None and sora_lambda_warmup_steps > 0:
@@ -1720,14 +1766,63 @@ def run_training_loop(
                         if flatlora_manager is not None:
                             flatlora_manager.restore_after_backward()
                     grad_norm_total: Optional[float] = None
+                    # PiSSA 深度诊断（backward 后）：梯度范数 & 参数范数（裁剪前）
+                    if _pissa_deep_diag:
+                        _a_norms, _b_norms, _a_gnorms, _b_gnorms = [], [], [], []
+                        _head_gnorm_pre = None
+                        for _n, _p in model.named_parameters():
+                            if not _p.requires_grad:
+                                continue
+                            if "lora_A" in _n:
+                                _a_norms.append(float(_p.detach().norm().item()))
+                                if _p.grad is not None:
+                                    _a_gnorms.append(float(_p.grad.detach().norm().item()))
+                            elif "lora_B" in _n:
+                                _b_norms.append(float(_p.detach().norm().item()))
+                                if _p.grad is not None:
+                                    _b_gnorms.append(float(_p.grad.detach().norm().item()))
+                            elif _head_gnorm_pre is None and any(
+                                k in _n for k in ("classifier", "score", "pooler")
+                            ) and _p.grad is not None:
+                                _head_gnorm_pre = float(_p.grad.detach().norm().item())
+                        _cur_lr = float(optimizer.param_groups[0]["lr"])
+                        _a_norm_mean = sum(_a_norms) / max(len(_a_norms), 1)
+                        _b_norm_mean = sum(_b_norms) / max(len(_b_norms), 1)
+                        _a_gnorm_mean = sum(_a_gnorms) / max(len(_a_gnorms), 1) if _a_gnorms else 0.0
+                        _b_gnorm_mean = sum(_b_gnorms) / max(len(_b_gnorms), 1) if _b_gnorms else 0.0
+                        _rel_update_a = (_a_gnorm_mean * _cur_lr / max(_a_norm_mean, 1e-12))
+                        _rel_update_b = (_b_gnorm_mean * _cur_lr / max(_b_norm_mean, 1e-12))
+                        _pissa_grad_norm_pre_clip = float(
+                            sum(g**2 for g in (_a_gnorms + _b_gnorms + ([_head_gnorm_pre] if _head_gnorm_pre else [])))**0.5
+                        ) if (_a_gnorms or _b_gnorms) else None
+                        _head_str = f" head_grad={_head_gnorm_pre:.4f}" if _head_gnorm_pre is not None else ""
+                        print(
+                            f"[pissa][grad] step={global_step} lr={_cur_lr:.2e} "
+                            f"||A||={_a_norm_mean:.4f} ||B||={_b_norm_mean:.4f} "
+                            f"||gA||={_a_gnorm_mean:.4f} ||gB||={_b_gnorm_mean:.4f} "
+                            f"rel_upd_A={_rel_update_a:.2e} rel_upd_B={_rel_update_b:.2e}"
+                            f"{_head_str}"
+                        )
+                    else:
+                        _pissa_grad_norm_pre_clip = None
                     if max_grad_norm is not None and max_grad_norm > 0:
                         _gn = torch.nn.utils.clip_grad_norm_(
                             [p for p in model.parameters() if p.requires_grad], max_grad_norm
                         )
                         grad_norm_total = float(_gn.detach().item()) if isinstance(_gn, torch.Tensor) else float(_gn)
+                    if _pissa_deep_diag:
+                        _total_gnorm = _pissa_grad_norm_pre_clip if _pissa_grad_norm_pre_clip else (grad_norm_total or 0.0)
+                        _clip_ratio = (_total_gnorm / max_grad_norm) if max_grad_norm and max_grad_norm > 0 and _total_gnorm else 0.0
+                        print(
+                            f"[pissa][clip] step={global_step} "
+                            f"grad_norm_pre_clip={_total_gnorm:.4f} "
+                            f"max_grad_norm={max_grad_norm} "
+                            f"clip_ratio={_clip_ratio:.2f}x "
+                            f"{'CLIPPED' if _clip_ratio > 1.0 else 'ok'}"
+                        )
                     if (
                         is_main_process
-                        and method_name in {"lora", "evorank", "pissa"}
+                        and method_name in {"lora", "evorank", "pissa", "flatlora"}
                         and task_name in {"cola", "rte"}
                         and (
                             global_step in debug_steps
@@ -1801,7 +1896,7 @@ def run_training_loop(
                     optimizer.step()
                     if (
                         is_main_process
-                        and method_name in {"lora", "evorank", "pissa"}
+                        and method_name in {"lora", "evorank", "pissa", "flatlora"}
                         and task_name in {"cola", "rte"}
                         and global_step == 0
                     ):
@@ -1963,7 +2058,7 @@ def run_training_loop(
                         best_val_metrics = metrics_dict_val
                     elif val_metric == best_val_acc and not best_val_metrics:
                         best_val_metrics = metrics_dict_val
-                    if method_name in {"lora", "evorank", "pissa"} and task_name in {"cola", "rte"} and epoch in {0, epochs - 1}:
+                    if method_name in {"lora", "evorank", "pissa", "flatlora"} and task_name in {"cola", "rte", "mrpc", "stsb"}:
                         pred_list = [int(x) for x in y_pred_main]
                         true_list = [int(x) for x in y_true_main]
                         pred_dist = {str(k): int(sum(1 for x in pred_list if x == k)) for k in sorted(set(pred_list))}
@@ -1984,6 +2079,11 @@ def run_training_loop(
                                 "sample_preds": pred_list[:16],
                                 "sample_true": true_list[:16],
                             },
+                        )
+                        print(
+                            f"[{method_name}][eval-dist] epoch={epoch + 1} "
+                            f"pred_dist={pred_dist} true_dist={true_dist} "
+                            f"sample_pred={pred_list[:8]} sample_true={true_list[:8]}"
                         )
                     print(
                         f"[{method_name}] epoch={epoch + 1}/{epochs} "
@@ -2326,6 +2426,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--head_lr", type=float, default=None, help="分类头等可训练参数学习率。None 时默认与 --lr 相同；需要更快收敛可显式调高")
+    parser.add_argument("--pissa_lr", type=float, default=None, help="PiSSA 专用学习率覆盖。PiSSA 的 SVD 初始化使梯度幅度远大于标准 LoRA，通常需要更低的 lr（论文推荐 1e-4）。None 时使用 --lr")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--T_es", type=int, default=200)
@@ -2536,6 +2637,10 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 method_warmup_ratio = float(args.warmup_ratio)
                 method_lr_scheduler_type = "linear"
                 method_lr = float(args.lr)
+                if method == "pissa" and getattr(args, "pissa_lr", None) is not None:
+                    method_lr = float(args.pissa_lr)
+                    if args.is_main_process:
+                        print(f"[pissa] 使用 --pissa_lr={method_lr} 覆盖全局 lr={args.lr}")
                 for seed in seeds:
                     torch.manual_seed(seed)
                     if torch.cuda.is_available():
@@ -2581,6 +2686,73 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         evorank_compensation_mode=args.evo_compensation_mode, # 传递评价中使用的补偿策略
                         toplora_dropout=args.toplora_dropout,
                     )
+                    # === PiSSA / Flat-LoRA 初始化诊断 ===
+                    if args.is_main_process and method in ("pissa", "flatlora"):
+                        _diag_inner = _unwrap_for_save(method_model)
+                        _diag_lora_delta_norms: List[float] = []
+                        _diag_base_norms: List[float] = []
+                        _diag_scaling_val: Optional[float] = None
+                        _diag_checked = 0
+                        for _dn, _dm in _diag_inner.named_modules():
+                            if not (hasattr(_dm, "lora_A") and hasattr(_dm, "lora_B")):
+                                continue
+                            try:
+                                if isinstance(_dm.lora_A, (dict, nn.ModuleDict)):
+                                    _ak = "default" if "default" in _dm.lora_A else next(iter(_dm.lora_A.keys()))
+                                    _dA = _dm.lora_A[_ak].weight.data
+                                    _dB = _dm.lora_B[_ak].weight.data
+                                    _ds = float(_dm.scaling[_ak])
+                                else:
+                                    continue
+                                if _diag_scaling_val is None:
+                                    _diag_scaling_val = _ds
+                                _delta = _ds * (_dB @ _dA)
+                                _diag_lora_delta_norms.append(float(_delta.float().norm().item()))
+                                if hasattr(_dm, "get_base_layer"):
+                                    _diag_base_norms.append(float(_dm.get_base_layer().weight.data.float().norm().item()))
+                                _diag_checked += 1
+                            except Exception:
+                                continue
+                        if _diag_checked > 0:
+                            import statistics as _st
+                            _dn_mean = _st.mean(_diag_lora_delta_norms)
+                            _dn_max = max(_diag_lora_delta_norms)
+                            _bn_mean = _st.mean(_diag_base_norms) if _diag_base_norms else 0
+                            print(
+                                f"[{method}][init-diag] task={task_name} seed={seed} "
+                                f"scaling(alpha/r)={_diag_scaling_val:.2f} "
+                                f"||scaling*B@A||: mean={_dn_mean:.4f} max={_dn_max:.4f}  "
+                                f"||W_base||: mean={_bn_mean:.4f}  layers={_diag_checked}"
+                            )
+                            if method == "pissa" and _diag_scaling_val is not None and abs(_diag_scaling_val - 1.0) > 0.01:
+                                print(
+                                    f"[pissa][WARNING] scaling={_diag_scaling_val:.2f} != 1.0 — "
+                                    f"PiSSA 论文要求 lora_alpha == r 以保证初始 effective weight == pretrained weight。"
+                                    f"当前 alpha={args.lora_alpha}, r={args.target_rank}。"
+                                    f"若 PEFT 未在 SVD 分解中补偿 scaling，初始有效权重将偏离预训练 {abs(_diag_scaling_val - 1):.0%}×(top-r SVD)。"
+                                )
+                        if method == "pissa" and args.is_main_process:
+                            _init_a_norms, _init_b_norms = [], []
+                            for _n, _p in method_model.named_parameters():
+                                if not _p.requires_grad:
+                                    continue
+                                if "lora_A" in _n:
+                                    _init_a_norms.append(float(_p.detach().norm().item()))
+                                elif "lora_B" in _n:
+                                    _init_b_norms.append(float(_p.detach().norm().item()))
+                            _ia_mean = sum(_init_a_norms) / max(len(_init_a_norms), 1)
+                            _ib_mean = sum(_init_b_norms) / max(len(_init_b_norms), 1)
+                            _ia_max = max(_init_a_norms) if _init_a_norms else 0.0
+                            _ib_max = max(_init_b_norms) if _init_b_norms else 0.0
+                            print(
+                                f"[pissa][init-params] ||A||: mean={_ia_mean:.4f} max={_ia_max:.4f} count={len(_init_a_norms)}  "
+                                f"||B||: mean={_ib_mean:.4f} max={_ib_max:.4f} count={len(_init_b_norms)}"
+                            )
+                            print(
+                                f"[pissa][init-params] 论文推荐 CoLA: lr=1e-4, bs=16, epochs=20, alpha=8  "
+                                f"当前: lr={method_lr}, bs={args.batch_size}, epochs={args.epochs}, alpha={args.lora_alpha}"
+                            )
+
                     checkpoint_root: Optional[str] = None
                     if not args.no_output_dir:
                         safe_model_name = model_name.replace("/", "_").replace("\\", "_")

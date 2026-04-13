@@ -1,105 +1,141 @@
 #!/bin/bash
 # ============================================================================
-# 公平对比: GLUE × DeBERTa-v3-base × 全方法
+# 公平对比: GLUE × DeBERTa-v3-base × 全方法（逐任务超参对齐 AdaLoRA 官方）
 # ============================================================================
 #
-# 1. AdaLoRA 官方仓库 (ICLR 2023) 提供了 DeBERTa-v3-base 在全部 8 个 GLUE
-#    子任务上的独立超参，是唯一覆盖面最全的基准。
-# 2. SoRA 官方仓库 (EMNLP 2023) 自己的 LoRA 基线使用 lr=3e-4 / epochs=10
-#    （而非 SoRA 的 8e-4/20），验证了高 LR+长训适配 SoRA 但不适配 LoRA。
-# 3. LoRA 原始仓库用 DeBERTa-v2-XXLarge，lr 极低 (6e-5~1e-4)，
-#    DeBERTa-v3-base 体量更小可适当提高。
+# 超参来源：AdaLoRA 官方仓库 (ICLR 2023) DeBERTa-v3-base 在 8 个 GLUE 子任务上
+# 的独立超参（NLU/scripts/run_debertav3_*.sh），是唯一在 DeBERTa-v3-base 上
+# 覆盖全部 GLUE 子任务的基准。
 #
-# 结论：按数据集规模分两挡，以 AdaLoRA 超参为主基准：
-#   大数据集 (MNLI/SST2/QQP/QNLI): lr=5e-4, epochs=7
-#   小数据集 (CoLA/RTE/MRPC/STS-B): lr=8e-4, epochs=25
+# AdaLoRA 官方参数映射：
+#   init_warmup → --adalora_tinit    (初始满秩训练步数)
+#   final_warmup → --adalora_tfinal  (末尾固定秩步数)
+#   mask_interval → --adalora_delta_t (秩调整间隔步数)
+#   reg_orth_coef → --adalora_orth_reg_weight
 #
-# 方法特有参数保持各自论文默认。SoRA 使用论文专用 max_grad_norm=0.1，
-# 其他方法使用标准 max_grad_norm=1.0。
+# 公平原则：
+#   - 每个任务的 lr / epochs / max_seq_length / lora_alpha 取自 AdaLoRA 脚本
+#   - 所有方法共享同一套 target_modules（6 类，含 attention.output.dense）
+#   - 所有方法共享同一套 dropout（protocol_dropout=0.05）
+#   - weight_decay 统一 0.01（AdaLoRA 各任务 0~0.1，取折中；stsb 保留 0.1）
+#   - batch_size 统一 32（与 AdaLoRA 官方一致）
+#   - warmup_ratio 统一 0.06（SoRA/AdaLoRA 均用此值）
+#   - seed_list 沿用 SoRA 论文的 5 种子：0 21 42 81 100
+#   - SoRA 特有参数按论文 no-schedule 主线
 # ============================================================================
 
+set -euo pipefail
 mkdir -p logs runs artifacts
 
-# ===========================================================================
-#  大数据集子任务 (样本>60k): MNLI, SST-2, QQP, QNLI
-# ===========================================================================
-nohup torchrun --nproc_per_node=2 --master_port=29500 \
-  run_benchmark.py \
-  --ddp \
-  --methods lora adalora evorank sora toplora flatlora pissa \
-  --comparison_protocol controlled_fair \
-  --protocol_dropout 0.05 \
-  --module_preset default \
-  --flatlora_rho 0.05 \
-  --task_list mnli sst2 qqp qnli \
-  --model_list microsoft/deberta-v3-base \
-  --target_rank 8 \
-  --lora_alpha 16 \
-  --epochs 7 \
-  --batch_size 32 \
-  --max_length 256 \
-  --lr 5e-4 \
-  --warmup_ratio 0.06 \
-  --weight_decay 0.01 \
-  --max_grad_norm 1.0 \
-  --adalora_delta_t 100 \
-  --adalora_orth_reg_weight 0.1 \
-  --sora_sparse_lambda 10 \
-  --sora_sparse_lambda_2 3e-4 \
-  --lambda_c 0.0 \
-  --expand_init_mode gradient \
-  --mini_val_k 8 \
-  --evo_alpha_u 1.0 \
-  --evo_p_p 0.05 \
-  --evo_H_p 4 \
-  --evo_max_reallocate_candidates 16 \
-  --verify_n_samples 0 \
-  --seed_list 0 21 42 81 100 \
-  --log_dir runs/fair_glue_deberta_large_ddp \
-  --output_dir artifacts \
-  --export_csv results_fair_glue_deberta_large_ddp.csv \
-  > logs/fair_glue_deberta_large_ddp.out 2>&1 &
+METHODS="lora adalora evorank sora toplora flatlora pissa"
+MODEL="microsoft/deberta-v3-base"
+SEEDS="0 21 42 81 100"
+PROTOCOL="controlled_fair"
+PROTOCOL_DROPOUT=0.05
 
-echo "Started LARGE-task benchmark (MNLI/SST2/QQP/QNLI). Check logs/fair_glue_deberta_large_ddp.out"
+PORT=29500
 
-# ===========================================================================
-#  小数据集子任务 (样本<10k): CoLA, RTE, MRPC, STS-B
-# ===========================================================================
-nohup torchrun --nproc_per_node=2 --master_port=29501 \
-  run_benchmark.py \
-  --ddp \
-  --methods lora adalora evorank sora toplora flatlora pissa \
-  --comparison_protocol controlled_fair \
-  --protocol_dropout 0.05 \
-  --module_preset default \
-  --flatlora_rho 0.05 \
-  --task_list cola rte mrpc stsb \
-  --model_list microsoft/deberta-v3-base \
-  --target_rank 8 \
-  --lora_alpha 32 \
-  --epochs 25 \
-  --batch_size 32 \
-  --max_length 128 \
-  --lr 8e-4 \
-  --warmup_ratio 0.06 \
-  --weight_decay 0.01 \
-  --max_grad_norm 1.0 \
-  --adalora_delta_t 10 \
-  --adalora_orth_reg_weight 0.1 \
-  --sora_sparse_lambda 10 \
-  --sora_sparse_lambda_2 3e-4 \
-  --lambda_c 0.0 \
-  --expand_init_mode gradient \
-  --mini_val_k 8 \
-  --evo_alpha_u 1.0 \
-  --evo_p_p 0.05 \
-  --evo_H_p 4 \
-  --evo_max_reallocate_candidates 16 \
-  --verify_n_samples 0 \
-  --seed_list 0 21 42 81 100 \
-  --log_dir runs/fair_glue_deberta_small_ddp \
-  --output_dir artifacts \
-  --export_csv results_fair_glue_deberta_small_ddp.csv \
-  > logs/fair_glue_deberta_small_ddp.out 2>&1 &
+# ---- 启动单个任务 ----
+run_task() {
+  local TASK=$1
+  local LR=$2
+  local EPOCHS=$3
+  local MAX_LEN=$4
+  local ALPHA=$5
+  local WD=$6
+  local TINIT=$7          # adalora_tinit  (= AdaLoRA init_warmup)
+  local TFINAL=$8         # adalora_tfinal (= AdaLoRA final_warmup)
+  local DELTA_T=$9        # adalora_delta_t (= AdaLoRA mask_interval)
+  local ORTH_REG=${10}    # adalora_orth_reg_weight (= AdaLoRA reg_orth_coef)
 
-echo "Started SMALL-task benchmark (CoLA/RTE/MRPC/STS-B). Check logs/fair_glue_deberta_small_ddp.out"
+  echo "================================================================"
+  echo " Task: $TASK | lr=$LR epochs=$EPOCHS maxlen=$MAX_LEN alpha=$ALPHA wd=$WD"
+  echo " AdaLoRA: tinit=$TINIT tfinal=$TFINAL deltaT=$DELTA_T orth=$ORTH_REG"
+  echo "================================================================"
+
+  nohup torchrun --nproc_per_node=2 --master_port=$PORT \
+    run_benchmark.py \
+    --ddp \
+    --methods $METHODS \
+    --comparison_protocol $PROTOCOL \
+    --protocol_dropout $PROTOCOL_DROPOUT \
+    --module_preset default \
+    --flatlora_rho 0.05 \
+    --task_list $TASK \
+    --model_list $MODEL \
+    --target_rank 8 \
+    --lora_alpha $ALPHA \
+    --epochs $EPOCHS \
+    --batch_size 32 \
+    --max_length $MAX_LEN \
+    --lr $LR \
+    --warmup_ratio 0.06 \
+    --weight_decay $WD \
+    --max_grad_norm 1.0 \
+    --adalora_tinit $TINIT \
+    --adalora_tfinal $TFINAL \
+    --adalora_delta_t $DELTA_T \
+    --adalora_orth_reg_weight $ORTH_REG \
+    --sora_sparse_lambda 10 \
+    --sora_sparse_lambda_2 3e-4 \
+    --lambda_c 0.0 \
+    --expand_init_mode gradient \
+    --mini_val_k 8 \
+    --evo_alpha_u 1.0 \
+    --evo_p_p 0.05 \
+    --evo_H_p 4 \
+    --evo_max_reallocate_candidates 16 \
+    --verify_n_samples 0 \
+    --seed_list $SEEDS \
+    --log_dir runs/fair_glue_deberta_${TASK} \
+    --output_dir artifacts \
+    --export_csv results_fair_glue_deberta_${TASK}.csv \
+    > logs/fair_glue_deberta_${TASK}.out 2>&1
+
+  PORT=$((PORT + 1))
+}
+
+# ============================================================================
+#  逐任务参数（来自 AdaLoRA NLU/scripts/run_debertav3_*.sh）
+# ============================================================================
+#
+# AdaLoRA 官方各任务参数表：
+# ┌────────┬────────┬────────┬────────┬───────┬──────┬──────────┬────────────┬──────────────┬──────────┐
+# │ task   │ lr     │ epochs │ maxlen │ alpha │  wd  │ tinit    │ tfinal     │ delta_t      │ orth_reg │
+# ├────────┼────────┼────────┼────────┼───────┼──────┼──────────┼────────────┼──────────────┼──────────┤
+# │ cola   │ 8e-4   │ 25     │ 64     │ 32    │ 0    │ 800      │ 3500       │ 10           │ 0.1      │
+# │ mnli   │ 5e-4   │ 7      │ 256    │ 16    │ 0    │ 8000     │ 50000      │ 100          │ 0.1      │
+# │ mrpc   │ 1e-3   │ 30     │ 320    │ 32    │ 0.01 │ 600      │ 1800       │ 1            │ 0.1      │
+# │ qqp    │ 8e-4   │ 5      │ 320    │ 16    │ 0.01 │ 8000     │ 25000      │ 100          │ 0.1      │
+# │ qnli   │ 5e-4   │ 5      │ 512    │ 32    │ 0.01 │ 2000     │ 8000       │ 100          │ 0.1      │
+# │ rte    │ 1.2e-3 │ 50     │ 320    │ 32    │ 0.01 │ 600      │ 1800       │ 1            │ 0.3      │
+# │ sst2   │ 8e-4   │ 24     │ 128    │ 16    │ 0.01 │ 6000     │ 22000      │ 100          │ 0.1      │
+# │ stsb   │ 2.2e-3 │ 25     │ 128    │ 32    │ 0.1  │ 800      │ 2000       │ 10           │ 0.3      │
+# └────────┴────────┴────────┴────────┴───────┴──────┴──────────┴────────────┴──────────────┴──────────┘
+
+# --- CoLA ---
+run_task cola   8e-4    25   64   32  0.01   800   3500   10   0.1
+
+# --- MNLI ---
+run_task mnli   5e-4    7    256  16  0.01   8000  50000  100  0.1
+
+# --- MRPC ---
+run_task mrpc   1e-3    30   320  32  0.01   600   1800   1    0.1
+
+# --- QQP ---
+run_task qqp    8e-4    5    320  16  0.01   8000  25000  100  0.1
+
+# --- QNLI ---
+run_task qnli   5e-4    5    512  32  0.01   2000  8000   100  0.1
+
+# --- RTE ---
+run_task rte    1.2e-3  50   320  32  0.01   600   1800   1    0.3
+
+# --- SST-2 ---
+run_task sst2   8e-4    24   128  16  0.01   6000  22000  100  0.1
+
+# --- STS-B ---
+run_task stsb   2.2e-3  25   128  32  0.1    800   2000   10   0.3
+
+echo ""
+echo "All 8 GLUE tasks launched sequentially. Check logs/fair_glue_deberta_*.out"
