@@ -140,6 +140,8 @@ def train_evo_lora_step(
     random_seed: Optional[int] = None,
     max_grad_norm: Optional[float] = None,
     include_noop_candidate: bool = True,
+    es_top_k_refine: int = 3,
+    es_significance_threshold: float = 0.5,
 ) -> Dict[str, Any]:
     """
     论文 Alg. 1：双时间尺度训练步。
@@ -317,10 +319,35 @@ def train_evo_lora_step(
         mutations = controller.generate_mutations()
         mutations = _select_population(mutations, lambda_pop, population_strategy, current_step=step)
 
+        # === A3：基于梯度统计的预筛选 ===
+        # 使用 EMA 统计估计每个 mutation 的预期收益变化，
+        # 过滤掉影响可忽略的候选，从而减少 trial 前向次数。
+        if len(mutations) > es_top_k_refine + 2:
+            scored_mutations: List[Tuple[float, ModuleMutation]] = []
+            for mut in mutations:
+                if isinstance(mut, ExpandMutation):
+                    priority = controller.ema_u.get(mut.layer_name, 0.0)
+                elif isinstance(mut, PruneMutation):
+                    s_val = float(controller.ema_s[mut.layer_name][mut.index].item())
+                    priority = 1.0 / (s_val + 1e-8)
+                elif isinstance(mut, ReallocateMutation):
+                    e_u = controller.ema_u.get(mut.expand_mut.layer_name, 0.0)
+                    p_s = float(controller.ema_s[mut.prune_mut.layer_name][mut.prune_mut.index].item())
+                    priority = e_u + 1.0 / (p_s + 1e-8)
+                else:
+                    priority = 0.0
+                scored_mutations.append((priority, mut))
+            scored_mutations.sort(key=lambda x: x[0], reverse=True)
+            max_trials = max(es_top_k_refine * 3, 6)
+            mutations = [m for _, m in scored_mutations[:max_trials]]
+
         result["did_evolution"] = True
         result["num_mutations"] = len(mutations)
 
-        # Trial 阶段：逐个 apply -> (mini-val-set 平均评估) -> undo，禁止污染训练图。
+        # Trial 阶段（Hyperscale ES 优化版）：
+        #   Stage 1 — 粗筛：每个候选仅用 1 个 val batch，筛出 top-K
+        #   Stage 2 — 精评：仅对 top-K 使用全部 val batches 精确评估
+        #   Selection — 借鉴 EggRoll：baseline subtraction + z-score 归一化
         # DDP：各 rank 上 generate_mutations 得到的列表长度可能不一致（浮点/采样边界），
         # 若仍用「if mutations and val_batches」整段跳过，则会出现部分 rank 少做 all_reduce，
         # NCCL 集体次数不一致 -> watchdog 超时 / SIGABRT。此处用 MAX 对齐长度并用占位 mutation 补齐。
@@ -340,8 +367,11 @@ def train_evo_lora_step(
             model.eval()
             unwrapped_model = getattr(model, "module", model)
 
+            use_two_stage = len(val_batches) > 1 and len(mutations) > es_top_k_refine
+
             rewards: List[Tuple[float, Optional[ModuleMutation], float, float]] = []
             with torch.no_grad():
+                # --- 基线评估（noop）在全部 val batches 上计算 ---
                 base_eval_losses: List[torch.Tensor] = []
                 for val_inputs, val_targets in val_batches:
                     val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
@@ -357,51 +387,127 @@ def train_evo_lora_step(
                 base_complexity = _compute_complexity(controller, complexity_mode)
                 result["es_base_val_loss"] = base_eval_loss_f
                 result["es_base_complexity"] = base_complexity
-                if include_noop_candidate:
-                    # 论文 Eq. 167 elitist selection: z_t (no-op) 始终在候选集中
-                    # 论文 Eq. 163: R(z) = -L_val(Θ; z) - λ_c · C(z)
-                    base_reward = -base_eval_loss_f - lambda_c * base_complexity
-                    rewards.append((base_reward, None, base_eval_loss_f, base_complexity))  # no-op reward
 
-                for mutation in mutations:
-                    if isinstance(mutation, _PaddingTrialMutation):
-                        eval_loss = base_eval_loss.detach().clone()
-                        committed_candidate: Optional[ModuleMutation] = None
-                    else:
-                        mutation.apply()
-                        eval_losses: List[torch.Tensor] = []
-                        for val_inputs, val_targets in val_batches:
-                            val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
-                            val_targets_dev = val_targets.to(model_device)
-                            val_logits = unwrapped_model(val_inputs_dev)
-                            batch_eval_loss = loss_fn(val_logits, val_targets_dev)
-                            eval_losses.append(batch_eval_loss.detach())
+                base_reward = -base_eval_loss_f - lambda_c * base_complexity
 
-                        eval_loss = torch.stack(eval_losses).mean()
-                        committed_candidate = mutation
+                if use_two_stage:
+                    # ===== Stage 1：仅用首个 val batch 做粗筛 =====
+                    screen_batch = val_batches[0]
+                    screen_inputs_dev = {k: v.to(model_device) for k, v in screen_batch[0].items()}
+                    screen_targets_dev = screen_batch[1].to(model_device)
+
+                    base_screen_logits = unwrapped_model(screen_inputs_dev)
+                    base_screen_loss = loss_fn(base_screen_logits, screen_targets_dev).detach()
                     if dist.is_available() and dist.is_initialized():
-                        reduced = eval_loss.clone()
-                        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
-                        eval_loss = reduced / dist.get_world_size()
+                        _rb = base_screen_loss.clone()
+                        dist.all_reduce(_rb, op=dist.ReduceOp.SUM)
+                        base_screen_loss = _rb / dist.get_world_size()
+                    base_screen_loss_f = float(base_screen_loss.item())
 
-                    eval_loss_f = float(eval_loss.item())
-                    candidate_complexity = _compute_complexity(controller, complexity_mode)
-                    reward = -eval_loss_f - lambda_c * candidate_complexity
-                    rewards.append((reward, committed_candidate, eval_loss_f, candidate_complexity))
-                    if not isinstance(mutation, _PaddingTrialMutation):
-                        mutation.undo()
+                    coarse_scores: List[Tuple[float, int]] = []
+                    for mi, mutation in enumerate(mutations):
+                        if isinstance(mutation, _PaddingTrialMutation):
+                            coarse_loss_f = base_screen_loss_f
+                        else:
+                            mutation.apply()
+                            s_logits = unwrapped_model(screen_inputs_dev)
+                            s_loss = loss_fn(s_logits, screen_targets_dev).detach()
+                            if dist.is_available() and dist.is_initialized():
+                                _rs = s_loss.clone()
+                                dist.all_reduce(_rs, op=dist.ReduceOp.SUM)
+                                s_loss = _rs / dist.get_world_size()
+                            coarse_loss_f = float(s_loss.item())
+                            mutation.undo()
+                        coarse_scores.append((coarse_loss_f, mi))
+
+                    coarse_scores.sort(key=lambda x: x[0])
+                    refine_indices = set(idx for _, idx in coarse_scores[:es_top_k_refine])
+
+                    # ===== Stage 2：对 top-K 用全部 val batches 精评 =====
+                    if include_noop_candidate:
+                        rewards.append((base_reward, None, base_eval_loss_f, base_complexity))
+
+                    for mi, mutation in enumerate(mutations):
+                        if mi not in refine_indices:
+                            continue
+                        if isinstance(mutation, _PaddingTrialMutation):
+                            eval_loss_f = base_eval_loss_f
+                            committed_candidate: Optional[ModuleMutation] = None
+                        else:
+                            mutation.apply()
+                            eval_losses_list: List[torch.Tensor] = []
+                            for val_inputs, val_targets in val_batches:
+                                val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
+                                val_targets_dev = val_targets.to(model_device)
+                                val_logits = unwrapped_model(val_inputs_dev)
+                                eval_losses_list.append(loss_fn(val_logits, val_targets_dev).detach())
+                            eval_loss = torch.stack(eval_losses_list).mean()
+                            if dist.is_available() and dist.is_initialized():
+                                _rr = eval_loss.clone()
+                                dist.all_reduce(_rr, op=dist.ReduceOp.SUM)
+                                eval_loss = _rr / dist.get_world_size()
+                            eval_loss_f = float(eval_loss.item())
+                            committed_candidate = mutation
+                            mutation.undo()
+
+                        candidate_complexity = _compute_complexity(controller, complexity_mode)
+                        reward = -eval_loss_f - lambda_c * candidate_complexity
+                        rewards.append((reward, committed_candidate, eval_loss_f, candidate_complexity))
+
+                else:
+                    # ===== 单阶段回退（候选较少或仅 1 个 val batch）=====
+                    if include_noop_candidate:
+                        rewards.append((base_reward, None, base_eval_loss_f, base_complexity))
+
+                    for mutation in mutations:
+                        if isinstance(mutation, _PaddingTrialMutation):
+                            eval_loss_f = base_eval_loss_f
+                            committed_candidate = None
+                        else:
+                            mutation.apply()
+                            eval_losses_list = []
+                            for val_inputs, val_targets in val_batches:
+                                val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
+                                val_targets_dev = val_targets.to(model_device)
+                                val_logits = unwrapped_model(val_inputs_dev)
+                                eval_losses_list.append(loss_fn(val_logits, val_targets_dev).detach())
+                            eval_loss = torch.stack(eval_losses_list).mean()
+                            if dist.is_available() and dist.is_initialized():
+                                _rr = eval_loss.clone()
+                                dist.all_reduce(_rr, op=dist.ReduceOp.SUM)
+                                eval_loss = _rr / dist.get_world_size()
+                            eval_loss_f = float(eval_loss.item())
+                            committed_candidate = mutation
+                            mutation.undo()
+
+                        candidate_complexity = _compute_complexity(controller, complexity_mode)
+                        reward = -eval_loss_f - lambda_c * candidate_complexity
+                        rewards.append((reward, committed_candidate, eval_loss_f, candidate_complexity))
 
             if was_training:
                 model.train()
 
             if rewards:
-                # 论文 Eq. 167: z_{t+1} = argmax_{z ∈ {z_t} ∪ N(z_t)} R(z)
-                # Theorem 4.4 保证 R(z_{t+1}) ≥ R(z_t)（单调不减）
-                best_reward, best_mutation, best_eval_loss_f, best_complexity = max(rewards, key=lambda x: x[0])
+                # === 借鉴 EggRoll 的 baseline subtraction + z-score 选择 ===
+                # Baseline = noop reward；fitness_i = (R_i - baseline) / std(all R)
+                all_rewards_vals = [r[0] for r in rewards]
+                n_rewards = len(all_rewards_vals)
+                if n_rewards > 1:
+                    reward_mean = sum(all_rewards_vals) / n_rewards
+                    reward_var = sum((r - reward_mean) ** 2 for r in all_rewards_vals) / n_rewards
+                    reward_std = max(reward_var ** 0.5, 1e-8)
+                    z_scores = [(r - base_reward) / reward_std for r in all_rewards_vals]
+                    best_idx = max(range(n_rewards), key=lambda i: z_scores[i])
+                    best_z = z_scores[best_idx]
+                    if best_z < es_significance_threshold:
+                        best_idx = next(i for i, r in enumerate(rewards) if r[1] is None) if include_noop_candidate else 0
+                else:
+                    best_idx = 0
+
+                best_reward, best_mutation, best_eval_loss_f, best_complexity = rewards[best_idx]
                 if best_mutation is not None:
                     controller.commit_mutation(best_mutation)
                     _reset_optimizer_state_for_mutation(optimizer, best_mutation)
-                # ES 轮次结束后，主动回收未提交候选的缓存引用，降低潜在显存滞留风险。
                 controller.cleanup_uncommitted_mutations(mutations, committed=best_mutation)
                 result["best_reward"] = best_reward
                 result["best_mutation"] = "noop" if best_mutation is None else best_mutation.__class__.__name__

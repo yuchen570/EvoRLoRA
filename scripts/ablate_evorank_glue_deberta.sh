@@ -53,6 +53,8 @@ COMMON_ARGS=(
   --evo_allow_reallocation
   --evo_max_reallocate_candidates 8
   --evo_include_noop_candidate
+  --es_top_k_refine 3
+  --es_significance_threshold 0.5
   --seed_list 0 21 42 81 100
   --verify_n_samples 0
   --output_dir artifacts

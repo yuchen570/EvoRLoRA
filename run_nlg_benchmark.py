@@ -466,6 +466,8 @@ def run_sft_training(args, method: str):
                         T_es=args.T_es,
                         lambda_c=0.0,
                         include_noop_candidate=True,
+                        es_top_k_refine=args.es_top_k_refine,
+                        es_significance_threshold=args.es_significance_threshold,
                     )
                 loss = torch.tensor(out["train_loss"], device=device)
             else:
@@ -580,6 +582,8 @@ def main():
     # 算法特有参数
     parser.add_argument("--T_es", type=int, default=50) # EvoRank
     parser.add_argument("--mini_val_k", type=int, default=2) # EvoRank
+    parser.add_argument("--es_top_k_refine", type=int, default=3) # EvoRank：两阶段 ES 中进入精评的 top-K 候选数
+    parser.add_argument("--es_significance_threshold", type=float, default=0.5) # EvoRank：相对 noop 基线的 z-score 显著性阈值
     parser.add_argument("--evorank_rho", type=float, default=0.0)
     parser.add_argument("--adalora_tinit", type=int, default=100)
     parser.add_argument("--adalora_tfinal", type=int, default=500)

@@ -1413,6 +1413,8 @@ def run_training_loop(
     flatlora_rho: float = 0.05,
     peft_meta: Optional[Dict[str, Any]] = None,
     evo_include_noop_candidate: bool = True,
+    es_top_k_refine: int = 3,
+    es_significance_threshold: float = 0.5,
 ) -> Dict[str, Any]:
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         if not torch.cuda.is_available():
@@ -1518,6 +1520,20 @@ def run_training_loop(
     # epoch 内充分增长、ES 统计量可靠。LR 衰减段不变（仍基于 total_train_steps）。
     evo_warmup_cap = max(20, int(0.1 * steps_per_epoch))
     evo_warmup_steps = min(warmup_steps, evo_warmup_cap) if method_name == "evorank" else warmup_steps
+
+    # B4：按数据规模自适应调整 T_es 与 mini_val_k（Hyperscale ES 优化）。
+    # 小数据集的 ES 信号噪声更大：增大 T_es 以减少无效演化轮次；
+    # 大数据集可保持更频繁、评估更充分的 ES 触发策略。
+    if method_name == "evorank" and T_es > 0:
+        dataset_steps = steps_per_epoch * epochs
+        if dataset_steps < 2000:
+            T_es = max(T_es, 500)
+            mini_val_k = min(mini_val_k, 4)
+        elif dataset_steps < 5000:
+            T_es = max(T_es, 300)
+            mini_val_k = min(mini_val_k, 6)
+        if is_main_process:
+            print(f"[evorank][adaptive] dataset_steps={dataset_steps} → T_es={T_es}, mini_val_k={mini_val_k}")
     
     if is_main_process and method_name in {"lora", "evorank", "pissa", "adalora", "sora", "toplora"} and task_name in {"cola", "rte"}:
         if method_name == "sora":
@@ -1693,6 +1709,8 @@ def run_training_loop(
                         random_seed=random_seed,
                         max_grad_norm=max_grad_norm,
                         include_noop_candidate=evo_include_noop_candidate,
+                        es_top_k_refine=es_top_k_refine,
+                        es_significance_threshold=es_significance_threshold,
                     )
                     train_loss = float(out["train_loss"])
                     avg_active_rank = float(
@@ -2532,6 +2550,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evo_include_noop_candidate", dest="evo_include_noop_candidate", action="store_true", help="EvoRank：ES 候选中包含 no-op 基线（默认开启）")
     parser.add_argument("--no_evo_include_noop_candidate", dest="evo_include_noop_candidate", action="store_false", help="EvoRank：移除 no-op 候选，用于消融 validation-side safeguard")
     parser.set_defaults(evo_include_noop_candidate=True)
+    parser.add_argument("--es_top_k_refine", type=int, default=3,
+                        help="EvoRank two-stage ES: coarse-screen all candidates with 1 val batch, then refine top-K with all val batches")
+    parser.add_argument("--es_significance_threshold", type=float, default=0.5,
+                        help="EvoRank ES: z-score threshold for committing a mutation over noop (EggRoll-inspired baseline subtraction)")
     parser.add_argument(
         "--expand_init_mode",
         type=str,
@@ -2840,6 +2862,8 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         flatlora_rho=args.flatlora_rho,
                         peft_meta=meta,
                         evo_include_noop_candidate=args.evo_include_noop_candidate,
+                        es_top_k_refine=args.es_top_k_refine,
+                        es_significance_threshold=args.es_significance_threshold,
                     )
                     res.update(
                         {

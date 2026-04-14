@@ -63,6 +63,8 @@ run_task() {
     --evo_p_p 0.05 \
     --evo_H_p 4 \
     --evo_max_reallocate_candidates 16 \
+    --es_top_k_refine 3 \
+    --es_significance_threshold 0.5 \
     --verify_n_samples 0 \
     --seed_list $SEEDS \
     --log_dir runs/fair_glue_deberta_${TASK} \

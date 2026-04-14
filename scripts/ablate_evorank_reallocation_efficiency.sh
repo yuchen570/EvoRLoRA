@@ -43,6 +43,8 @@ COMMON_ARGS=(
   --evo_cooldown_steps 2
   --evo_allow_reallocation
   --evo_include_noop_candidate
+  --es_top_k_refine 3
+  --es_significance_threshold 0.5
   --seed_list 0 42 100
   --verify_n_samples 0
   --output_dir artifacts

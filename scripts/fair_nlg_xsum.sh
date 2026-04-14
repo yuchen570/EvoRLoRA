@@ -56,6 +56,8 @@ nohup torchrun --nproc_per_node=2 --master_port=29530 \
   --evo_p_p 0.05 \
   --evo_H_p 4 \
   --evo_max_reallocate_candidates 16 \
+  --es_top_k_refine 3 \
+  --es_significance_threshold 0.5 \
   --seed 42 \
   --verify_n_samples 0 \
   --log_dir runs/fair_nlg_xsum_ddp \

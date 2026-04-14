@@ -64,6 +64,8 @@ for METHOD in "${METHODS[@]}"; do
         --model_max_length 512 \
         --pissa_init_method pissa_niter_16 \
         --T_es 100 \
+        --es_top_k_refine 3 \
+        --es_significance_threshold 0.5 \
         --output_dir $OUTPUT_DIR \
         --seed $SEED \
         > logs/nlg_${METHOD}.out 2>&1 &

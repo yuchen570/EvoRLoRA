@@ -495,6 +495,46 @@ class EvoRankLoRALayer(nn.Module):
         delta_W = (B_active @ A_active) * scaling
         W.data += delta_W
         
+    @torch.no_grad()
+    def compute_inactive_probe_scores(self) -> Optional[torch.Tensor]:
+        """
+        EggRoll-inspired soft probing: estimate the value of activating each
+        inactive slot by examining its existing weight norms and the current
+        gradient signal, without any additional forward pass.
+
+        For each inactive index i, the probe score is:
+          probe_i = ||a_i|| * (||grad_B_mean|| + ||grad_A_i||)
+        where grad_B_mean is the average gradient norm across active B columns,
+        and grad_A_i is the gradient of the i-th row of A (inherited from the
+        last backward, even though the slot is inactive — PyTorch still computes
+        gradients for the full r_max-sized parameters).
+
+        Returns a tensor of shape (r_max,) with scores for inactive slots
+        (active slots get 0). Returns None if gradients are unavailable.
+        """
+        if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
+            return None
+
+        inactive_idx = self.get_inactive_indices()
+        if not inactive_idx:
+            return None
+
+        scores = torch.zeros(self.r_max, device=self.lora_A.weight.device)
+        idx_t = torch.as_tensor(inactive_idx, device=self.lora_A.weight.device, dtype=torch.long)
+
+        norm_A = torch.norm(self.lora_A.weight.data, dim=1)
+        grad_A_norm = torch.norm(self.lora_A.weight.grad, dim=1)
+
+        active_idx = self.get_active_indices()
+        if active_idx:
+            active_t = torch.as_tensor(active_idx, device=self.lora_B.weight.device, dtype=torch.long)
+            grad_B_mean = torch.norm(self.lora_B.weight.grad[:, active_t], dim=0).mean()
+        else:
+            grad_B_mean = torch.norm(self.lora_B.weight.grad, dim=0).mean()
+
+        scores[idx_t] = norm_A[idx_t] * (grad_B_mean + grad_A_norm[idx_t])
+        return scores
+
     def extra_repr(self) -> str:
         r_active = self.get_active_rank()
         return f"in_features={self.in_features}, out_features={self.out_features}, r_max={self.r_max}, active={r_active}, alpha={self.lora_alpha}"

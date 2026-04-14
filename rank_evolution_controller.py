@@ -47,52 +47,106 @@ class ExpandMutation(ModuleMutation):
         self.index = index
         self.init_mode = init_mode
         self.grad_direction = grad_direction
-        self.cached_A = None
-        self.cached_B = None
-        
+        self._saved_A_row = None
+        self._saved_B_col = None
+        self._comp_indices = None
+        self._comp_factor_inv = None
+
     def apply(self):
-        self.cached_A = self.layer.lora_A.weight.data.clone()
-        self.cached_B = self.layer.lora_B.weight.data.clone()
-        self.layer.activate_component(
-            self.index,
+        layer = self.layer
+        idx = self.index
+        self._saved_A_row = layer.lora_A.weight.data[idx, :].clone()
+        self._saved_B_col = layer.lora_B.weight.data[:, idx].clone()
+        prev_rank = layer.get_active_rank()
+        new_rank = prev_rank + 1
+        if prev_rank > 0:
+            c = layer.get_scaling_factor(prev_rank) / layer.get_scaling_factor(new_rank)
+            old_indices = [i for i, m in enumerate(layer.active_mask.tolist()) if m and i != idx]
+            self._comp_indices = old_indices
+            self._comp_factor_inv = 1.0 / c if c != 0 else 1.0
+        else:
+            self._comp_indices = None
+            self._comp_factor_inv = None
+        layer.activate_component(
+            idx,
             init_mode=self.init_mode,
             grad_direction=self.grad_direction,
         )
-        
+
     def undo(self):
-        if self.cached_A is not None and self.cached_B is not None:
-            self.layer.active_mask[self.index] = False
-            self.layer.lora_A.weight.data.copy_(self.cached_A)
-            self.layer.lora_B.weight.data.copy_(self.cached_B)
-            self.cached_A, self.cached_B = None, None
+        if self._saved_A_row is None:
+            return
+        layer = self.layer
+        idx = self.index
+        if self._comp_indices is not None and self._comp_factor_inv is not None:
+            c_inv = self._comp_factor_inv
+            comp = self._comp_indices
+            if layer.compensation_mode == "B":
+                layer.lora_B.weight.data[:, comp] *= c_inv
+            elif layer.compensation_mode == "A":
+                layer.lora_A.weight.data[comp, :] *= c_inv
+            elif layer.compensation_mode == "Both":
+                c_inv_half = math.sqrt(c_inv)
+                layer.lora_B.weight.data[:, comp] *= c_inv_half
+                layer.lora_A.weight.data[comp, :] *= c_inv_half
+        layer.lora_A.weight.data[idx, :] = self._saved_A_row
+        layer.lora_B.weight.data[:, idx] = self._saved_B_col
+        layer.active_mask[idx] = False
+        self._saved_A_row = None
+        self._saved_B_col = None
+        self._comp_indices = None
+        self._comp_factor_inv = None
 
     def clear_cache(self):
-        self.cached_A = None
-        self.cached_B = None
+        self._saved_A_row = None
+        self._saved_B_col = None
+        self._comp_indices = None
+        self._comp_factor_inv = None
 
 class PruneMutation(ModuleMutation):
     def __init__(self, layer_name: str, layer: EvoRankLoRALayer, index: int):
         self.layer_name = layer_name
         self.layer = layer
         self.index = index
-        self.cached_A = None
-        self.cached_B = None
-        
+        self._comp_indices = None
+        self._comp_factor_inv = None
+
     def apply(self):
-        self.cached_A = self.layer.lora_A.weight.data.clone()
-        self.cached_B = self.layer.lora_B.weight.data.clone()
-        self.layer.deactivate_component(self.index)
-        
+        layer = self.layer
+        idx = self.index
+        prev_rank = layer.get_active_rank()
+        new_rank = prev_rank - 1
+        if new_rank > 0:
+            c = layer.get_scaling_factor(prev_rank) / layer.get_scaling_factor(new_rank)
+            remaining = [i for i, m in enumerate(layer.active_mask.tolist()) if m and i != idx]
+            self._comp_indices = remaining
+            self._comp_factor_inv = 1.0 / c if c != 0 else 1.0
+        else:
+            self._comp_indices = None
+            self._comp_factor_inv = None
+        layer.deactivate_component(idx)
+
     def undo(self):
-        if self.cached_A is not None and self.cached_B is not None:
-            self.layer.active_mask[self.index] = True
-            self.layer.lora_A.weight.data.copy_(self.cached_A)
-            self.layer.lora_B.weight.data.copy_(self.cached_B)
-            self.cached_A, self.cached_B = None, None
+        layer = self.layer
+        idx = self.index
+        if self._comp_indices is not None and self._comp_factor_inv is not None:
+            c_inv = self._comp_factor_inv
+            comp = self._comp_indices
+            if layer.compensation_mode == "B":
+                layer.lora_B.weight.data[:, comp] *= c_inv
+            elif layer.compensation_mode == "A":
+                layer.lora_A.weight.data[comp, :] *= c_inv
+            elif layer.compensation_mode == "Both":
+                c_inv_half = math.sqrt(c_inv)
+                layer.lora_B.weight.data[:, comp] *= c_inv_half
+                layer.lora_A.weight.data[comp, :] *= c_inv_half
+        layer.active_mask[idx] = True
+        self._comp_indices = None
+        self._comp_factor_inv = None
 
     def clear_cache(self):
-        self.cached_A = None
-        self.cached_B = None
+        self._comp_indices = None
+        self._comp_factor_inv = None
 
 class ReallocateMutation(ModuleMutation):
     def __init__(self, prune_mut: PruneMutation, expand_mut: ExpandMutation):
@@ -268,6 +322,16 @@ class RankEvolutionController:
             else:
                 self.ema_s[name][active] = self.rho * self.ema_s[name][active] + (1 - self.rho) * curr_s[active]
 
+        # B3：受 EggRoll 启发的软探测
+        # 对“有高价值非活跃槽位”的层提高 ema_u，帮助更早触发有效扩张。
+        for name, layer in self.layers.items():
+            probe = layer.compute_inactive_probe_scores()
+            if probe is not None and probe.any():
+                max_probe = float(probe.max().item())
+                if max_probe > 0:
+                    probe_norm = max_probe / (g_max + eps)
+                    self.ema_u[name] = self.ema_u[name] + 0.1 * probe_norm
+
         self._is_initialized = True
 
     def compute_thresholds(self) -> Tuple[float, float]:
@@ -362,6 +426,11 @@ class RankEvolutionController:
           2. Reduction:    c^prune_{ℓ,i} ≥ H_p → 休眠组件 (ℓ,i)
           3. Reallocation: 一层 reduce + 另一层 expand（近似保预算）
 
+        Antithetic pairing (Hyperscale ES 优化):
+          借鉴 EggRoll 的 ±σ 对称采样思想，同层 expand/prune 是天然反对称对。
+          同层的 expand 和 prune 只需评估差异更大的一侧（信息冗余剔除），
+          跨层 reallocate 使用 score 差异排序而非盲目笛卡尔积。
+
         纯粹收集候选，不改任何计数或状态；由外层 ES 在 D_val 上决策赢家。
         """
         mutations: List[ModuleMutation] = []
@@ -409,37 +478,57 @@ class RankEvolutionController:
 
         prune_muts: List[PruneMutation] = [m for _, m in prune_candidates]
 
-        # 3) 单操作候选
+        # 3) 反对称去冗余：若同层同时出现 expand / prune 候选，
+        # 仅保留信号更强的一侧（相对当前状态的扰动更显著）。
+        expand_layers = {m.layer_name for m in expand_muts}
+        prune_layers = {m.layer_name for m in prune_muts}
+        antithetic_layers = expand_layers & prune_layers
+        if antithetic_layers:
+            filtered_prune: List[PruneMutation] = []
+            for pm in prune_muts:
+                if pm.layer_name in antithetic_layers:
+                    score = float(self.ema_s[pm.layer_name][pm.index].item())
+                    u_score = self.ema_u[pm.layer_name]
+                    if score < u_score:
+                        filtered_prune.append(pm)
+                else:
+                    filtered_prune.append(pm)
+            prune_muts = filtered_prune
+
         mutations.extend(expand_muts)
         mutations.extend(prune_muts)
 
-        # 4) Reallocate 候选：避免组合爆炸
+        # 4) Reallocate：按分数差排序配对，替代盲目笛卡尔积枚举
         if (not self.allow_reallocation) or (not expand_muts) or (not prune_muts):
             return mutations
 
-        reallocate_count = 0
+        scored_pairs: List[Tuple[float, ExpandMutation, PruneMutation]] = []
         for e_mut in expand_muts:
+            e_score = self.ema_u[e_mut.layer_name]
             for p_mut in prune_muts:
                 if e_mut.layer_name == p_mut.layer_name:
                     continue
+                p_score = float(self.ema_s[p_mut.layer_name][p_mut.index].item())
+                pair_score = e_score - p_score
+                scored_pairs.append((pair_score, e_mut, p_mut))
 
-                if self.reallocate_strategy not in {"topk_cross"}:
-                    raise ValueError(f"未知 reallocate_strategy: {self.reallocate_strategy}")
+        scored_pairs.sort(key=lambda x: x[0], reverse=True)
 
-                if self.max_reallocate_candidates is not None and reallocate_count >= self.max_reallocate_candidates:
-                    return mutations
-
-                mutations.append(
-                    ReallocateMutation(
-                        PruneMutation(p_mut.layer_name, p_mut.layer, p_mut.index),
-                        ExpandMutation(
-                            e_mut.layer_name, e_mut.layer, e_mut.index,
-                            init_mode=e_mut.init_mode,
-                            grad_direction=e_mut.grad_direction,
-                        ),
-                    )
+        reallocate_count = 0
+        for _, e_mut, p_mut in scored_pairs:
+            if self.max_reallocate_candidates is not None and reallocate_count >= self.max_reallocate_candidates:
+                break
+            mutations.append(
+                ReallocateMutation(
+                    PruneMutation(p_mut.layer_name, p_mut.layer, p_mut.index),
+                    ExpandMutation(
+                        e_mut.layer_name, e_mut.layer, e_mut.index,
+                        init_mode=e_mut.init_mode,
+                        grad_direction=e_mut.grad_direction,
+                    ),
                 )
-                reallocate_count += 1
+            )
+            reallocate_count += 1
 
         return mutations
 
