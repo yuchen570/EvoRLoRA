@@ -43,7 +43,7 @@ COMMON_ARGS=(
   --complexity_mode rank_sum
   --lambda_pop 16
   --population_strategy all
-  --expand_init_mode gradient
+  --expand_init_mode preserve
   --evo_rho 0.9
   --evo_p_g 0.8
   --evo_p_p 0.1
