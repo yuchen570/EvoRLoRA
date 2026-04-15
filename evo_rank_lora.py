@@ -50,7 +50,9 @@ class EvoRankLoRALayer(nn.Module):
         self.r_max = r_max
         self.lora_alpha = lora_alpha
         self.use_rslora = bool(use_rslora)
-        self.compensation_mode = compensation_mode # "B", "A", 或 "Both"
+        if compensation_mode not in {"B", "A", "Both", "None"}:
+            raise ValueError(f"未知 compensation_mode={compensation_mode!r}，应为 B/A/Both/None")
+        self.compensation_mode = compensation_mode # "B", "A", "Both", 或 "None"
         self.debug = debug  # 调试模式：开启后会检查全零梯度（触发 GPU->CPU 同步，DDP 下慎用）
         
         if r_init > r_max:
@@ -182,6 +184,9 @@ class EvoRankLoRALayer(nn.Module):
                 c_half = math.sqrt(c)
                 self.lora_B.weight[:, old_indices] *= c_half
                 self.lora_A.weight[old_indices, :] *= c_half
+            elif self.compensation_mode == "None":
+                # 方案 4：不进行补偿（用于消融）
+                pass
 
     @torch.no_grad()
     def deactivate_component(self, index: int):
@@ -218,6 +223,9 @@ class EvoRankLoRALayer(nn.Module):
                 c_half = math.sqrt(c)
                 self.lora_B.weight[:, remaining_indices] *= c_half
                 self.lora_A.weight[remaining_indices, :] *= c_half
+            elif self.compensation_mode == "None":
+                # 方案 4：不进行补偿（用于消融）
+                pass
         
     def get_active_indices(self) -> List[int]:
         """使用原生 nonzero() 避免 CPU-GPU 同步和列表转换开销"""

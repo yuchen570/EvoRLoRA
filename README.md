@@ -230,6 +230,9 @@ python run_benchmark.py \
   --sora_lambda_warmup_steps 0 \
   --flatlora_rho 0.05 \
   --expand_init_mode gradient \
+  --evo_compensation_mode B \
+  --es_top_k_refine 3 \
+  --es_significance_threshold 0.5 \
   --seed 42 \
   --log_dir runs/smoke_full \
   --output_dir artifacts \

@@ -2574,8 +2574,8 @@ def parse_args() -> argparse.Namespace:
         "--evo_compensation_mode",
         type=str,
         default="B",
-        choices=["B", "A", "Both"],
-        help="EvoRank 秩变更时的等价变换补偿模式。'B': 只对 B 补偿（默认）；'A': 只对 A 补偿；'Both': A/B 各补偿 sqrt(c)。",
+        choices=["B", "A", "Both", "None"],
+        help="EvoRank 秩变更时的等价变换补偿模式。'B': 只对 B 补偿（默认）；'A': 只对 A 补偿；'Both': A/B 各补偿 sqrt(c)；'None': 不补偿（消融）。",
     )
     parser.add_argument("--lambda_pop", type=int, default=None)
     parser.add_argument("--population_strategy", type=str, default="all", choices=["all", "random"])
