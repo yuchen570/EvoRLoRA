@@ -13,16 +13,17 @@ from sklearn.metrics import accuracy_score, f1_score, matthews_corrcoef
 def glue_primary_metric_key(task_name: str) -> str:
     """用于日志 / TensorBoard / metrics.jsonl 的指标标识。"""
     m = {
-        "cola": "matthews_corrcoef",
-        "sst2": "accuracy",
-        "mrpc": "f1",
-        "qqp": "f1",
-        "stsb": "pearson_spearman_mean",
-        "mnli": "accuracy",
-        "qnli": "accuracy",
-        "rte": "accuracy",
-        "wnli": "accuracy",
-        "ax": "accuracy",
+        # 对齐 AdaLoRA / HF-GLUE 习惯命名
+        "cola": "mcc",
+        "sst2": "acc",
+        "mrpc": "acc_and_f1",
+        "qqp": "acc_and_f1",
+        "stsb": "corr",
+        "mnli": "m/mm",
+        "qnli": "acc",
+        "rte": "acc",
+        "wnli": "acc",
+        "ax": "acc",
     }
     if task_name not in m:
         raise ValueError(f"未知 GLUE task_name: {task_name}")
@@ -32,10 +33,11 @@ def glue_primary_metric_key(task_name: str) -> str:
 def compute_glue_primary_metric(task_name: str, y_pred: np.ndarray, y_true: np.ndarray) -> float:
     """
     返回该子集的「主」标量（越大越好，用于 best 跟踪与 CSV）。
-    - CoLA: Matthews 相关
-    - SST-2 / MNLI / QNLI / RTE / WNLI / ax: Accuracy
-    - MRPC / QQP: F1 (binary)
-    - STS-B: (Pearson + Spearman) / 2（与 GLUE 总分中该任务常见合成方式一致）
+    - CoLA: mcc
+    - SST-2 / QNLI / RTE / WNLI / ax: acc
+    - MRPC / QQP: acc_and_f1 = (acc + f1) / 2
+    - STS-B: corr = (Pearson + Spearman) / 2
+    - MNLI: m/mm = (matched + mismatched) / 2（同时记录 matched/mismatched）
     """
     y_true = np.asarray(y_true).reshape(-1)
     y_pred = np.asarray(y_pred).reshape(-1)
@@ -45,7 +47,9 @@ def compute_glue_primary_metric(task_name: str, y_pred: np.ndarray, y_true: np.n
     if task_name in ("sst2", "mnli", "qnli", "rte", "wnli", "ax"):
         return float(accuracy_score(y_true, y_pred))
     if task_name in ("mrpc", "qqp"):
-        return float(f1_score(y_true, y_pred, average="binary", zero_division=0))
+        acc = float(accuracy_score(y_true, y_pred))
+        f1 = float(f1_score(y_true, y_pred, average="binary", zero_division=0))
+        return (acc + f1) / 2.0
     if task_name == "stsb":
         p, _ = pearsonr(y_pred, y_true)
         s, _ = spearmanr(y_pred, y_true)
@@ -61,20 +65,34 @@ def compute_glue_metrics_dict(task_name: str, y_pred: np.ndarray, y_true: np.nda
 
     res = {}
     if task_name == "cola":
-        res["matthews_corrcoef"] = float(matthews_corrcoef(y_true, y_pred))
+        mcc = float(matthews_corrcoef(y_true, y_pred))
+        res["matthews_corrcoef"] = mcc
+        res["mcc"] = mcc
     elif task_name in ("sst2", "mnli", "qnli", "rte", "wnli", "ax"):
-        res["accuracy"] = float(accuracy_score(y_true, y_pred))
+        acc = float(accuracy_score(y_true, y_pred))
+        res["accuracy"] = acc
+        res["acc"] = acc
+        if task_name == "mnli":
+            res["mnli/acc"] = acc
     elif task_name in ("mrpc", "qqp"):
-        res["f1"] = float(f1_score(y_true, y_pred, average="binary", zero_division=0))
-        res["accuracy"] = float(accuracy_score(y_true, y_pred))
+        f1 = float(f1_score(y_true, y_pred, average="binary", zero_division=0))
+        acc = float(accuracy_score(y_true, y_pred))
+        res["f1"] = f1
+        res["accuracy"] = acc
+        res["acc"] = acc
+        res["acc_and_f1"] = (acc + f1) / 2.0
     elif task_name == "stsb":
         p, _ = pearsonr(y_pred, y_true)
         s, _ = spearmanr(y_pred, y_true)
         p = 0.0 if np.isnan(p) else float(p)
         s = 0.0 if np.isnan(s) else float(s)
-        res["pearson_spearman_mean"] = (p + s) / 2.0
+        corr = (p + s) / 2.0
+        res["pearson_spearman_mean"] = corr
         res["pearson"] = p
         res["spearman"] = s
+        res["pearsonr"] = p
+        res["spearmanr"] = s
+        res["corr"] = corr
     else:
         raise ValueError(f"未知 GLUE task_name: {task_name}")
     return res

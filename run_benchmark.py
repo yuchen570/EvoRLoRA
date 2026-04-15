@@ -2076,10 +2076,15 @@ def run_training_loop(
                     if is_main_process:
                         val_metric_m = compute_glue_primary_metric(task_name, y_pred_m, y_true_m)
                         val_metric_mm = compute_glue_primary_metric(task_name, y_pred_mm, y_true_mm)
+                        # 论文表格口径：MNLI 主指标为 m/mm 的平均
                         val_metric = (val_metric_m + val_metric_mm) / 2.0
                         metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred_m, y_true_m)
                         metrics_dict_val["accuracy_m"] = val_metric_m
                         metrics_dict_val["accuracy_mm"] = val_metric_mm
+                        metrics_dict_val["mnli_m_mm"] = f"{val_metric_m:.6f}/{val_metric_mm:.6f}"
+                        # AdaLoRA / HF-GLUE 常见命名兼容：matched 与 mismatched 分开记录
+                        metrics_dict_val["mnli/acc"] = val_metric_m
+                        metrics_dict_val["mnli-mm/acc"] = val_metric_mm
                         y_pred_main = y_pred_m
                         y_true_main = y_true_m
                 else:
@@ -2094,6 +2099,24 @@ def run_training_loop(
                     if is_main_process:
                         val_metric = compute_glue_primary_metric(task_name, y_pred_local, y_true_local)
                         metrics_dict_val = compute_glue_metrics_dict(task_name, y_pred_local, y_true_local)
+                        # AdaLoRA / HF-GLUE 常见命名兼容：MRPC/QQP 记录 acc/f1 及其均值
+                        if task_name in {"mrpc", "qqp"}:
+                            _acc = metrics_dict_val.get("accuracy")
+                            _f1 = metrics_dict_val.get("f1")
+                            metrics_dict_val["acc"] = _acc
+                            if _acc is not None and _f1 is not None:
+                                metrics_dict_val["acc_and_f1"] = (float(_acc) + float(_f1)) / 2.0
+                        # AdaLoRA / HF-GLUE 常见命名兼容：STS-B 用 corr/spearmanr 命名
+                        if task_name == "stsb":
+                            _p = metrics_dict_val.get("pearson")
+                            _s = metrics_dict_val.get("spearman")
+                            if _p is not None:
+                                metrics_dict_val["pearsonr"] = _p
+                            if _s is not None:
+                                metrics_dict_val["spearmanr"] = _s
+                            _c = metrics_dict_val.get("pearson_spearman_mean")
+                            if _c is not None:
+                                metrics_dict_val["corr"] = _c
                         y_pred_main = y_pred_local
                         y_true_main = y_true_local
                 if ddp_enabled and _ddp_is_active():
@@ -2278,6 +2301,33 @@ def run_training_loop(
                 }
                 if task_type == "nlu" and task_name is not None:
                     rec["glue_metric"] = glue_primary_metric_key(task_name)
+                    rec["matthews_corrcoef"] = metrics_dict_val.get("matthews_corrcoef")
+                    rec["mcc"] = metrics_dict_val.get("mcc")
+                    rec["accuracy"] = metrics_dict_val.get("accuracy")
+                    rec["f1"] = metrics_dict_val.get("f1")
+                    rec["acc"] = metrics_dict_val.get("acc")
+                    rec["acc_and_f1"] = metrics_dict_val.get("acc_and_f1")
+                    rec["pearson_spearman_mean"] = metrics_dict_val.get("pearson_spearman_mean")
+                    rec["corr"] = metrics_dict_val.get("corr")
+                    rec["pearsonr"] = metrics_dict_val.get("pearsonr")
+                    rec["spearmanr"] = metrics_dict_val.get("spearmanr")
+                    rec["accuracy_m"] = metrics_dict_val.get("accuracy_m")
+                    rec["accuracy_mm"] = metrics_dict_val.get("accuracy_mm")
+                    rec["mnli/acc"] = metrics_dict_val.get("mnli/acc")
+                    rec["mnli-mm/acc"] = metrics_dict_val.get("mnli-mm/acc")
+                    # 图表口径友好字段：MNLI(m/mm), QQP(acc/F1), MRPC(acc)
+                    if task_name == "mnli":
+                        rec["mnli_m_mm"] = metrics_dict_val.get("mnli_m_mm")
+                    if task_name == "qqp":
+                        qqp_acc = metrics_dict_val.get("accuracy")
+                        qqp_f1 = metrics_dict_val.get("f1")
+                        rec["qqp_acc_f1"] = (
+                            f"{float(qqp_acc):.6f}/{float(qqp_f1):.6f}"
+                            if qqp_acc is not None and qqp_f1 is not None
+                            else None
+                        )
+                    if task_name == "mrpc":
+                        rec["mrpc_acc"] = metrics_dict_val.get("accuracy")
                 if task_type == "nlg":
                     rec["rouge1"] = rouge1_val
                     rec["rouge2"] = rouge2_val
