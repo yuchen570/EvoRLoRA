@@ -683,7 +683,6 @@ def peft_factory(
     comparison_protocol: str = "none",
     protocol_dropout: float = 0.05,
     evorank_r_max: int = 16,
-    evorank_use_rslora: bool = False,
     evorank_alpha_u: float = 1.0,
     evorank_beta_u: float = 1.0,
     evorank_rho: float = 0.9,
@@ -694,7 +693,8 @@ def peft_factory(
     evorank_cooldown_steps: int = 2,
     evorank_allow_reallocation: bool = True,
     evorank_max_reallocate_candidates: int = 8,
-    evorank_compensation_mode: str = "B",
+    evorank_init_strategy: str = "pissa",
+    evorank_pissa_niter: int = 2,
     toplora_dropout: float = 0.05,
 ) -> Tuple[nn.Module, Optional[RankEvolutionController], Dict[str, Any]]:
     def _collect_all_linear_target_modules(m: nn.Module) -> List[str]:
@@ -916,10 +916,12 @@ def peft_factory(
             target_modules=target_modules,
             layer_kwargs={
                 "r_max": er_max,
-                "r_init": target_rank,
+                "r_init": 0,
                 "lora_alpha": effective_alpha,
-                "use_rslora": bool(evorank_use_rslora),
-                "compensation_mode": evorank_compensation_mode, # 补偿模式：B, A, 或 Both
+                "use_rslora": False,
+                "compensation_mode": "None",
+                "init_strategy": str(evorank_init_strategy),
+                "pissa_niter": int(evorank_pissa_niter),
             },
             controller_kwargs={
                 "rho": float(evorank_rho),
@@ -933,7 +935,7 @@ def peft_factory(
                 "alpha_u": float(evorank_alpha_u),
                 "beta_u": float(evorank_beta_u),
                 "allow_reallocation": bool(evorank_allow_reallocation),
-                "expand_init_mode": getattr(args, "expand_init_mode", "zero"),
+                "expand_init_mode": getattr(args, "expand_init_mode", "preserve"),
                 "max_reallocate_candidates": int(evorank_max_reallocate_candidates) if int(evorank_max_reallocate_candidates) > 0 else None,
             },
         )
@@ -991,6 +993,7 @@ def peft_factory(
 
     meta = {
         "trainable_params": trainable_params,
+        "target_rank": int(target_rank),
         "extra_params": extra_params,  # TopLoRA 专属额外参数量（其他方法为 0）
         "target_modules": list(target_modules),
         "effective_dropout": effective_dropout_val,
@@ -1282,6 +1285,12 @@ def _save_final_artifact(
     tokenizer: Optional[Any],
     best_val_accuracy: float,
     global_step: int,
+    *,
+    best_val_global_step: Optional[int] = None,
+    best_val_epoch: Optional[int] = None,
+    best_metrics: Optional[Dict[str, float]] = None,
+    best_snapshot: Optional[Dict[str, Any]] = None,
+    end_snapshot: Optional[Dict[str, Any]] = None,
 ) -> None:
     os.makedirs(final_dir, exist_ok=True)
     meta: Dict[str, Any] = {
@@ -1289,7 +1298,21 @@ def _save_final_artifact(
         "task_type": task_type,
         "best_val_accuracy": float(best_val_accuracy),
         "global_step": int(global_step),
+        "weights_checkpoint": "last_training_step",
+        "note": (
+            "验证指标为训练期间最佳验证步；本目录权重为最后一个训练步（秩/门控可能与最佳步不一致）。"
+        ),
     }
+    if best_val_global_step is not None:
+        meta["best_val_global_step"] = int(best_val_global_step)
+    if best_val_epoch is not None:
+        meta["best_val_epoch"] = int(best_val_epoch)
+    if best_metrics is not None:
+        meta["best_metrics"] = best_metrics
+    if best_snapshot is not None:
+        meta["best_snapshot"] = best_snapshot
+    if end_snapshot is not None:
+        meta["end_snapshot"] = end_snapshot
     if task_name is not None:
         meta["task_name"] = task_name
     with open(os.path.join(final_dir, "training_meta.json"), "w", encoding="utf-8") as f:
@@ -1667,7 +1690,9 @@ def run_training_loop(
             is_main_process=is_main_process, local_rank=local_rank,
         )
     # ==================================
-    
+
+    best_val_rank_snapshot: Optional[Dict[str, Any]] = None
+    best_val_trainable_params: Optional[int] = None
     try:
         best_val_acc = 0.0
         best_val_metrics: Dict[str, float] = {}
@@ -2102,11 +2127,14 @@ def run_training_loop(
                     val_metric = float(m_tensor.item())
                     dist.barrier()
                 if is_main_process:
+                    rank_snap = False
                     if val_metric > best_val_acc:
                         best_val_acc = val_metric
                         best_val_metrics = metrics_dict_val
+                        rank_snap = True
                     elif val_metric == best_val_acc and not best_val_metrics:
                         best_val_metrics = metrics_dict_val
+                        rank_snap = True
                     if method_name in {"lora", "evorank", "pissa", "flatlora"} and task_name in {"cola", "rte", "mrpc", "stsb"}:
                         pred_list = [int(x) for x in y_pred_main]
                         true_list = [int(x) for x in y_true_main]
@@ -2162,6 +2190,25 @@ def run_training_loop(
                              if "lora_A" in n and p.numel() > 0), 8
                         )) if method_name in ("lora", "pissa", "flatlora") else 8,
                     )
+                    if rank_snap:
+                        best_val_rank_snapshot = {
+                            "avg_rank": float(rank_info["summary"]["avg_rank"]),
+                            "total_active": int(rank_info["summary"]["total_active"]),
+                            "total_capacity": int(rank_info["summary"]["total_capacity"]),
+                            "global_step": int(global_step),
+                            "epoch": int(epoch + 1),
+                        }
+                        best_val_trainable_params = count_trainable_params(_unwrap_training_module(model))
+                        if checkpoint_root and method_name in {"adalora", "sora", "evorank"}:
+                            _save_checkpoint_pt(
+                                os.path.join(checkpoint_root, "checkpoint_best.pt"),
+                                _unwrap_for_save(model),
+                                optimizer,
+                                lr_scheduler,
+                                global_step,
+                                epoch,
+                                best_val_acc,
+                            )
                     _print_rank_distribution(rank_info, method_name, epoch + 1, epochs)
                     if writer is not None:
                         writer.add_scalar(f"val/{mkey}", val_metric, epoch)
@@ -2247,7 +2294,9 @@ def run_training_loop(
                                     f"ref0={refs_text[0][:120] if refs_text else ''!r}"
                                 )
     
+                    prev_best = best_val_acc
                     best_val_acc = max(best_val_acc, val_metric)
+                    rank_snap = best_val_acc > prev_best
                     print(
                         f"[{method_name}] epoch={epoch + 1}/{epochs} "
                         f"step={global_step} val_rouge1={rouge1_val:.4f} val_rouge2={rouge2_val:.4f} "
@@ -2261,6 +2310,25 @@ def run_training_loop(
                              if "lora_A" in n and p.numel() > 0), 8
                         )) if method_name in ("lora", "pissa", "flatlora") else 8,
                     )
+                    if rank_snap:
+                        best_val_rank_snapshot = {
+                            "avg_rank": float(rank_info["summary"]["avg_rank"]),
+                            "total_active": int(rank_info["summary"]["total_active"]),
+                            "total_capacity": int(rank_info["summary"]["total_capacity"]),
+                            "global_step": int(global_step),
+                            "epoch": int(epoch + 1),
+                        }
+                        best_val_trainable_params = count_trainable_params(_unwrap_training_module(model))
+                        if checkpoint_root and method_name in {"adalora", "sora", "evorank"}:
+                            _save_checkpoint_pt(
+                                os.path.join(checkpoint_root, "checkpoint_best.pt"),
+                                _unwrap_for_save(model),
+                                optimizer,
+                                lr_scheduler,
+                                global_step,
+                                epoch,
+                                best_val_acc,
+                            )
                     _print_rank_distribution(rank_info, method_name, epoch + 1, epochs)
                     if writer is not None:
                         writer.add_scalar("val/rouge1", rouge1_val, epoch)
@@ -2340,18 +2408,6 @@ def run_training_loop(
         wandb_run.finish()
 
     model.eval()
-    if is_main_process and checkpoint_root and save_final_model:
-        final_dir = os.path.join(checkpoint_root, "final")
-        _save_final_artifact(
-            _unwrap_for_save(model),
-            final_dir,
-            method_name,
-            task_type,
-            task_name,
-            tokenizer,
-            best_val_acc,
-            global_step,
-        )
     if is_main_process and verify_n_samples > 0:
         _run_verify_samples(
             model,
@@ -2383,10 +2439,28 @@ def run_training_loop(
         val_metric_key_str = "rougeL"
 
     try:
-        rank_dist = _collect_rank_distribution(model, method_name, controller, args.target_rank)
+        _tr_meta = int((peft_meta or {}).get("target_rank", 8))
+        rank_dist = _collect_rank_distribution(model, method_name, controller, _tr_meta)
         final_avg_active_rank = rank_dist["summary"]["avg_rank"]
+        end_rank_summary: Dict[str, Any] = {
+            "avg_rank": float(rank_dist["summary"].get("avg_rank", 0.0)),
+            "total_active": int(rank_dist["summary"].get("total_active", 0)),
+            "total_capacity": int(rank_dist["summary"].get("total_capacity", 0)),
+        }
     except Exception:
         final_avg_active_rank = "N/A"
+        end_rank_summary = {}
+
+    if best_val_rank_snapshot is not None:
+        avg_active_rank_reported = float(best_val_rank_snapshot["avg_rank"])
+    elif isinstance(final_avg_active_rank, (int, float)):
+        avg_active_rank_reported = float(final_avg_active_rank)
+    else:
+        avg_active_rank_reported = final_avg_active_rank
+    if isinstance(final_avg_active_rank, (int, float)):
+        avg_active_rank_end_reported = float(final_avg_active_rank)
+    else:
+        avg_active_rank_end_reported = final_avg_active_rank
 
     def _mean_numeric(records: List[Dict[str, float]], key: str) -> Optional[float]:
         vals: List[float] = []
@@ -2405,12 +2479,22 @@ def run_training_loop(
     evorank_delta_val_loss_mean = _mean_numeric(evorank_es_records, "delta_val_loss")
     evorank_delta_complexity_mean = _mean_numeric(evorank_es_records, "delta_complexity")
 
+    end_trainable_params = count_trainable_params(_unwrap_training_module(model))
+
     result = {
         "method": method_name,
         "optimizer_type": "AdamW+SparseAdamW" if method_name == "sora" else "AdamW",
         "total_train_time_sec": total_time,
         "peak_memory_mb": peak_mem_mb,
-        "avg_active_rank": final_avg_active_rank,
+        "best_avg_active_rank": avg_active_rank_reported,
+        "end_avg_active_rank": avg_active_rank_end_reported,
+        "best_global_step": (
+            int(best_val_rank_snapshot["global_step"]) if best_val_rank_snapshot is not None else ""
+        ),
+        "best_trainable_params": (
+            int(best_val_trainable_params) if best_val_trainable_params is not None else ""
+        ),
+        "end_trainable_params": int(end_trainable_params),
         "warmup_ratio": warmup_ratio,
         "lr_scheduler_type": lr_scheduler_type,
         "artifact_dir": artifact_dir_str,
@@ -2436,6 +2520,46 @@ def run_training_loop(
     if task_type == "nlu" and val_metric_key_str:
         # 与选优标量一致：QQP 为 mean_acc_f1；MNLI 等为 val_metric（如 m/mm 平均），避免 CSV 中 accuracy 与主指标不一致。
         result[val_metric_key_str] = float(best_val_acc)
+    if is_main_process and checkpoint_root and save_final_model:
+        final_dir = os.path.join(checkpoint_root, "final")
+        best_snapshot_for_meta: Dict[str, Any] = {
+            "best_global_step": int(best_val_rank_snapshot["global_step"]) if best_val_rank_snapshot is not None else None,
+            "best_epoch": int(best_val_rank_snapshot["epoch"]) if best_val_rank_snapshot is not None else None,
+            "best_rank_summary": (
+                {
+                    "avg_rank": float(best_val_rank_snapshot["avg_rank"]),
+                    "total_active": int(best_val_rank_snapshot["total_active"]),
+                    "total_capacity": int(best_val_rank_snapshot["total_capacity"]),
+                }
+                if best_val_rank_snapshot is not None
+                else {}
+            ),
+            "best_trainable_params": int(best_val_trainable_params) if best_val_trainable_params is not None else None,
+        }
+        end_snapshot_for_meta: Dict[str, Any] = {
+            "end_global_step": int(global_step),
+            "end_rank_summary": end_rank_summary,
+            "end_trainable_params": int(end_trainable_params),
+        }
+        _save_final_artifact(
+            _unwrap_for_save(model),
+            final_dir,
+            method_name,
+            task_type,
+            task_name,
+            tokenizer,
+            best_val_acc,
+            global_step,
+            best_val_global_step=(
+                int(best_val_rank_snapshot["global_step"]) if best_val_rank_snapshot is not None else None
+            ),
+            best_val_epoch=(
+                int(best_val_rank_snapshot["epoch"]) if best_val_rank_snapshot is not None else None
+            ),
+            best_metrics={k: float(v) for k, v in best_val_metrics.items()},
+            best_snapshot=best_snapshot_for_meta,
+            end_snapshot=end_snapshot_for_meta,
+        )
     return result
 
 
@@ -2680,11 +2804,6 @@ def parse_args() -> argparse.Namespace:
         help="EvoRank 每层秩超空间上限 R_max（与论文默认 16 一致）",
     )
     parser.add_argument(
-        "--evorank_use_rslora",
-        action="store_true",
-        help="EvoRank 缩放改为 rsLoRA(alpha/sqrt(r))。默认关闭，使用标准 LoRA 缩放(alpha/r)。",
-    )
-    parser.add_argument(
         "--evo_alpha_u",
         type=float,
         default=1.0,
@@ -2715,25 +2834,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expand_init_mode",
         type=str,
-        default="zero",
-        choices=["zero", "gradient"],
+        default="preserve",
+        choices=["zero", "gradient", "preserve"],
         help="EvoRank 扩张初始化策略。"
              "'zero': B 列清零（安全 cold start）；"
+             "'preserve': 仅激活掩码，保留预初始化 A/B（m=0 热身推荐）；"
              "'gradient': 论文 Proposition 3.2——基于 ∂L/∂ΔW 的主奇异方向初始化新分量，"
              "通过 power iteration 高效计算，不构造完整梯度矩阵。",
+    )
+    parser.add_argument(
+        "--evorank_init_strategy",
+        type=str,
+        default="pissa",
+        choices=["lora", "pissa"],
+        help="EvoRank A/B 初始化策略。pissa 表示使用 PiSSA 风格 SVD 初始化（可与 m=0 配合）。",
+    )
+    parser.add_argument(
+        "--evorank_pissa_niter",
+        type=int,
+        default=2,
+        help="EvoRank PiSSA 风格 SVD 的迭代次数（用于 svd_lowrank，高值更准但更慢）。",
     )
     parser.add_argument(
         "--evo_max_reallocate_candidates",
         type=int,
         default=8,
         help="EvoRank 默认的跨层 reallocation 候选上限。候选按 top-k cross 顺序生成，并在达到该上限后停止。设为 0 或负数可关闭限流（允许组合爆炸消融）。",
-    )
-    parser.add_argument(
-        "--evo_compensation_mode",
-        type=str,
-        default="B",
-        choices=["B", "A", "Both", "None"],
-        help="EvoRank 秩变更时的等价变换补偿模式。'B': 只对 B 补偿（默认）；'A': 只对 A 补偿；'Both': A/B 各补偿 sqrt(c)；'None': 不补偿（消融）。",
     )
     parser.add_argument("--lambda_pop", type=int, default=None)
     parser.add_argument("--population_strategy", type=str, default="all", choices=["all", "random"])
@@ -2885,7 +3011,6 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         comparison_protocol=args.comparison_protocol,
                         protocol_dropout=args.protocol_dropout,
                         evorank_r_max=args.evorank_r_max,
-                        evorank_use_rslora=args.evorank_use_rslora,
                         evorank_alpha_u=args.evo_alpha_u,
                         evorank_beta_u=args.evo_beta_u,
                         evorank_rho=args.evo_rho,
@@ -2896,7 +3021,8 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         evorank_cooldown_steps=args.evo_cooldown_steps,
                         evorank_allow_reallocation=args.evo_allow_reallocation,
                         evorank_max_reallocate_candidates=args.evo_max_reallocate_candidates,
-                        evorank_compensation_mode=args.evo_compensation_mode, # 传递评价中使用的补偿策略
+                        evorank_init_strategy=args.evorank_init_strategy,
+                        evorank_pissa_niter=args.evorank_pissa_niter,
                         toplora_dropout=args.toplora_dropout,
                     )
                     # === PiSSA / Flat-LoRA 初始化诊断 ===
@@ -3039,6 +3165,9 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                             "seed": seed,
                         }
                     )
+                    tpb = res.get("best_trainable_params")
+                    if isinstance(tpb, int) and tpb > 0:
+                        res["trainable_params"] = tpb
                     if args.is_main_process:
                         all_results.append(res)
                         seed_results.append(res)
@@ -3058,6 +3187,12 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         "rouge1",
                         "rouge2",
                         "rougeL",
+                        "best_avg_active_rank",
+                        "end_avg_active_rank",
+                        "best_global_step",
+                        "best_trainable_params",
+                        "end_trainable_params",
+                        "trainable_params",
                     ]
                     
                     mean_row = dict(seed_results[0])
@@ -3078,13 +3213,12 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                             mean_row[m_key] = ""
                             std_row[m_key] = ""
                             
-                    # 清空不适合聚合的字段
+                    # 清空不适合聚合的字段（best/end 快照字段已在上方聚合）
                     for row in (mean_row, std_row):
                         row["artifact_dir"] = ""
                         row["final_dir"] = ""
                         row["peak_memory_mb"] = ""
                         row["total_train_time_sec"] = ""
-                        row["avg_active_rank"] = ""
                         row["warmup_ratio"] = ""
                         row["lr_scheduler_type"] = ""
                         row["evorank_avg_delta_complexity"] = ""
@@ -3119,7 +3253,11 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "rouge2",
                     "rougeL",
                     "peak_memory_mb",
-                    "avg_active_rank",
+                    "best_avg_active_rank",
+                    "end_avg_active_rank",
+                    "best_global_step",
+                    "best_trainable_params",
+                    "end_trainable_params",
                     "warmup_ratio",
                     "lr_scheduler_type",
                     "evorank_avg_delta_complexity",
@@ -3187,7 +3325,7 @@ if __name__ == "__main__":
                 f"{'peak_mem_mb':<12} {'avg_rank':<10} {'time_sec':<10}"
             )
             for r in results:
-                ar = r["avg_active_rank"]
+                ar = r.get("best_avg_active_rank", r.get("avg_active_rank", "N/A"))
                 ar_fmt = f"{float(ar):.4f}" if isinstance(ar, float) else str(ar)
                 
                 eval_key = r.get("val_metric_key", "")

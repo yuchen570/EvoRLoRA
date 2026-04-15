@@ -72,7 +72,9 @@ def main() -> None:
         metric_display, metric_value = _metric_display(mean_row, std_row)
         total_time = _safe_float(mean_row.get("total_train_time_sec"))
         peak_mem = _safe_float(mean_row.get("peak_memory_mb"))
-        avg_rank = _safe_float(mean_row.get("avg_active_rank"))
+        avg_rank = _safe_float(mean_row.get("best_avg_active_rank"))
+        if avg_rank is None:
+            avg_rank = _safe_float(mean_row.get("avg_active_rank"))
         seed_used = mean_row.get("seed", "")
         if variant == "capped_k8" and total_time is not None:
             base_time = total_time

@@ -132,6 +132,23 @@ class DictFeatureClassifier(nn.Module):
     def forward(self, features: Dict[str, torch.Tensor]) -> torch.Tensor:
         return self.inner(**features).logits
 
+
+def _extract_tunable_state_dict(module: nn.Module) -> Dict[str, torch.Tensor]:
+    """仅保存可训练参数及关键 LoRA 相关 buffer，避免 best 快照落盘全量基座权重。"""
+    ret: Dict[str, torch.Tensor] = {}
+    trainable_keys = {n for n, p in module.named_parameters() if p.requires_grad}
+    for k, v in module.state_dict().items():
+        if (
+            k in trainable_keys
+            or "active_mask" in k
+            or "lora_" in k
+            or "gate" in k
+            or "classifier" in k
+            or "pooler" in k
+        ):
+            ret[k] = v.detach().cpu()
+    return ret
+
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int, num_cycles: float = 0.5):
     """余弦学习率衰减"""
     def lr_lambda(current_step):
@@ -233,9 +250,11 @@ def build_model_and_peft(args, method: str):
             target_modules=target_modules,
             layer_kwargs={
                 "r_max": args.lora_rank,
-                "r_init": args.lora_rank,
+                "r_init": 0,
                 "lora_alpha": args.lora_alpha,
                 "lora_dropout": args.lora_dropout,
+                "init_strategy": args.evorank_init_strategy,
+                "pissa_niter": args.evorank_pissa_niter,
             },
             controller_kwargs={
                 "rho": args.evorank_rho,
@@ -249,7 +268,7 @@ def build_model_and_peft(args, method: str):
                 "alpha_u": 1.0,
                 "beta_u": 0.5,
                 "allow_reallocation": True,
-                "expand_init_mode": "gradient",
+                "expand_init_mode": "preserve",
                 "max_reallocate_candidates": 16,
             },
         )
@@ -424,6 +443,12 @@ def run_sft_training(args, method: str):
     # ======= 训练循环 =======
     global_step = 0
     start_time = time.time()
+    best_train_loss = float("inf")
+    best_global_step = 0
+    best_epoch = 0
+    best_checkpoint_path = os.path.join(args.output_dir, "checkpoint_best.pt")
+    if is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
     
     if is_main_process:
         logger.info(f"*** Starting training for {method} ***")
@@ -518,6 +543,21 @@ def run_sft_training(args, method: str):
                         model_to_update.update_and_allocate(global_step)
                         
                 global_step += 1
+                cur_loss = float(loss.detach().item())
+                if is_main_process and cur_loss < best_train_loss:
+                    best_train_loss = cur_loss
+                    best_global_step = int(global_step)
+                    best_epoch = int(epoch + 1)
+                    if method in {"adalora", "sora", "evorank"}:
+                        model_for_best = model.module if hasattr(model, "module") else model
+                        core_model = model_for_best.inner if method == "evorank" and hasattr(model_for_best, "inner") else model_for_best
+                        payload = {
+                            "global_step": int(global_step),
+                            "epoch": int(epoch),
+                            "best_train_loss": float(best_train_loss),
+                            "model": _extract_tunable_state_dict(core_model),
+                        }
+                        torch.save(payload, best_checkpoint_path)
                 
                 if is_main_process and global_step % 10 == 0:
                     logger.info(f"Epoch {epoch} | Step {global_step}/{total_steps} | Loss: {accum_loss / args.gradient_accumulation_steps:.4f} | LR: {lr_scheduler.get_last_lr()[0]:.2e}")
@@ -529,6 +569,7 @@ def run_sft_training(args, method: str):
         model_to_save = model.module if hasattr(model, "module") else model
         if method == "evorank":
             model_to_save = model_to_save.inner
+        end_trainable_params = int(sum(p.numel() for p in model_to_save.parameters() if p.requires_grad))
         
         # 将 PiSSA 或 LoRA 合并进 base model，以支持 vLLM 直接推理
         if method in ["lora", "lora_kaiming", "pissa", "flatlora"]:
@@ -541,8 +582,37 @@ def run_sft_training(args, method: str):
         model_to_save.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
         
-        # 记录元数据
+        # 记录双口径元数据（当前 NLG 入口未进行验证集 ROUGE，best 以训练损失代理并显式标注）。
         meta["total_time_sec"] = time.time() - start_time
+        meta["weights_checkpoint"] = "last_training_step"
+        meta["note"] = (
+            "run_nlg_benchmark.py 当前不做验证集 ROUGE；best_* 以训练损失代理，"
+            "best_rouge*/end_rouge* 置为 null。"
+        )
+        meta["best_metrics"] = {
+            "best_train_loss": float(best_train_loss) if math.isfinite(best_train_loss) else None,
+            "best_rouge1": None,
+            "best_rouge2": None,
+            "best_rougeL": None,
+        }
+        meta["end_metrics"] = {
+            "end_rouge1": None,
+            "end_rouge2": None,
+            "end_rougeL": None,
+        }
+        meta["best_snapshot"] = {
+            "best_global_step": int(best_global_step),
+            "best_epoch": int(best_epoch),
+            "best_rank_summary": None,
+            "best_trainable_params": int(end_trainable_params),
+        }
+        meta["end_snapshot"] = {
+            "end_global_step": int(global_step),
+            "end_rank_summary": None,
+            "end_trainable_params": int(end_trainable_params),
+        }
+        if os.path.exists(best_checkpoint_path):
+            meta["best_checkpoint"] = best_checkpoint_path
         with open(os.path.join(args.output_dir, "benchmark_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
@@ -585,6 +655,8 @@ def main():
     parser.add_argument("--es_top_k_refine", type=int, default=3) # EvoRank：两阶段 ES 中进入精评的 top-K 候选数
     parser.add_argument("--es_significance_threshold", type=float, default=0.5) # EvoRank：相对 noop 基线的 z-score 显著性阈值
     parser.add_argument("--evorank_rho", type=float, default=0.0)
+    parser.add_argument("--evorank_init_strategy", type=str, default="pissa", choices=["lora", "pissa"])
+    parser.add_argument("--evorank_pissa_niter", type=int, default=2)
     parser.add_argument("--adalora_tinit", type=int, default=100)
     parser.add_argument("--adalora_tfinal", type=int, default=500)
     parser.add_argument("--adalora_delta_t", type=int, default=10)

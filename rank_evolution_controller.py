@@ -49,24 +49,12 @@ class ExpandMutation(ModuleMutation):
         self.grad_direction = grad_direction
         self._saved_A_row = None
         self._saved_B_col = None
-        self._comp_indices = None
-        self._comp_factor_inv = None
 
     def apply(self):
         layer = self.layer
         idx = self.index
         self._saved_A_row = layer.lora_A.weight.data[idx, :].clone()
         self._saved_B_col = layer.lora_B.weight.data[:, idx].clone()
-        prev_rank = layer.get_active_rank()
-        new_rank = prev_rank + 1
-        if prev_rank > 0:
-            c = layer.get_scaling_factor(prev_rank) / layer.get_scaling_factor(new_rank)
-            old_indices = [i for i, m in enumerate(layer.active_mask.tolist()) if m and i != idx]
-            self._comp_indices = old_indices
-            self._comp_factor_inv = 1.0 / c if c != 0 else 1.0
-        else:
-            self._comp_indices = None
-            self._comp_factor_inv = None
         layer.activate_component(
             idx,
             init_mode=self.init_mode,
@@ -78,75 +66,34 @@ class ExpandMutation(ModuleMutation):
             return
         layer = self.layer
         idx = self.index
-        if self._comp_indices is not None and self._comp_factor_inv is not None:
-            c_inv = self._comp_factor_inv
-            comp = self._comp_indices
-            if layer.compensation_mode == "B":
-                layer.lora_B.weight.data[:, comp] *= c_inv
-            elif layer.compensation_mode == "A":
-                layer.lora_A.weight.data[comp, :] *= c_inv
-            elif layer.compensation_mode == "Both":
-                c_inv_half = math.sqrt(c_inv)
-                layer.lora_B.weight.data[:, comp] *= c_inv_half
-                layer.lora_A.weight.data[comp, :] *= c_inv_half
         layer.lora_A.weight.data[idx, :] = self._saved_A_row
         layer.lora_B.weight.data[:, idx] = self._saved_B_col
         layer.active_mask[idx] = False
         self._saved_A_row = None
         self._saved_B_col = None
-        self._comp_indices = None
-        self._comp_factor_inv = None
 
     def clear_cache(self):
         self._saved_A_row = None
         self._saved_B_col = None
-        self._comp_indices = None
-        self._comp_factor_inv = None
 
 class PruneMutation(ModuleMutation):
     def __init__(self, layer_name: str, layer: EvoRankLoRALayer, index: int):
         self.layer_name = layer_name
         self.layer = layer
         self.index = index
-        self._comp_indices = None
-        self._comp_factor_inv = None
 
     def apply(self):
         layer = self.layer
         idx = self.index
-        prev_rank = layer.get_active_rank()
-        new_rank = prev_rank - 1
-        if new_rank > 0:
-            c = layer.get_scaling_factor(prev_rank) / layer.get_scaling_factor(new_rank)
-            remaining = [i for i, m in enumerate(layer.active_mask.tolist()) if m and i != idx]
-            self._comp_indices = remaining
-            self._comp_factor_inv = 1.0 / c if c != 0 else 1.0
-        else:
-            self._comp_indices = None
-            self._comp_factor_inv = None
         layer.deactivate_component(idx)
 
     def undo(self):
         layer = self.layer
         idx = self.index
-        if self._comp_indices is not None and self._comp_factor_inv is not None:
-            c_inv = self._comp_factor_inv
-            comp = self._comp_indices
-            if layer.compensation_mode == "B":
-                layer.lora_B.weight.data[:, comp] *= c_inv
-            elif layer.compensation_mode == "A":
-                layer.lora_A.weight.data[comp, :] *= c_inv
-            elif layer.compensation_mode == "Both":
-                c_inv_half = math.sqrt(c_inv)
-                layer.lora_B.weight.data[:, comp] *= c_inv_half
-                layer.lora_A.weight.data[comp, :] *= c_inv_half
         layer.active_mask[idx] = True
-        self._comp_indices = None
-        self._comp_factor_inv = None
 
     def clear_cache(self):
-        self._comp_indices = None
-        self._comp_factor_inv = None
+        pass
 
 class ReallocateMutation(ModuleMutation):
     def __init__(self, prune_mut: PruneMutation, expand_mut: ExpandMutation):
@@ -243,8 +190,8 @@ class RankEvolutionController:
         self.max_prune_candidates = max_prune_candidates
         self.max_reallocate_candidates = max_reallocate_candidates
         self.reallocate_strategy = reallocate_strategy
-        if expand_init_mode not in ("zero", "gradient"):
-            raise ValueError(f"expand_init_mode 须为 'zero' 或 'gradient'，收到: {expand_init_mode}")
+        if expand_init_mode not in ("zero", "gradient", "preserve"):
+            raise ValueError(f"expand_init_mode 须为 'zero'/'gradient'/'preserve'，收到: {expand_init_mode}")
         self.expand_init_mode = expand_init_mode
 
     def cleanup_uncommitted_mutations(
@@ -394,6 +341,9 @@ class RankEvolutionController:
             # 1. 更新扩张计数 count_g
             if self.ema_u[name] > tau_grow and act_rank < self.r_max:
                 self.count_g[name] += 1
+            elif act_rank == 0 and layer.get_inactive_indices():
+                # r=0 启动兜底：允许至少产生一批扩张候选，避免冷启动永远无法生长。
+                self.count_g[name] = self.H_g
             else:
                 self.count_g[name] = 0
                 

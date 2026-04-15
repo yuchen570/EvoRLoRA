@@ -20,8 +20,7 @@ class EvoRankLoRALayer(nn.Module):
 
     实现说明：
     1. 秩超空间：lora_A (r_max × in), lora_B (out × r_max)，掩码选择活跃组件。
-    2. 缩放：默认标准 LoRA (α/r)，可选 rsLoRA (α/√r, use_rslora=True)；
-       expand/reduce 时做补偿 (乘 s(r_old)/s(r_new))，保持 ΔW 输出连续。
+    2. 缩放：固定标准 LoRA (α/r)；expand/reduce 时不做补偿。
     3. 高效评价：避免实例化 G = ∂L/∂ΔW (out × in 巨矩阵)，利用 A.grad 和 B.grad
        的 trace trick 计算 g_ℓ 和 s^red_{ℓ,i}。
     4. 本层保持无状态；EMA/计数器/冷却期由 RankEvolutionController 管理。
@@ -41,6 +40,9 @@ class EvoRankLoRALayer(nn.Module):
         lora_dropout: float = 0.0,
         use_rslora: bool = False,
         compensation_mode: str = "B",
+        init_strategy: str = "lora",
+        pissa_niter: int = 2,
+        base_weight: Optional[torch.Tensor] = None,
         debug: bool = False,
     ):
         super().__init__()
@@ -49,10 +51,14 @@ class EvoRankLoRALayer(nn.Module):
         self.out_features = out_features
         self.r_max = r_max
         self.lora_alpha = lora_alpha
-        self.use_rslora = bool(use_rslora)
-        if compensation_mode not in {"B", "A", "Both", "None"}:
-            raise ValueError(f"未知 compensation_mode={compensation_mode!r}，应为 B/A/Both/None")
-        self.compensation_mode = compensation_mode # "B", "A", "Both", 或 "None"
+        # 保留参数仅为兼容旧调用路径；当前实现固定为标准 LoRA 缩放且不做补偿。
+        self.use_rslora = False
+        self.compensation_mode = "None"
+        if init_strategy not in {"lora", "pissa"}:
+            raise ValueError(f"未知 init_strategy={init_strategy!r}，应为 lora/pissa")
+        self.init_strategy = init_strategy
+        self.pissa_niter = int(max(pissa_niter, 0))
+        self._base_weight_for_init = base_weight
         self.debug = debug  # 调试模式：开启后会检查全零梯度（触发 GPU->CPU 同步，DDP 下慎用）
         
         if r_init > r_max:
@@ -82,18 +88,47 @@ class EvoRankLoRALayer(nn.Module):
         self._cached_grad_direction: Optional[Tuple[torch.Tensor, torch.Tensor, float]] = None
         
     def reset_parameters(self):
-        """标准 LoRA 初始化：A Kaiming, B Zero"""
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        """参数初始化：默认 LoRA，或 PiSSA 风格 SVD 初始化。"""
+        if self.init_strategy == "pissa" and self._base_weight_for_init is not None:
+            self._init_from_pissa_svd(self._base_weight_for_init)
+        else:
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B.weight)
+
+    @torch.no_grad()
+    def _init_from_pissa_svd(self, base_weight: torch.Tensor) -> None:
+        """
+        PiSSA 风格初始化：基于 base weight 的低秩 SVD 近似构造 A/B。
+        使用 torch.svd_lowrank 作为高效路径，失败时回退到 torch.linalg.svd。
+        """
+        nn.init.zeros_(self.lora_A.weight)
         nn.init.zeros_(self.lora_B.weight)
+
+        w = base_weight.detach().float().to(self.lora_A.weight.device)
+        max_rank = int(min(self.r_max, w.size(0), w.size(1)))
+        if max_rank <= 0:
+            return
+
+        try:
+            u, s, v = torch.svd_lowrank(w, q=max_rank, niter=self.pissa_niter)
+        except Exception:
+            u_full, s_full, vh_full = torch.linalg.svd(w, full_matrices=False)
+            u = u_full[:, :max_rank]
+            s = s_full[:max_rank]
+            v = vh_full[:max_rank, :].T
+
+        s_sqrt = torch.sqrt(torch.clamp(s, min=0.0))
+        b = u[:, :max_rank] * s_sqrt.unsqueeze(0)
+        a = (s_sqrt.unsqueeze(1) * v[:, :max_rank].T)
+        self.lora_B.weight.data[:, :max_rank] = b.to(self.lora_B.weight.dtype)
+        self.lora_A.weight.data[:max_rank, :] = a.to(self.lora_A.weight.dtype)
         
     def get_active_rank(self) -> int:
         return self.active_mask.sum().item()
         
     def get_scaling_factor(self, r: int) -> float:
-        """缩放因子：默认 LoRA(alpha/r)；可选 rsLoRA(alpha/sqrt(r))。"""
+        """缩放因子：固定标准 LoRA(alpha/r)。"""
         rank = max(r, 1)
-        if self.use_rslora:
-            return self.lora_alpha / math.sqrt(rank)
         return self.lora_alpha / rank
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -108,7 +143,10 @@ class EvoRankLoRALayer(nn.Module):
         
         # 若所有组件都被 de-activate（通常由 r_min 控制避免发生），直接返回 0
         if len(active_indices) == 0:
-            return torch.zeros((*x.shape[:-1], self.out_features), device=x.device, dtype=x.dtype)
+            # 保持与 LoRA 参数的计算图连接，确保 backward 后 grad 不是 None（用于 r=0 统计逻辑）。
+            z = torch.zeros((*x.shape[:-1], self.out_features), device=x.device, dtype=x.dtype)
+            anchor = (self.lora_A.weight.sum() + self.lora_B.weight.sum()) * 0.0
+            return z + anchor.to(x.dtype)
             
         x = self.lora_dropout(x)
         
@@ -138,18 +176,18 @@ class EvoRankLoRALayer(nn.Module):
         init_mode:
             "zero"     -- A 行重置 + B 列清零（干净 cold start，默认）
             "gradient" -- 论文 Proposition 3.2：B 列和 A 行设为 ∂L/∂ΔW 的主奇异方向
+            "preserve" -- 仅激活掩码，保留预初始化 A/B（用于 m=0 + 预置权重热身）
         grad_direction:
             (u1, v1, sigma1) 元组，由 compute_gradient_rank1_direction() 提供。
         """
         if self.active_mask[index]:
             return
 
-        prev_rank = self.get_active_rank()
-        new_rank = prev_rank + 1
-
         self.active_mask[index] = True
 
-        if init_mode == "gradient" and grad_direction is not None:
+        if init_mode == "preserve":
+            pass
+        elif init_mode == "gradient" and grad_direction is not None:
             u1, v1, _sigma1 = grad_direction
             # 用现有活跃 B 列的平均范数作为参考尺度，取 1% 作为新分量幅度
             old_indices = [i for i, m in enumerate(self.active_mask.tolist()) if m and i != index]
@@ -166,27 +204,7 @@ class EvoRankLoRALayer(nn.Module):
             nn.init.kaiming_uniform_(self.lora_A.weight[index:index + 1, :], a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight[:, index])
         
-        # Double Scaling 防护：应用等价变换（Function-Preserving Transformation）
-        # 缩放因子从 s(prev_rank) 降为 s(new_rank)，为了保持 ΔW = s * B * A 输出不变，需补偿旧权重。
-        # c = s(prev) / s(new)
-        if prev_rank > 0:
-            c = self.get_scaling_factor(prev_rank) / self.get_scaling_factor(new_rank)
-            old_indices = [i for i, m in enumerate(self.active_mask.tolist()) if m and i != index]
-            
-            if self.compensation_mode == "B":
-                # 方案 1：只补偿 B（默认，最安全，B 为零初值 gate）
-                self.lora_B.weight[:, old_indices] *= c
-            elif self.compensation_mode == "A":
-                # 方案 2：只补偿 A
-                self.lora_A.weight[old_indices, :] *= c
-            elif self.compensation_mode == "Both":
-                # 方案 3：同时补偿 A 和 B，各取 sqrt(c) 以防数值爆炸
-                c_half = math.sqrt(c)
-                self.lora_B.weight[:, old_indices] *= c_half
-                self.lora_A.weight[old_indices, :] *= c_half
-            elif self.compensation_mode == "None":
-                # 方案 4：不进行补偿（用于消融）
-                pass
+        # 不进行补偿：rank 变化后直接使用新的缩放因子。
 
     @torch.no_grad()
     def deactivate_component(self, index: int):
@@ -203,29 +221,9 @@ class EvoRankLoRALayer(nn.Module):
         if not self.active_mask[index]:
             return # 已休眠
             
-        prev_rank = self.get_active_rank()
-        new_rank = prev_rank - 1
-        
         self.active_mask[index] = False
         
-        # 反向补偿：缩放因子从 s(prev_rank) 变为 s(new_rank)（变大），
-        # 留下来的组件输出会被放大。为了保持输出连续性，需按 compensation_mode 进行对冲。
-        # c = s(prev) / s(new) < 1
-        if new_rank > 0:
-            c = self.get_scaling_factor(prev_rank) / self.get_scaling_factor(new_rank)
-            remaining_indices = self.get_active_indices()  # index 已被去激活
-            
-            if self.compensation_mode == "B":
-                self.lora_B.weight[:, remaining_indices] *= c
-            elif self.compensation_mode == "A":
-                self.lora_A.weight[remaining_indices, :] *= c
-            elif self.compensation_mode == "Both":
-                c_half = math.sqrt(c)
-                self.lora_B.weight[:, remaining_indices] *= c_half
-                self.lora_A.weight[remaining_indices, :] *= c_half
-            elif self.compensation_mode == "None":
-                # 方案 4：不进行补偿（用于消融）
-                pass
+        # 不进行补偿：rank 变化后直接使用新的缩放因子。
         
     def get_active_indices(self) -> List[int]:
         """使用原生 nonzero() 避免 CPU-GPU 同步和列表转换开销"""
@@ -390,12 +388,14 @@ class EvoRankLoRALayer(nn.Module):
 
         仅活跃位有值，未激活位为 0。
         """
+        active_idx = self.get_active_indices()
+        if not active_idx:
+            return torch.zeros(self.r_max, device=self.lora_A.weight.device)
         if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
             raise ValueError("需要先调用 .backward() 计算出 lora_A 和 lora_B 的梯度")
         if self.debug and not self.lora_A.weight.grad.any():
             warnings.warn("lora_A.grad 全为零，可能是 zero_grad() 之后未执行新的 backward()")
 
-        active_idx = self.get_active_indices()
         s_layer = float(self.get_scaling_factor(max(len(active_idx), 1)))
 
         # |⟨G, b_i a_i⊤⟩|：rsLoRA 下 ∂L/∂A 含额外标量 s，除去后得论文量
@@ -455,14 +455,13 @@ class EvoRankLoRALayer(nn.Module):
         if use_cached and self._cached_demand_score is not None:
             return self._cached_demand_score
 
+        active_idx = self.get_active_indices()
+        if len(active_idx) == 0:
+            return 0.0
         if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
              raise ValueError("需要先调用 .backward() 计算出 lora_A 和 lora_B 的梯度")
         if self.debug and not self.lora_A.weight.grad.any():
              warnings.warn("lora_A.grad 全为零，可能是 zero_grad() 之后未执行新的 backward()")
-
-        active_idx = self.get_active_indices()
-        if len(active_idx) == 0:
-            return 0.0
 
         s = float(self.get_scaling_factor(len(active_idx)))
         if s == 0.0:

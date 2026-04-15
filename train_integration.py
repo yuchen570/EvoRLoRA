@@ -94,11 +94,15 @@ def inject_evo_lora(
         raise ValueError("未匹配到任何可注入的 nn.Linear，请检查 target_modules 后缀")
 
     lora_layers: Dict[str, EvoRankLoRALayer] = {}
+    init_strategy = str(layer_kwargs.get("init_strategy", "lora"))
     for name, base_linear in to_inject:
+        per_layer_kwargs = dict(layer_kwargs)
+        if init_strategy == "pissa":
+            per_layer_kwargs["base_weight"] = base_linear.weight.detach()
         lora_layer = EvoRankLoRALayer(
             in_features=base_linear.in_features,
             out_features=base_linear.out_features,
-            **layer_kwargs,
+            **per_layer_kwargs,
         )
         # LoRA 旁路放在与原线性层相同设备，避免 forward 时设备不一致。
         lora_layer = lora_layer.to(base_linear.weight.device)
