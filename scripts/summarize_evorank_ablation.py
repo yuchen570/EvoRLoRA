@@ -28,7 +28,7 @@ TASK_HEADERS = {
     "cola": "CoLA",
     "qqp": "QQP (Acc/F1)",
     "qnli": "QNLI",
-    "mrpc": "MRPC (Acc/F1)",
+    "mrpc": "MRPC (Acc)",
     "stsb": "STS-B",
 }
 
@@ -100,10 +100,7 @@ def _task_score(task: str, row: Dict[str, str]) -> Optional[float]:
     if task == "qnli":
         return _safe_float(row.get("accuracy"))
     if task == "mrpc":
-        acc = _safe_float(row.get("accuracy"))
-        f1 = _safe_float(row.get("f1"))
-        vals = [v for v in (acc, f1) if v is not None]
-        return sum(vals) / len(vals) if vals else None
+        return _safe_float(row.get("accuracy"))
     if task == "stsb":
         ps = _safe_float(row.get("pearson_spearman_mean"))
         if ps is not None:
@@ -132,12 +129,16 @@ def _task_display(task: str, mean_row: Dict[str, str], std_row: Optional[Dict[st
         if m is None and mm is None:
             return fmt(_safe_float(mean_row.get("accuracy")), _safe_float(std_row.get("accuracy")) if std_row else None)
         return f"{fmt(m, sm)}/{fmt(mm, smm)}"
-    if task in {"qqp", "mrpc"}:
+    if task == "qqp":
         acc = _safe_float(mean_row.get("accuracy"))
         f1 = _safe_float(mean_row.get("f1"))
         sacc = _safe_float(std_row.get("accuracy")) if std_row else None
         sf1 = _safe_float(std_row.get("f1")) if std_row else None
         return f"{fmt(acc, sacc)}/{fmt(f1, sf1)}"
+    if task == "mrpc":
+        acc = _safe_float(mean_row.get("accuracy"))
+        sacc = _safe_float(std_row.get("accuracy")) if std_row else None
+        return fmt(acc, sacc)
     metric_map = {
         "sst2": "accuracy",
         "cola": "matthews_corrcoef",

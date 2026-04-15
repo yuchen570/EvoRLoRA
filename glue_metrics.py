@@ -1,4 +1,8 @@
-"""GLUE 各子集官方主指标（与 GLUE benchmark 常用约定一致）。"""
+"""GLUE 各子集 NLU 指标与选优标量。
+
+论文表口径：MNLI 为 matched/mismatched 准确率；SST-2 / QNLI / RTE / WNLI 为 Acc；
+CoLA 为 Matthews；QQP 为 Acc 与 F1 的**平均**作为选优标准；MRPC 为 Acc；
+STS-B 为 Pearson 与 Spearman 的均值（Corr）。"""
 from __future__ import annotations
 
 from typing import Tuple
@@ -11,12 +15,12 @@ from sklearn.metrics import accuracy_score, f1_score, matthews_corrcoef
 
 
 def glue_primary_metric_key(task_name: str) -> str:
-    """用于日志 / TensorBoard / metrics.jsonl 的指标标识。"""
+    """用于日志 / TensorBoard / metrics.jsonl / CSV「主指标」列名的标识（与选优标量一致）。"""
     m = {
         "cola": "matthews_corrcoef",
         "sst2": "accuracy",
-        "mrpc": "f1",
-        "qqp": "f1",
+        "mrpc": "accuracy",
+        "qqp": "mean_acc_f1",
         "stsb": "pearson_spearman_mean",
         "mnli": "accuracy",
         "qnli": "accuracy",
@@ -31,21 +35,23 @@ def glue_primary_metric_key(task_name: str) -> str:
 
 def compute_glue_primary_metric(task_name: str, y_pred: np.ndarray, y_true: np.ndarray) -> float:
     """
-    返回该子集的「主」标量（越大越好，用于 best 跟踪与 CSV）。
-    - CoLA: Matthews 相关
-    - SST-2 / MNLI / QNLI / RTE / WNLI / ax: Accuracy
-    - MRPC / QQP: F1 (binary)
-    - STS-B: (Pearson + Spearman) / 2（与 GLUE 总分中该任务常见合成方式一致）
+    返回该子集的选优标量（越大越好，用于 best 跟踪、epoch 日志与 CSV 主列）。
+    - CoLA: Matthews
+    - SST-2 / MNLI / QNLI / RTE / WNLI / ax / MRPC: Accuracy
+    - QQP: (Accuracy + F1) / 2
+    - STS-B: (Pearson + Spearman) / 2
     """
     y_true = np.asarray(y_true).reshape(-1)
     y_pred = np.asarray(y_pred).reshape(-1)
 
     if task_name == "cola":
         return float(matthews_corrcoef(y_true, y_pred))
-    if task_name in ("sst2", "mnli", "qnli", "rte", "wnli", "ax"):
+    if task_name in ("sst2", "mnli", "qnli", "rte", "wnli", "ax", "mrpc"):
         return float(accuracy_score(y_true, y_pred))
-    if task_name in ("mrpc", "qqp"):
-        return float(f1_score(y_true, y_pred, average="binary", zero_division=0))
+    if task_name == "qqp":
+        acc = float(accuracy_score(y_true, y_pred))
+        f1 = float(f1_score(y_true, y_pred, average="binary", zero_division=0))
+        return (acc + f1) / 2.0
     if task_name == "stsb":
         p, _ = pearsonr(y_pred, y_true)
         s, _ = spearmanr(y_pred, y_true)

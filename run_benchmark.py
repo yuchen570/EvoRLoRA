@@ -2042,7 +2042,8 @@ def run_training_loop(
     
             # 每个 epoch 在完整验证集上评估指标
             model.eval()
-    
+            metrics_dict_val: Dict[str, float] = {}
+
             if task_type == "nlu":
                 if task_name is None:
                     raise ValueError("NLU（GLUE）评估需要传入 task_name")
@@ -2051,7 +2052,6 @@ def run_training_loop(
                 val_metric = 0.0
                 mkey = glue_primary_metric_key(task_name)
                 regression = nlu_is_glue_regression(task_name)
-                metrics_dict_val: Dict[str, float] = {}
                 y_pred_main: List[float] = []
                 y_true_main: List[float] = []
                 ev_loader = val_loader_eval_full if val_loader_eval_full is not None else val_loader
@@ -2134,9 +2134,25 @@ def run_training_loop(
                             f"pred_dist={pred_dist} true_dist={true_dist} "
                             f"sample_pred={pred_list[:8]} sample_true={true_list[:8]}"
                         )
+                    _val_log_extra = ""
+                    if task_name == "mnli" and metrics_dict_val:
+                        am = metrics_dict_val.get("accuracy_m")
+                        amm = metrics_dict_val.get("accuracy_mm")
+                        if am is not None and amm is not None:
+                            _val_log_extra = f" acc_m={am:.4f} acc_mm={amm:.4f}"
+                    elif task_name == "qqp" and metrics_dict_val:
+                        acc_v = metrics_dict_val.get("accuracy")
+                        f1_v = metrics_dict_val.get("f1")
+                        if acc_v is not None and f1_v is not None:
+                            _val_log_extra = f" acc={acc_v:.4f} f1={f1_v:.4f}"
+                    elif task_name == "mrpc" and metrics_dict_val:
+                        f1_v = metrics_dict_val.get("f1")
+                        if f1_v is not None:
+                            _val_log_extra = f" f1={f1_v:.4f}"
                     print(
                         f"[{method_name}] epoch={epoch + 1}/{epochs} "
                         f"step={global_step} val_{mkey}={val_metric:.4f} best={best_val_acc:.4f}"
+                        f"{_val_log_extra}"
                     )
                     # === 逐层秩分布日志 ===
                     rank_info = _collect_rank_distribution(
@@ -2149,11 +2165,17 @@ def run_training_loop(
                     _print_rank_distribution(rank_info, method_name, epoch + 1, epochs)
                     if writer is not None:
                         writer.add_scalar(f"val/{mkey}", val_metric, epoch)
+                        for _gk, _gv in metrics_dict_val.items():
+                            if _gk != mkey:
+                                writer.add_scalar(f"val/{_gk}", _gv, epoch)
                         for lname, lr_val in rank_info["per_layer"].items():
                             writer.add_scalar(f"rank/{lname}", lr_val, epoch)
                         writer.add_scalar("rank/avg", rank_info["summary"]["avg_rank"], epoch)
                     if wandb_run is not None:
                         wandb_log_dict = {f"val/{mkey}": val_metric, "epoch": epoch + 1, "step": global_step}
+                        for _gk, _gv in metrics_dict_val.items():
+                            if _gk != mkey:
+                                wandb_log_dict[f"val/{_gk}"] = _gv
                         wandb_log_dict["rank/avg"] = rank_info["summary"]["avg_rank"]
                         wandb_run.log(wandb_log_dict)
     
@@ -2278,6 +2300,8 @@ def run_training_loop(
                 }
                 if task_type == "nlu" and task_name is not None:
                     rec["glue_metric"] = glue_primary_metric_key(task_name)
+                    if metrics_dict_val:
+                        rec["glue_val"] = {k: float(v) for k, v in metrics_dict_val.items()}
                 if task_type == "nlg":
                     rec["rouge1"] = rouge1_val
                     rec["rouge2"] = rouge2_val
@@ -2407,8 +2431,142 @@ def run_training_loop(
         "rouge1": rouge1_val if task_type == "nlg" else "",
         "rouge2": rouge2_val if task_type == "nlg" else "",
         "rougeL": best_val_acc if val_metric_key_str == "rougeL" else "",
+        "mean_acc_f1": "",
     }
+    if task_type == "nlu" and val_metric_key_str:
+        # 与选优标量一致：QQP 为 mean_acc_f1；MNLI 等为 val_metric（如 m/mm 平均），避免 CSV 中 accuracy 与主指标不一致。
+        result[val_metric_key_str] = float(best_val_acc)
     return result
+
+
+# 与论文 GLUE 总表列一致（不含 wnli）；All 为下列各任务代表分数的平均（MNLI/QQP 用双指标各自参与后再取任务内均分，再与其他任务一起平均）。
+GLUE_PAPER_TABLE_TASKS: Tuple[str, ...] = (
+    "mnli",
+    "sst2",
+    "cola",
+    "qqp",
+    "qnli",
+    "rte",
+    "mrpc",
+    "stsb",
+)
+
+
+def _glue_csv_float(val: Any) -> Optional[float]:
+    if val is None or val == "" or val == "N/A":
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def print_glue_paper_style_table(
+    results: List[Dict[str, Any]],
+    *,
+    task_type: str,
+    methods_order: Optional[List[str]] = None,
+) -> None:
+    """按论文表格式打印 Markdown 汇总（百分比、两位小数；MNLI 为 m/mm，QQP 为 Acc/F1）。"""
+    if task_type != "nlu" or not results:
+        return
+
+    mean_groups: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+    detail_groups: Dict[Tuple[str, str, str], Dict[str, Dict[str, Any]]] = {}
+    for r in results:
+        task = str(r.get("task", "") or "")
+        if task not in GLUE_PAPER_TABLE_TASKS:
+            continue
+        seed = r.get("seed", "")
+        seed_s = str(seed) if seed is not None else ""
+        bb = str(r.get("backbone", "") or "")
+        meth = str(r.get("method", "") or "")
+        if seed_s == "std":
+            continue
+        if seed_s == "mean":
+            mean_groups.setdefault((bb, meth), {})[task] = r
+        else:
+            detail_groups.setdefault((bb, meth, seed_s), {})[task] = r
+
+    def _meth_rank(method: str) -> int:
+        if methods_order and method in methods_order:
+            return methods_order.index(method)
+        return 10_000
+
+    def _pct(x: Optional[float]) -> str:
+        if x is None:
+            return "-"
+        return f"{x * 100.0:.2f}"
+
+    print("\n=== GLUE 论文表格式汇总 (×100%, 与总表列名一致) ===")
+    print(
+        "| Method | # Params | MNLI (m/mm) | SST-2 (Acc) | CoLA (Mcc) | QQP (Acc/F1) | "
+        "QNLI (Acc) | RTE (Acc) | MRPC (Acc) | STS-B (Corr) | All (Ave.) |"
+    )
+    print("|" + "---|" * 12)
+
+    if mean_groups:
+        ordered_bm = sorted(mean_groups.keys(), key=lambda bm: (bm[0], _meth_rank(bm[1])))
+        tmap_list = [mean_groups[bm] for bm in ordered_bm]
+    else:
+        ordered_triples = sorted(detail_groups.keys(), key=lambda k: (k[0], _meth_rank(k[1]), k[2]))
+        tmap_list = [detail_groups[k] for k in ordered_triples]
+
+    for tmap in tmap_list:
+        row0 = next(iter(tmap.values()))
+        tp = row0.get("trainable_params", "")
+        try:
+            params_str = f"{int(tp) / 1e6:.2f}M" if tp not in ("", None) else "-"
+        except (TypeError, ValueError):
+            params_str = "-"
+
+        def gv(tn: str, col: str) -> Optional[float]:
+            tr = tmap.get(tn)
+            if not tr:
+                return None
+            return _glue_csv_float(tr.get(col))
+
+        mnli_m = gv("mnli", "accuracy_m")
+        mnli_mm = gv("mnli", "accuracy_mm")
+        if mnli_m is not None or mnli_mm is not None:
+            mnli_str = f"{_pct(mnli_m)}/{_pct(mnli_mm)}"
+            mnli_score = ((mnli_m or 0.0) + (mnli_mm or 0.0)) / 2.0
+        else:
+            mnli_acc = gv("mnli", "accuracy")
+            mnli_str = f"{_pct(mnli_acc)}/-" if mnli_acc is not None else "-"
+            mnli_score = mnli_acc
+
+        sst2 = gv("sst2", "accuracy")
+        cola = gv("cola", "matthews_corrcoef")
+        qqp_a = gv("qqp", "accuracy")
+        qqp_f = gv("qqp", "f1")
+        if qqp_a is not None or qqp_f is not None:
+            qqp_str = f"{_pct(qqp_a)}/{_pct(qqp_f)}"
+            qqp_score = ((qqp_a or 0.0) + (qqp_f or 0.0)) / 2.0
+        else:
+            qqp_str = "-"
+            qqp_score = None
+
+        qnli = gv("qnli", "accuracy")
+        rte = gv("rte", "accuracy")
+        mrpc = gv("mrpc", "accuracy")
+        stsb = gv("stsb", "pearson_spearman_mean")
+
+        scores_01: List[float] = []
+        for s in (mnli_score, sst2, cola, qqp_score, qnli, rte, mrpc, stsb):
+            if s is not None:
+                scores_01.append(float(s))
+        if scores_01:
+            avg_pct = sum(scores_01) / len(scores_01) * 100.0
+            avg_str = f"**{avg_pct:.2f}**"
+        else:
+            avg_str = "-"
+
+        meth = str(row0.get("method", "") or "")
+        print(
+            f"| {meth} | {params_str} | {mnli_str} | {_pct(sst2)} | {_pct(cola)} | {qqp_str} | "
+            f"{_pct(qnli)} | {_pct(rte)} | {_pct(mrpc)} | {_pct(stsb)} | {avg_str} |"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -2887,7 +3045,20 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
                 # 多种子聚合：追加均值/标准差汇总行
                 if args.is_main_process and len(seed_results) > 1:
-                    metric_keys = ["matthews_corrcoef", "accuracy", "accuracy_m", "accuracy_mm", "f1", "pearson_spearman_mean", "pearson", "spearman", "rouge1", "rouge2", "rougeL"]
+                    metric_keys = [
+                        "matthews_corrcoef",
+                        "accuracy",
+                        "accuracy_m",
+                        "accuracy_mm",
+                        "f1",
+                        "mean_acc_f1",
+                        "pearson_spearman_mean",
+                        "pearson",
+                        "spearman",
+                        "rouge1",
+                        "rouge2",
+                        "rougeL",
+                    ]
                     
                     mean_row = dict(seed_results[0])
                     std_row = dict(seed_results[0])
@@ -2940,6 +3111,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "accuracy_m",
                     "accuracy_mm",
                     "f1",
+                    "mean_acc_f1",
                     "pearson_spearman_mean",
                     "pearson",
                     "spearman",
@@ -3037,6 +3209,12 @@ if __name__ == "__main__":
                     f"{pm_fmt} "
                     f"{ar_fmt:<10} "
                     f"{tt_fmt}"
+                )
+            if results and getattr(args, "task_type", "nlu") == "nlu":
+                print_glue_paper_style_table(
+                    results,
+                    task_type=args.task_type,
+                    methods_order=list(args.methods) if getattr(args, "methods", None) else None,
                 )
     finally:
         if args.ddp_enabled and dist.is_available() and dist.is_initialized():
