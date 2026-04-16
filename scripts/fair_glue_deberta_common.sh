@@ -11,6 +11,22 @@ MODEL="microsoft/deberta-v3-base"
 SEEDS="0 21 42 81 100"
 PROTOCOL="controlled_fair"
 PROTOCOL_DROPOUT=0.05
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-32}"
+ADALORA_REF_GLOBAL_BATCH="${ADALORA_REF_GLOBAL_BATCH:-32}"  # AdaLoRA NLU scripts: 1 GPU x bs32
+
+scale_adalora_steps() {
+  local ref_steps=$1
+  local actual_global_batch=$(( NPROC_PER_NODE * PER_DEVICE_BATCH_SIZE ))
+  local scaled
+
+  # Keep AdaLoRA schedule aligned by global-step ratio when global batch changes.
+  scaled=$(( (ref_steps * ADALORA_REF_GLOBAL_BATCH + actual_global_batch / 2) / actual_global_batch ))
+  if (( scaled < 1 )); then
+    scaled=1
+  fi
+  echo "$scaled"
+}
 
 # ---- 启动单个任务（第一个参数为该作业的 master_port）----
 run_task() {
@@ -26,12 +42,19 @@ run_task() {
   local DELTA_T=${10}     # adalora_delta_t (= AdaLoRA mask_interval)
   local ORTH_REG=${11}    # adalora_orth_reg_weight (= AdaLoRA reg_orth_coef)
 
+  local SCALED_TINIT SCALED_TFINAL SCALED_DELTA_T
+  SCALED_TINIT="$(scale_adalora_steps "$TINIT")"
+  SCALED_TFINAL="$(scale_adalora_steps "$TFINAL")"
+  SCALED_DELTA_T="$(scale_adalora_steps "$DELTA_T")"
+
   echo "================================================================"
   echo " Task: $TASK | master_port=$MASTER_PORT | lr=$LR epochs=$EPOCHS maxlen=$MAX_LEN alpha=$ALPHA wd=$WD"
-  echo " AdaLoRA: tinit=$TINIT tfinal=$TFINAL deltaT=$DELTA_T orth=$ORTH_REG"
+  echo " Runtime: nproc=$NPROC_PER_NODE per_device_bs=$PER_DEVICE_BATCH_SIZE global_bs=$(( NPROC_PER_NODE * PER_DEVICE_BATCH_SIZE ))"
+  echo " AdaLoRA(ref@global_bs=${ADALORA_REF_GLOBAL_BATCH}): tinit=$TINIT tfinal=$TFINAL deltaT=$DELTA_T orth=$ORTH_REG"
+  echo " AdaLoRA(scaled): tinit=$SCALED_TINIT tfinal=$SCALED_TFINAL deltaT=$SCALED_DELTA_T"
   echo "================================================================"
 
-  nohup torchrun --nproc_per_node=2 --master_port="$MASTER_PORT" \
+  nohup torchrun --nproc_per_node="$NPROC_PER_NODE" --master_port="$MASTER_PORT" \
     run_benchmark.py \
     --ddp \
     --methods $METHODS \
@@ -44,15 +67,15 @@ run_task() {
     --target_rank 8 \
     --lora_alpha $ALPHA \
     --epochs $EPOCHS \
-    --batch_size 32 \
+    --batch_size "$PER_DEVICE_BATCH_SIZE" \
     --max_length $MAX_LEN \
     --lr $LR \
     --warmup_ratio 0.06 \
     --weight_decay $WD \
     --max_grad_norm 1.0 \
-    --adalora_tinit $TINIT \
-    --adalora_tfinal $TFINAL \
-    --adalora_delta_t $DELTA_T \
+    --adalora_tinit "$SCALED_TINIT" \
+    --adalora_tfinal "$SCALED_TFINAL" \
+    --adalora_delta_t "$SCALED_DELTA_T" \
     --adalora_orth_reg_weight $ORTH_REG \
     --sora_sparse_lambda 10 \
     --sora_sparse_lambda_2 3e-4 \
