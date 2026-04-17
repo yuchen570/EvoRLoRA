@@ -242,16 +242,25 @@ class EvoRankLoRALayer(nn.Module):
         backward 后一次性缓存 g_ℓ、s^red（剪枝）、\\bar s（扩张容量）和梯度主方向，
         避免 controller 读取时重复计算。
         """
-        self._cached_demand_score = self.compute_demand_score()
+        n_m_pair = self._compute_n_m_from_current_gradients()
+        if n_m_pair is None:
+            self._cached_demand_score = 0.0
+            self._cached_grad_direction = None
+        else:
+            n, m = n_m_pair
+            s_mtx = n.T @ n
+            t_mtx = m @ m.T
+            gf_sq = torch.trace(s_mtx @ t_mtx).clamp(min=0.0)
+            self._cached_demand_score = float(torch.sqrt(gf_sq).item())
+            self._cached_grad_direction = self._power_iteration_rank1(n, m)
         self._cached_prune_scores = self._compute_prune_scores_raw(alpha1, alpha2)
         self._cached_expand_bar_s = self._compute_expand_bar_s_raw()
-        self._cached_grad_direction = self._compute_gradient_rank1_direction()
 
     # ------ 梯度引导的 rank-1 扩张方向 (论文 Proposition 3.2) ------
 
     @staticmethod
     def _power_iteration_rank1(
-        N: torch.Tensor, M: torch.Tensor, num_iters: int = 5,
+        N: torch.Tensor, M: torch.Tensor, num_iters: int = 2,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
         """
         论文 Proposition 3.2（Eq. 381–388）：最优 rank-1 扩张方向。
@@ -293,12 +302,12 @@ class EvoRankLoRALayer(nn.Module):
         return u, v, abs(sigma_signed)
 
     @torch.no_grad()
-    def _compute_gradient_rank1_direction(
+    def _compute_n_m_from_current_gradients(
         self,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """
-        论文 Proposition 3.2：计算近似 G = ∂L/∂ΔW 的主 rank-1 奇异方向。
-        复用 compute_demand_score 的 (A^TA+εI)^{-1}A^T 重建，然后做 power iteration。
+        统一构建 N、M，供 demand score 与 gradient rank-1 direction 复用。
+        N = grad_B/s，M = (A^T A + eps I)^{-1} A^T。
         """
         if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
             return None
@@ -312,20 +321,32 @@ class EvoRankLoRALayer(nn.Module):
             return None
 
         idx_t = torch.as_tensor(active_idx, device=self.lora_A.weight.device, dtype=torch.long)
-        
-        with torch.autocast(device_type=self.lora_A.weight.device.type if self.lora_A.weight.device.type != "meta" else "cpu", enabled=False):
+        device_type = self.lora_A.weight.device.type if self.lora_A.weight.device.type != "meta" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
             gb = self.lora_B.weight.grad.index_select(1, idx_t).float()
             a = self.lora_A.weight.index_select(0, idx_t).float()
-    
-            N = gb / s                    # (out, r)
-            at = a.T                      # (in, r)
-            ata = at.T @ at               # (r, r)
-            M = torch.linalg.solve(
+            n = gb / s  # (out, r)
+            at = a.T    # (in, r)
+            ata = at.T @ at
+            m = torch.linalg.solve(
                 ata + 1e-6 * torch.eye(ata.size(0), device=ata.device, dtype=ata.dtype),
                 at.T,
-            )                             # (r, in)
-    
-            return self._power_iteration_rank1(N, M)
+            )  # (r, in)
+        return n, m
+
+    @torch.no_grad()
+    def _compute_gradient_rank1_direction(
+        self,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
+        """
+        论文 Proposition 3.2：计算近似 G = ∂L/∂ΔW 的主 rank-1 奇异方向。
+        复用 compute_demand_score 的 (A^TA+εI)^{-1}A^T 重建，然后做 power iteration。
+        """
+        n_m_pair = self._compute_n_m_from_current_gradients()
+        if n_m_pair is None:
+            return None
+        n, m = n_m_pair
+        return self._power_iteration_rank1(n, m)
 
     @torch.no_grad()
     def compute_gradient_rank1_direction(
@@ -456,24 +477,11 @@ class EvoRankLoRALayer(nn.Module):
         if len(active_idx) == 0:
             return 0.0
 
-        s = float(self.get_scaling_factor(len(active_idx)))
-        if s == 0.0:
+        n_m_pair = self._compute_n_m_from_current_gradients()
+        if n_m_pair is None:
             return 0.0
-
-        idx_t = torch.as_tensor(active_idx, device=self.lora_A.weight.device, dtype=torch.long)
-        
+        n, m = n_m_pair
         with torch.autocast(device_type=self.lora_A.weight.device.type if self.lora_A.weight.device.type != "meta" else "cpu", enabled=False):
-            gb = self.lora_B.weight.grad.index_select(1, idx_t).float()
-            a = self.lora_A.weight.index_select(0, idx_t).float()
-            n = gb / s
-            at = a.T  # (in_features, r_active)
-            # 正则化正规方程替代 SVD 伪逆，避免 pinv 底层 SVD 的瞬间显存峰值：
-            # A^+ = (A^T A + εI)^{-1} A^T，其中 A^T A 仅为 (r, r) 极小矩阵。
-            ata = at.T @ at  # (r, r)
-            m = torch.linalg.solve(
-                ata + 1e-6 * torch.eye(ata.size(0), device=ata.device, dtype=ata.dtype),
-                at.T,
-            )  # (r, in_features)
             s_mtx = n.T @ n
             t_mtx = m @ m.T
             gf_sq = torch.trace(s_mtx @ t_mtx).clamp(min=0.0)

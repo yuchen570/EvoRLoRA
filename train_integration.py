@@ -187,6 +187,17 @@ def train_evo_lora_step(
             if ctrl.cooldowns[name].device != layer_device:
                 ctrl.cooldowns[name] = ctrl.cooldowns[name].to(layer_device)
 
+    def _controller_state_device_mismatch(ctrl: RankEvolutionController) -> bool:
+        layer_device = next(iter(ctrl.layers.values())).lora_A.weight.device
+        for name in ctrl.layers:
+            if ctrl.ema_s[name].device != layer_device:
+                return True
+            if ctrl.count_p[name].device != layer_device:
+                return True
+            if ctrl.cooldowns[name].device != layer_device:
+                return True
+        return False
+
     def _compute_complexity(ctrl: RankEvolutionController, mode: str) -> float:
         """论文 Eq. 127 / 131：结构复杂度 C(z)。"""
         if mode == "rank_sum":
@@ -245,7 +256,6 @@ def train_evo_lora_step(
             _reset_optimizer_state_for_mutation(opt, mutation.expand_mut)
 
     model.train()
-    _sync_controller_state_device(controller)
     inputs, targets = train_batch
     model_device = next(model.parameters()).device
 
@@ -285,6 +295,8 @@ def train_evo_lora_step(
     )
     did_cache_stats = False
     if should_evolve:
+        if step == warmup_steps or _controller_state_device_mismatch(controller):
+            _sync_controller_state_device(controller)
         # 在梯度裁剪之前缓存 g_ℓ 与分量分数，对应 ∂L/∂ΔW（与论文一致）；裁剪会改变范数口径。
         # cache_statistics_from_current_gradients 内对 g_ℓ 与各分量评分只各算一次并写入缓存，供 update_statistics 复用。
         for layer in controller.layers.values():
@@ -308,12 +320,24 @@ def train_evo_lora_step(
         # DDP 下为避免统计量在各卡之间出现微小差异，进一步对 EMA 统计做全局一致化。
         if dist.is_available() and dist.is_initialized():
             world_size = dist.get_world_size()
-            for name in controller.layers:
-                u = torch.tensor([controller.ema_u[name]], device=model_device, dtype=torch.float32)
-                dist.all_reduce(u, op=dist.ReduceOp.SUM)
-                controller.ema_u[name] = (u / world_size).item()
-                dist.all_reduce(controller.ema_s[name], op=dist.ReduceOp.SUM)
-                controller.ema_s[name] = controller.ema_s[name] / world_size
+            names = list(controller.layers.keys())
+            if names:
+                u_vec = torch.tensor([controller.ema_u[n] for n in names], device=model_device, dtype=torch.float32)
+                s_rows = [controller.ema_s[n].to(model_device, dtype=torch.float32).reshape(-1) for n in names]
+                s_mat = torch.stack(s_rows, dim=0)
+                combined = torch.cat([u_vec, s_mat.reshape(-1)], dim=0)
+                dist.all_reduce(combined, op=dist.ReduceOp.SUM)
+                combined = combined / world_size
+
+                n_layers = len(names)
+                s_numel = s_mat.size(1)
+                u_part = combined[:n_layers]
+                s_part = combined[n_layers:].view(n_layers, s_numel)
+                for i, name in enumerate(names):
+                    controller.ema_u[name] = float(u_part[i].item())
+                    controller.ema_s[name] = s_part[i].view_as(controller.ema_s[name]).to(
+                        device=controller.ema_s[name].device, dtype=controller.ema_s[name].dtype
+                    )
         tau_grow, tau_prune = controller.compute_thresholds()
         controller.tick_evolution_state(tau_grow=tau_grow, tau_prune=tau_prune)
         mutations = controller.generate_mutations()
@@ -366,6 +390,13 @@ def train_evo_lora_step(
             was_training = model.training
             model.eval()
             unwrapped_model = getattr(model, "module", model)
+            val_batches_dev: List[Tuple[torch.Tensor, torch.Tensor]] = [
+                (
+                    {k: v.to(model_device, non_blocking=True) for k, v in val_inputs.items()},
+                    val_targets.to(model_device, non_blocking=True),
+                )
+                for val_inputs, val_targets in val_batches
+            ]
 
             use_two_stage = len(val_batches) > 1 and len(mutations) > es_top_k_refine
 
@@ -373,9 +404,7 @@ def train_evo_lora_step(
             with torch.no_grad():
                 # --- 基线评估（noop）在全部 val batches 上计算 ---
                 base_eval_losses: List[torch.Tensor] = []
-                for val_inputs, val_targets in val_batches:
-                    val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
-                    val_targets_dev = val_targets.to(model_device)
+                for val_inputs_dev, val_targets_dev in val_batches_dev:
                     base_logits = unwrapped_model(val_inputs_dev)
                     base_eval_losses.append(loss_fn(base_logits, val_targets_dev).detach())
                 base_eval_loss = torch.stack(base_eval_losses).mean()
@@ -392,9 +421,7 @@ def train_evo_lora_step(
 
                 if use_two_stage:
                     # ===== Stage 1：仅用首个 val batch 做粗筛 =====
-                    screen_batch = val_batches[0]
-                    screen_inputs_dev = {k: v.to(model_device) for k, v in screen_batch[0].items()}
-                    screen_targets_dev = screen_batch[1].to(model_device)
+                    screen_inputs_dev, screen_targets_dev = val_batches_dev[0]
 
                     base_screen_logits = unwrapped_model(screen_inputs_dev)
                     base_screen_loss = loss_fn(base_screen_logits, screen_targets_dev).detach()
@@ -404,21 +431,21 @@ def train_evo_lora_step(
                         base_screen_loss = _rb / dist.get_world_size()
                     base_screen_loss_f = float(base_screen_loss.item())
 
-                    coarse_scores: List[Tuple[float, int]] = []
+                    coarse_losses: List[torch.Tensor] = []
                     for mi, mutation in enumerate(mutations):
                         if isinstance(mutation, _PaddingTrialMutation):
-                            coarse_loss_f = base_screen_loss_f
+                            coarse_losses.append(base_screen_loss.clone())
                         else:
                             mutation.apply()
                             s_logits = unwrapped_model(screen_inputs_dev)
                             s_loss = loss_fn(s_logits, screen_targets_dev).detach()
-                            if dist.is_available() and dist.is_initialized():
-                                _rs = s_loss.clone()
-                                dist.all_reduce(_rs, op=dist.ReduceOp.SUM)
-                                s_loss = _rs / dist.get_world_size()
-                            coarse_loss_f = float(s_loss.item())
+                            coarse_losses.append(s_loss)
                             mutation.undo()
-                        coarse_scores.append((coarse_loss_f, mi))
+                    coarse_tensor = torch.stack(coarse_losses)
+                    if dist.is_available() and dist.is_initialized():
+                        dist.all_reduce(coarse_tensor, op=dist.ReduceOp.SUM)
+                        coarse_tensor = coarse_tensor / dist.get_world_size()
+                    coarse_scores = [(float(coarse_tensor[mi].item()), mi) for mi in range(len(mutations))]
 
                     coarse_scores.sort(key=lambda x: x[0])
                     refine_indices = set(idx for _, idx in coarse_scores[:es_top_k_refine])
@@ -436,9 +463,7 @@ def train_evo_lora_step(
                         else:
                             mutation.apply()
                             eval_losses_list: List[torch.Tensor] = []
-                            for val_inputs, val_targets in val_batches:
-                                val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
-                                val_targets_dev = val_targets.to(model_device)
+                            for val_inputs_dev, val_targets_dev in val_batches_dev:
                                 val_logits = unwrapped_model(val_inputs_dev)
                                 eval_losses_list.append(loss_fn(val_logits, val_targets_dev).detach())
                             eval_loss = torch.stack(eval_losses_list).mean()
@@ -466,9 +491,7 @@ def train_evo_lora_step(
                         else:
                             mutation.apply()
                             eval_losses_list = []
-                            for val_inputs, val_targets in val_batches:
-                                val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
-                                val_targets_dev = val_targets.to(model_device)
+                            for val_inputs_dev, val_targets_dev in val_batches_dev:
                                 val_logits = unwrapped_model(val_inputs_dev)
                                 eval_losses_list.append(loss_fn(val_logits, val_targets_dev).detach())
                             eval_loss = torch.stack(eval_losses_list).mean()
