@@ -12,29 +12,27 @@ SEEDS="0 21 42 81 100"
 PROTOCOL="controlled_fair"
 PROTOCOL_DROPOUT=0.05
 
-# ---- 启动单个任务（第一个参数为该作业的 master_port）----
+# ---- 启动单个任务 ----
 # 默认单卡运行；如需切换 GPU，可在外部设置 CUDA_VISIBLE_DEVICES。
 run_task() {
-  local MASTER_PORT=$1
-  local TASK=$2
-  local LR=$3
-  local EPOCHS=$4
-  local MAX_LEN=$5
-  local ALPHA=$6
-  local WD=$7
-  local TINIT=$8          # adalora_tinit  (= AdaLoRA init_warmup)
-  local TFINAL=$9         # adalora_tfinal (= AdaLoRA final_warmup)
-  local DELTA_T=${10}     # adalora_delta_t (= AdaLoRA mask_interval)
-  local ORTH_REG=${11}    # adalora_orth_reg_weight (= AdaLoRA reg_orth_coef)
+  local TASK=$1
+  local LR=$2
+  local EPOCHS=$3
+  local MAX_LEN=$4
+  local ALPHA=$5
+  local WD=$6
+  local TINIT=$7          # adalora_tinit  (= AdaLoRA init_warmup)
+  local TFINAL=$8         # adalora_tfinal (= AdaLoRA final_warmup)
+  local DELTA_T=$9        # adalora_delta_t (= AdaLoRA mask_interval)
+  local ORTH_REG=${10}    # adalora_orth_reg_weight (= AdaLoRA reg_orth_coef)
 
   echo "================================================================"
-  echo " Task: $TASK | master_port=$MASTER_PORT | lr=$LR epochs=$EPOCHS maxlen=$MAX_LEN alpha=$ALPHA wd=$WD"
+  echo " Task: $TASK | gpu=${CUDA_VISIBLE_DEVICES:-0} | lr=$LR epochs=$EPOCHS maxlen=$MAX_LEN alpha=$ALPHA wd=$WD"
   echo " AdaLoRA: tinit=$TINIT tfinal=$TFINAL deltaT=$DELTA_T orth=$ORTH_REG"
   echo "================================================================"
 
   nohup env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
-    torchrun --nproc_per_node=1 --master_port="$MASTER_PORT" \
-    run_benchmark.py \
+    python run_benchmark.py \
     --methods $METHODS \
     --comparison_protocol $PROTOCOL \
     --protocol_dropout $PROTOCOL_DROPOUT \

@@ -7,5 +7,4 @@ cd "$REPO_ROOT"
 # shellcheck source=scripts/fair_glue_deberta_common.sh
 source "${SCRIPT_DIR}/fair_glue_deberta_common.sh"
 mkdir -p logs runs artifacts
-MASTER_PORT="${MASTER_PORT:-$(( ${BASE_MASTER_PORT:-29500} + 4 * ${MASTER_PORT_STEP:-100} ))}"
-run_task "$MASTER_PORT" qnli 5e-4 5 512 32 0.01 2000 8000 100 0.1
+run_task qnli 5e-4 5 512 32 0.01 2000 8000 100 0.1
