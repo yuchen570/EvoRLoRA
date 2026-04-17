@@ -1,4 +1,4 @@
-"""GLUE 各子集官方主指标（与 GLUE benchmark 常用约定一致）。"""
+"""GLUE 各子集主指标定义（用于 best 跟踪 / 日志 / CSV / metrics.jsonl）。"""
 from __future__ import annotations
 
 from typing import Tuple
@@ -15,10 +15,10 @@ def glue_primary_metric_key(task_name: str) -> str:
     m = {
         "cola": "matthews_corrcoef",
         "sst2": "accuracy",
-        "mrpc": "f1",
-        "qqp": "f1",
+        "mrpc": "accuracy",
+        "qqp": "accuracy_f1_mean",
         "stsb": "pearson_spearman_mean",
-        "mnli": "accuracy",
+        "mnli": "accuracy_m_mm_mean",
         "qnli": "accuracy",
         "rte": "accuracy",
         "wnli": "accuracy",
@@ -34,7 +34,8 @@ def compute_glue_primary_metric(task_name: str, y_pred: np.ndarray, y_true: np.n
     返回该子集的「主」标量（越大越好，用于 best 跟踪与 CSV）。
     - CoLA: Matthews 相关
     - SST-2 / MNLI / QNLI / RTE / WNLI / ax: Accuracy
-    - MRPC / QQP: F1 (binary)
+    - MRPC: Accuracy
+    - QQP: (Accuracy + F1) / 2
     - STS-B: (Pearson + Spearman) / 2（与 GLUE 总分中该任务常见合成方式一致）
     """
     y_true = np.asarray(y_true).reshape(-1)
@@ -44,8 +45,12 @@ def compute_glue_primary_metric(task_name: str, y_pred: np.ndarray, y_true: np.n
         return float(matthews_corrcoef(y_true, y_pred))
     if task_name in ("sst2", "mnli", "qnli", "rte", "wnli", "ax"):
         return float(accuracy_score(y_true, y_pred))
-    if task_name in ("mrpc", "qqp"):
-        return float(f1_score(y_true, y_pred, average="binary", zero_division=0))
+    if task_name == "mrpc":
+        return float(accuracy_score(y_true, y_pred))
+    if task_name == "qqp":
+        acc = float(accuracy_score(y_true, y_pred))
+        f1 = float(f1_score(y_true, y_pred, average="binary", zero_division=0))
+        return (acc + f1) / 2.0
     if task_name == "stsb":
         p, _ = pearsonr(y_pred, y_true)
         s, _ = spearmanr(y_pred, y_true)

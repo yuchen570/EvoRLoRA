@@ -23,7 +23,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$REPO_ROOT"
 
-PARALLEL_JOBS="${PARALLEL_JOBS:-2}"
+PARALLEL_JOBS="${PARALLEL_JOBS:-1}"
+GPU_LIST="${GPU_LIST:-0 1}"  # 并行时按顺序为子任务分配单卡，如 "0 1" / "1 0"
+read -r -a GPUS <<< "$GPU_LIST"
+if [ ${#GPUS[@]} -eq 0 ]; then
+  echo "GPU_LIST 不能为空"
+  exit 1
+fi
 
 TASK_SCRIPTS=(
   fair_glue_deberta_cola.sh
@@ -46,8 +52,10 @@ for ((START=0; START<TOTAL; START+=PARALLEL_JOBS)); do
     s="${TASK_SCRIPTS[$J]}"
     name="${s#fair_glue_deberta_}"
     name="${name%.sh}"
+    gpu="${GPUS[$(( (J-START) % ${#GPUS[@]} ))]}"
     BATCH_NAMES+=("$name")
-    bash "${SCRIPT_DIR}/${s}" &
+    echo "Launching $name on GPU $gpu"
+    CUDA_VISIBLE_DEVICES="$gpu" bash "${SCRIPT_DIR}/${s}" &
     PIDS+=($!)
   done
   echo ""

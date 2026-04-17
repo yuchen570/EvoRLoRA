@@ -2277,7 +2277,16 @@ def run_training_loop(
                     "rank_summary": _rank_info["summary"],
                 }
                 if task_type == "nlu" and task_name is not None:
-                    rec["glue_metric"] = glue_primary_metric_key(task_name)
+                    if metrics_dict_val:
+                        rec.update({k: float(v) for k, v in metrics_dict_val.items()})
+                    if task_name == "mnli":
+                        rec["glue_metric"] = "m/mm"
+                    elif task_name == "qqp":
+                        rec["glue_metric"] = "acc/f1"
+                    elif task_name == "mrpc":
+                        rec["glue_metric"] = "accuracy"
+                    else:
+                        rec["glue_metric"] = glue_primary_metric_key(task_name)
                 if task_type == "nlg":
                     rec["rouge1"] = rouge1_val
                     rec["rouge2"] = rouge2_val

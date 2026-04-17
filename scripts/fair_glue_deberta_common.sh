@@ -13,6 +13,7 @@ PROTOCOL="controlled_fair"
 PROTOCOL_DROPOUT=0.05
 
 # ---- 启动单个任务（第一个参数为该作业的 master_port）----
+# 默认单卡运行；如需切换 GPU，可在外部设置 CUDA_VISIBLE_DEVICES。
 run_task() {
   local MASTER_PORT=$1
   local TASK=$2
@@ -31,9 +32,9 @@ run_task() {
   echo " AdaLoRA: tinit=$TINIT tfinal=$TFINAL deltaT=$DELTA_T orth=$ORTH_REG"
   echo "================================================================"
 
-  nohup torchrun --nproc_per_node=2 --master_port="$MASTER_PORT" \
+  nohup env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
+    torchrun --nproc_per_node=1 --master_port="$MASTER_PORT" \
     run_benchmark.py \
-    --ddp \
     --methods $METHODS \
     --comparison_protocol $PROTOCOL \
     --protocol_dropout $PROTOCOL_DROPOUT \
