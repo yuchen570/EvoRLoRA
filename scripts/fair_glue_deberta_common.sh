@@ -58,6 +58,7 @@ run_task() {
     --sora_sparse_lambda_2 3e-4 \
     --lambda_c 0.0 \
     --expand_init_mode gradient \
+    --evo_compensation_mode B \
     --mini_val_k 8 \
     --evo_alpha_u 1.0 \
     --evo_p_p 0.05 \
