@@ -29,7 +29,13 @@ from peft import (
 
 # 导入 EvoRank 和其它对比算法的注入函数
 from train_integration import inject_evo_lora, train_evo_lora_step
-from adalora_utils import compute_adalora_orthogonal_loss, get_adalora_orth_reg_weight, adalora_update_and_allocate
+from adalora_utils import (
+    adalora_update_and_allocate,
+    compute_adalora_orthogonal_loss,
+    get_adalora_orth_reg_weight,
+    normalize_adalora_schedule,
+    unwrap_inner_from_training_model,
+)
 from sora_inject import inject_sora, SparseAdamW
 from flatlora_inject import FlatLoRAHookManager
 from toplora_inject import inject_toplora
@@ -386,6 +392,21 @@ def run_sft_training(args, method: str):
     # ======= 定义优化器 =======
     total_steps = len(train_loader) * args.epochs // args.gradient_accumulation_steps
     warmup_steps = int(total_steps * args.warmup_ratio)
+
+    if method == "adalora":
+        tinit_n, tfinal_n, sched_warn = normalize_adalora_schedule(
+            total_steps=total_steps,
+            adalora_tinit=args.adalora_tinit,
+            adalora_tfinal=args.adalora_tfinal,
+        )
+        inner = unwrap_inner_from_training_model(model)
+        cfg = getattr(inner, "peft_config", {}).get("default", None)
+        if cfg is not None:
+            cfg.tinit = int(tinit_n)
+            cfg.tfinal = int(tfinal_n)
+            cfg.total_step = int(total_steps)
+        if sched_warn is not None and is_main_process:
+            logger.warning(sched_warn)
 
     opt_class = SparseAdamW if method == "sora" else torch.optim.AdamW
     

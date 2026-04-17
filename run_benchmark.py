@@ -29,7 +29,13 @@ from transformers import (
 
 from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
 
-from adalora_utils import adalora_update_and_allocate, compute_adalora_orthogonal_loss, get_adalora_orth_reg_weight, unwrap_inner_from_training_model
+from adalora_utils import (
+    adalora_update_and_allocate,
+    compute_adalora_orthogonal_loss,
+    get_adalora_orth_reg_weight,
+    normalize_adalora_schedule,
+    unwrap_inner_from_training_model,
+)
 from rank_evolution_controller import RankEvolutionController
 from sora_inject import SparseAdamW, inject_sora
 from toplora_inject import inject_toplora
@@ -826,45 +832,13 @@ def peft_factory(
     elif method_name == "adalora":
         # AdaLoRA：预算调度 + RankAllocator（步后 update_and_allocate）+ 正交正则（本脚本在 loss 上显式加入，见 run_training_loop）。
         planned_steps = max(int(total_steps or 1000), 1)
-        if adalora_tinit is None:
-            tinit = max(int(0.1 * planned_steps), 1)
-        else:
-            tinit = max(int(adalora_tinit), 1)
-        if adalora_tfinal is None:
-            tfinal = max(int(0.1 * planned_steps), tinit + 1)
-        else:
-            tfinal = max(int(adalora_tfinal), tinit + 1)
-        # 需满足 tinit < planned_steps - tfinal（中间段至少留 1 步做动态秩）。
-        # 官方 AdaLoRA 脚本的 tinit/tfinal 常按单卡或更长 total_step 设定；DDP 下每 epoch 步数减半会导致
-        # total_step 变短而与固定 tinit/tfinal 冲突。此处按比例收紧并告警，而非直接崩溃。
-        if tinit >= planned_steps - tfinal:
-            orig_tinit, orig_tfinal = tinit, tfinal
-            cap = planned_steps - 2  # 严格保留 tinit、tfinal 与至少 1 步中间段
-            if cap < 2:
-                raise ValueError(
-                    f"AdaLoRA 调度无效：total_step={planned_steps} 过短，无法满足 tinit/tfinal。"
-                    f"当前 tinit={tinit}, tfinal={tfinal}。请增大 --epochs 或减小 --adalora_tinit/--adalora_tfinal。"
-                )
-            sum_ab = tinit + tfinal
-            scale = float(cap) / float(max(sum_ab, 1))
-            tinit = max(1, int(tinit * scale))
-            tfinal = max(tinit + 1, int(tfinal * scale))
-            if tinit + tfinal > cap:
-                tfinal = cap - tinit
-            tfinal = max(tfinal, tinit + 1)
-            if tinit + tfinal >= planned_steps:
-                tinit = max(1, planned_steps // 3)
-                tfinal = max(tinit + 1, min(orig_tfinal, planned_steps - tinit - 1))
-            if tinit >= planned_steps - tfinal:
-                raise ValueError(
-                    f"AdaLoRA 调度无效：需满足 tinit < total_step - tfinal，当前 total_step={planned_steps}, "
-                    f"tinit={tinit}, tfinal={tfinal}（已尝试按步数收紧仍失败）。请增大训练步数或显式调小 --adalora_tinit/--adalora_tfinal。"
-                )
-            if is_main_process:
-                print(
-                    f"[adalora] tinit/tfinal 与 total_step={planned_steps} 不兼容（官方值常针对更长训练），"
-                    f"已按比例收紧: tinit {orig_tinit}->{tinit}, tfinal {orig_tfinal}->{tfinal}。"
-                )
+        tinit, tfinal, sched_warn = normalize_adalora_schedule(
+            total_steps=planned_steps,
+            adalora_tinit=adalora_tinit,
+            adalora_tfinal=adalora_tfinal,
+        )
+        if sched_warn is not None and is_main_process:
+            print(sched_warn)
         init_r_val = int(adalora_init_r) if adalora_init_r is not None else target_rank * 2
         if init_r_val < target_rank:
             raise ValueError("adalora_init_r 应 >= target_rank（target_r）")

@@ -8,6 +8,8 @@ AdaLoRA 训练辅助：正交正则与 update_and_allocate 解析。
 
 from __future__ import annotations
 
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 
@@ -69,3 +71,60 @@ def adalora_update_and_allocate(model: nn.Module, global_step: int) -> None:
         if mod is not inner and hasattr(mod, "update_and_allocate"):
             mod.update_and_allocate(global_step)
             return
+
+
+def normalize_adalora_schedule(
+    total_steps: int,
+    adalora_tinit: Optional[int] = None,
+    adalora_tfinal: Optional[int] = None,
+) -> Tuple[int, int, Optional[str]]:
+    """
+    规范化 AdaLoRA 调度，保证 tinit < total_step - tfinal（中间段至少 1 步）。
+    返回: (tinit, tfinal, warn_message_or_none)
+    """
+    planned_steps = max(int(total_steps or 1000), 1)
+
+    if adalora_tinit is None:
+        tinit = max(int(0.1 * planned_steps), 1)
+    else:
+        tinit = max(int(adalora_tinit), 1)
+
+    if adalora_tfinal is None:
+        tfinal = max(int(0.1 * planned_steps), tinit + 1)
+    else:
+        tfinal = max(int(adalora_tfinal), tinit + 1)
+
+    warn_message: Optional[str] = None
+    if tinit >= planned_steps - tfinal:
+        orig_tinit, orig_tfinal = tinit, tfinal
+        cap = planned_steps - 2  # 严格保留 tinit、tfinal 与至少 1 步中间段
+        if cap < 2:
+            raise ValueError(
+                f"AdaLoRA 调度无效：total_step={planned_steps} 过短，无法满足 tinit/tfinal。"
+                f"当前 tinit={tinit}, tfinal={tfinal}。请增大训练步数或减小 adalora_tinit/adalora_tfinal。"
+            )
+
+        sum_ab = tinit + tfinal
+        scale = float(cap) / float(max(sum_ab, 1))
+        tinit = max(1, int(tinit * scale))
+        tfinal = max(tinit + 1, int(tfinal * scale))
+        if tinit + tfinal > cap:
+            tfinal = cap - tinit
+        tfinal = max(tfinal, tinit + 1)
+
+        if tinit + tfinal >= planned_steps:
+            tinit = max(1, planned_steps // 3)
+            tfinal = max(tinit + 1, min(orig_tfinal, planned_steps - tinit - 1))
+
+        if tinit >= planned_steps - tfinal:
+            raise ValueError(
+                f"AdaLoRA 调度无效：需满足 tinit < total_step - tfinal，当前 total_step={planned_steps}, "
+                f"tinit={tinit}, tfinal={tfinal}（已尝试按步数收紧仍失败）。请增大训练步数或显式调小 adalora_tinit/adalora_tfinal。"
+            )
+
+        warn_message = (
+            f"[adalora] tinit/tfinal 与 total_step={planned_steps} 不兼容（官方值常针对更长训练），"
+            f"已按比例收紧: tinit {orig_tinit}->{tinit}, tfinal {orig_tfinal}->{tfinal}。"
+        )
+
+    return tinit, tfinal, warn_message
