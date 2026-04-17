@@ -1110,6 +1110,33 @@ def _collect_rank_distribution(
         else:
             summary_gate_stats = None
 
+    elif method_name == "toplora":
+        # TopLoRA: 固定秩，但监控 lora_lambda 的权重状态
+        lambda_weights = []
+        for n, p in inner.named_parameters():
+            if n.endswith(".lora_lambda.weight"):
+                lambda_weights.append(p.data.detach().abs().view(-1))
+                # 记录每一层
+                layer_key = n.replace(".lora_lambda.weight", "")
+                per_layer[layer_key] = target_rank
+            elif "lora_A" in n and p.numel() > 0:
+                layer_key = n.replace(".lora_A.default.weight", "").replace(".lora_A.weight", "").replace(".lora_A", "")
+                if layer_key not in per_layer:
+                    per_layer[layer_key] = target_rank
+
+        total_capacity = len(per_layer) * target_rank
+        
+        if lambda_weights:
+            all_lambda = torch.cat(lambda_weights)
+            summary_lambda_stats = {
+                "min": float(all_lambda.min().item()),
+                "max": float(all_lambda.max().item()),
+                "mean": float(all_lambda.mean().item()),
+                "std": float(all_lambda.std().item()),
+            }
+        else:
+            summary_lambda_stats = None
+
     else:
         # LoRA / TopLoRA: 固定秩
         for n, p in inner.named_parameters():
@@ -1149,6 +1176,8 @@ def _collect_rank_distribution(
     if method_name == "sora":
         summary["gate_abs_stats"] = summary_gate_stats if "summary_gate_stats" in locals() else None
         summary["gate_nan_count"] = gate_nan_count if "gate_nan_count" in locals() else 0
+    if method_name == "toplora":
+        summary["lambda_abs_stats"] = summary_lambda_stats if "summary_lambda_stats" in locals() else None
     if 'extra_info' in locals() and extra_info:
         summary["extra_string"] = extra_info + (f", eff_source={eff_source}" if method_name == "adalora" else "")
 
@@ -1171,7 +1200,7 @@ def _print_rank_distribution(
     extra_str = f" [{summary['extra_string']}]" if "extra_string" in summary else ""
     print(f"[{method_name}] === Rank Distribution (epoch={epoch}/{epochs}){extra_str} ===")
     
-    if method_name not in ("lora", "toplora", "pissa", "flatlora"):
+    if method_name not in ("lora", "pissa", "flatlora"):
         base_rank = summary.get("base_rank", -1)
         omitted = 0
         for layer_name, eff_r in per_layer.items():
@@ -1224,6 +1253,18 @@ def _print_rank_distribution(
             gate_nan_count = int(summary.get("gate_nan_count", 0))
             if gate_nan_count > 0:
                 print(f"  [diag] gate contains NaN values: count={gate_nan_count}")
+
+    # TopLoRA 诊断信息（无论秩是否为零都显示）
+    if method_name == "toplora":
+        lambda_stats = summary.get("lambda_abs_stats")
+        if lambda_stats is not None:
+            print(
+                "  [diag] lambda_weight|abs| stats: "
+                f"min={lambda_stats['min']:.3e} "
+                f"max={lambda_stats['max']:.3e} "
+                f"mean={lambda_stats['mean']:.3e} "
+                f"std={lambda_stats['std']:.3e}"
+            )
 
 
 def _unwrap_training_module(model: nn.Module) -> nn.Module:

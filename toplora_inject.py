@@ -149,6 +149,7 @@ def inject_toplora(
         )
 
     # 执行替换
+    total_extra_params = 0
     for name, base_linear in to_inject:
         wrapped = TopLoRALinear(
             base_linear,
@@ -156,7 +157,11 @@ def inject_toplora(
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
         ).to(base_linear.weight.device)
+        total_extra_params += wrapped.lora_lambda.weight.numel()
         _set_module_by_path(model, name, wrapped)
+
+    print(f"[TopLoRA] 已注入 {len(to_inject)} 个线性层 (r={r}, alpha={lora_alpha}, dropout={lora_dropout})")
+    print(f"[TopLoRA] 额外参数量 (W_lambda): {total_extra_params}")
 
     # 解冻分类头（与 SoRA inject 保持一致）
     for name, param in model.named_parameters():
