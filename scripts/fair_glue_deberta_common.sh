@@ -6,7 +6,7 @@
 # 不要直接执行本文件：请运行 fair_glue_deberta_<task>.sh 或 fair_glue_deberta.sh。
 # =============================================================================
 
-METHODS="lora adalora evorank sora toplora flatlora pissa"
+METHODS="evorank toplora flatlora"
 MODEL="microsoft/deberta-v3-base"
 SEEDS="0 21 42 81 100"
 PROTOCOL="controlled_fair"
