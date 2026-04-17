@@ -2259,7 +2259,16 @@ def run_training_loop(
                     "rank_summary": _rank_info["summary"],
                 }
                 if task_type == "nlu" and task_name is not None:
-                    rec["glue_metric"] = glue_primary_metric_key(task_name)
+                    if metrics_dict_val:
+                        rec.update({k: float(v) for k, v in metrics_dict_val.items()})
+                    if task_name == "mnli":
+                        rec["glue_metric"] = "m/mm"
+                    elif task_name == "qqp":
+                        rec["glue_metric"] = "acc/f1"
+                    elif task_name == "mrpc":
+                        rec["glue_metric"] = "accuracy"
+                    else:
+                        rec["glue_metric"] = glue_primary_metric_key(task_name)
                 if task_type == "nlg":
                     rec["rouge1"] = rouge1_val
                     rec["rouge2"] = rouge2_val
@@ -2390,6 +2399,9 @@ def run_training_loop(
         "rouge2": rouge2_val if task_type == "nlg" else "",
         "rougeL": best_val_acc if val_metric_key_str == "rougeL" else "",
     }
+    # 与 val_metric_key 对齐的主指标标量，供 CSV 汇总与 Benchmark Summary 读取
+    if task_type == "nlu" and val_metric_key_str:
+        result[val_metric_key_str] = float(best_val_acc)
     return result
 
 
@@ -2863,7 +2875,21 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
 
                 # 多种子聚合：追加均值/标准差汇总行
                 if args.is_main_process and len(seed_results) > 1:
-                    metric_keys = ["matthews_corrcoef", "accuracy", "accuracy_m", "accuracy_mm", "f1", "pearson_spearman_mean", "pearson", "spearman", "rouge1", "rouge2", "rougeL"]
+                    metric_keys = [
+                        "matthews_corrcoef",
+                        "accuracy",
+                        "accuracy_m",
+                        "accuracy_mm",
+                        "accuracy_m_mm_mean",
+                        "accuracy_f1_mean",
+                        "f1",
+                        "pearson_spearman_mean",
+                        "pearson",
+                        "spearman",
+                        "rouge1",
+                        "rouge2",
+                        "rougeL",
+                    ]
                     
                     mean_row = dict(seed_results[0])
                     std_row = dict(seed_results[0])
@@ -2915,6 +2941,8 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     "accuracy",
                     "accuracy_m",
                     "accuracy_mm",
+                    "accuracy_m_mm_mean",
+                    "accuracy_f1_mean",
                     "f1",
                     "pearson_spearman_mean",
                     "pearson",
