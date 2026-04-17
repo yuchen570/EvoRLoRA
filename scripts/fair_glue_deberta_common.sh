@@ -79,16 +79,17 @@ run_task() {
     --adalora_orth_reg_weight $ORTH_REG \
     --sora_sparse_lambda 10 \
     --sora_sparse_lambda_2 3e-4 \
+    --pissa_lr 1e-4 \
     --lambda_c 0.0 \
     --expand_init_mode gradient \
-    --evo_compensation_mode None \
+    --evo_compensation_mode B \
     --mini_val_k 8 \
     --evo_alpha_u 1.0 \
     --evo_p_p 0.05 \
     --evo_H_p 4 \
-    --evo_max_reallocate_candidates 16 \
-    --es_top_k_refine 3 \
-    --es_significance_threshold 0.5 \
+    --evo_max_reallocate_candidates 4 \
+    --es_top_k_refine 2 \
+    --es_significance_threshold 0.1 \
     --verify_n_samples 0 \
     --seed_list $SEEDS \
     --log_dir runs/fair_glue_deberta_${TASK} \

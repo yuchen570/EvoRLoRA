@@ -41,7 +41,12 @@ class TopSingularValue(nn.Module):
         self.token_dim = token_dim
         self.weight = nn.Parameter(torch.empty((token_dim, r), dtype=dtype))
         self.rms_norm = nn.RMSNorm([r])
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5), mode="fan_out")
+        # W_λ 零初始化：x @ W_λ ≡ 0 → RMSNorm(0) ≡ 0 → exp(0) ≡ 1，λ(x)≡1
+        # 等价于 init 阶段 TopLoRA 退化成标准 LoRA（此时 B=0 本就让 Δ=0）。
+        # 若改用 Kaiming 初始化，虽然 init 前向仍 Δ=0（B=0 屏蔽），但一旦 B 开始增长，
+        # λ(x) = exp(RMSNorm(...)) 会瞬间引入 O(1) 量级的 token-wise 噪声，
+        # 在小数据集（CoLA/MRPC）上已经观测到明显的 seed 间抖动（std↑）。
+        nn.init.zeros_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = x @ self.weight

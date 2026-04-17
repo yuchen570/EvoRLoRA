@@ -1498,14 +1498,16 @@ def run_training_loop(
     # B4：按数据规模自适应调整 T_es 与 mini_val_k（Hyperscale ES 优化）。
     # 小数据集的 ES 信号噪声更大：增大 T_es 以减少无效演化轮次；
     # 大数据集可保持更频繁、评估更充分的 ES 触发策略。
+    #
+    # 注意：曾经在小数据集上把 mini_val_k 也压到 4/6，但实测 CoLA/MRPC 上 val batch 太少会让
+    # ES trial 的 delta 被噪声淹没（baseline_subtraction 几乎永远胜出，avg_rank 基本不变）。
+    # 现在只自适应 T_es，mini_val_k 保留调用方传入值，由 ES 预筛与 top_k_refine 控制开销。
     if method_name == "evorank" and T_es > 0:
         dataset_steps = steps_per_epoch * epochs
         if dataset_steps < 2000:
             T_es = max(T_es, 500)
-            mini_val_k = min(mini_val_k, 4)
         elif dataset_steps < 5000:
             T_es = max(T_es, 300)
-            mini_val_k = min(mini_val_k, 6)
         if is_main_process:
             print(f"[evorank][adaptive] dataset_steps={dataset_steps} → T_es={T_es}, mini_val_k={mini_val_k}")
     
@@ -2988,6 +2990,54 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
     return all_results
 
 
+def _benchmark_row_primary_metric_value(row: Dict[str, Any]) -> float:
+    """
+    终端摘要里打印的 best_metric：与 glue_primary_metric_key 的命名一致，
+    但 CSV/result 字典使用 sklearn/HF 风格列名（如 matthews_corrcoef），
+    不能直接用 r[val_metric_key] 索引，否则缺失键会落到默认 0.0。
+    """
+    key = (row.get("val_metric_key") or "").strip()
+    if not key:
+        return 0.0
+
+    def _as_float(v: Any) -> Optional[float]:
+        if v in ("", None, "N/A"):
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    v: Optional[float] = None
+    if key == "mcc":
+        v = _as_float(row.get("matthews_corrcoef"))
+        if v is None:
+            v = _as_float(row.get("mcc"))
+    elif key == "acc":
+        v = _as_float(row.get("accuracy"))
+        if v is None:
+            v = _as_float(row.get("acc"))
+    elif key == "acc_and_f1":
+        v = _as_float(row.get("acc_and_f1"))
+        if v is None:
+            a = _as_float(row.get("accuracy"))
+            f = _as_float(row.get("f1"))
+            if a is not None and f is not None:
+                v = (a + f) / 2.0
+    elif key == "corr":
+        v = _as_float(row.get("pearson_spearman_mean"))
+        if v is None:
+            v = _as_float(row.get("corr"))
+    elif key == "m/mm":
+        am = _as_float(row.get("accuracy_m"))
+        amm = _as_float(row.get("accuracy_mm"))
+        if am is not None and amm is not None:
+            v = (am + amm) / 2.0
+    else:
+        v = _as_float(row.get(key))
+    return 0.0 if v is None else float(v)
+
+
 if __name__ == "__main__":
     args = parse_args()
     # 统一 HuggingFace 缓存到当前工程目录，避免默认写入用户主目录。
@@ -3031,7 +3081,8 @@ if __name__ == "__main__":
                 mk = (results[0].get("val_metric_key") or "").strip()
                 if mk:
                     print(
-                        f"[summary] 验证主指标日志键为 val_{mk}；该值已落入 CSV 对应列。"
+                        f"[summary] 验证主指标键 val_metric_key={mk!r}；"
+                        "CSV 中可能对应不同列名（如 mcc→matthews_corrcoef），摘要已做映射。"
                     )
             print("\n=== Benchmark Summary ===")
             print(
@@ -3042,10 +3093,7 @@ if __name__ == "__main__":
                 ar = r["avg_active_rank"]
                 ar_fmt = f"{float(ar):.4f}" if isinstance(ar, float) else str(ar)
                 
-                eval_key = r.get("val_metric_key", "")
-                best_val = r.get(eval_key, 0.0) if eval_key else 0.0
-                if best_val == "" or best_val == "N/A":
-                    best_val = 0.0
+                best_val = _benchmark_row_primary_metric_value(r)
 
                 pm = r.get('peak_memory_mb', 0.0)
                 pm_fmt = f"{float(pm):<12.2f}" if pm != "" else f"{pm:<12}"

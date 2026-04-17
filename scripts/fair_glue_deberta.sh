@@ -23,7 +23,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$REPO_ROOT"
 
-PARALLEL_JOBS="${PARALLEL_JOBS:-2}"
+# 默认串行执行：每个任务的 torchrun 已占用整机 2 张 GPU，若同时跑 2+ 组 torchrun
+# 会强行 oversubscribe GPU，导致 evorank / flatlora 这类有额外 forward 或 hook 的方法
+# 被 kernel 等待与 NCCL 带宽抢占放大数倍耗时（已在 fair_glue_deberta_cola/mrpc 日志里观测）。
+# 如确实有多机或空闲 GPU，再手动 `PARALLEL_JOBS=2 bash scripts/fair_glue_deberta.sh`。
+PARALLEL_JOBS="${PARALLEL_JOBS:-1}"
 
 TASK_SCRIPTS=(
   fair_glue_deberta_cola.sh
