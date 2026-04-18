@@ -43,30 +43,9 @@ from train_integration import inject_evo_lora, train_evo_lora_step
 
 from glue_metrics import collect_nlu_predictions, compute_glue_primary_metric, glue_primary_metric_key, compute_glue_metrics_dict
 
+from hf_cache_utils import check_local_dataset, resolve_pretrained_model_source
+
 from torch.nn.parallel import DistributedDataParallel as DDP
-
-def check_local_model(model_name_or_path, cache_dir="models"):
-    """检查模型是否已存在于本地缓存中，以决定是否开启 offline 模式"""
-    if os.path.exists(model_name_or_path) and os.path.isdir(model_name_or_path):
-        return True
-    # 简单的 heuristic：检查 cache_dir 下是否有对应的 slug 文件夹
-    slug = model_name_or_path.replace("/", "--")
-    if os.path.exists(os.path.join(cache_dir, f"models--{slug}")):
-        return True
-    return False
-
-def check_local_dataset(path, name=None, cache_dir="datasets"):
-    """检查数据集是否已存在于本地缓存中"""
-    if os.path.exists(path) and os.path.isdir(path):
-        return True
-    slug = path.replace("/", "--")
-    dataset_path = os.path.join(cache_dir, slug)
-    if name:
-        dataset_path = os.path.join(dataset_path, name)
-    # Datasets 缓存结构较复杂，这里仅做基本目录检查
-    if os.path.exists(dataset_path):
-        return True
-    return False
 
 
 def _linear_warmup_decay_lr_lambda(num_warmup_steps: int, num_training_steps: int):
@@ -374,18 +353,38 @@ def setup_data_and_model(
 ) -> Tuple[DataLoader, DataLoader, Optional[Union[DataLoader, Dict[str, DataLoader]]], nn.Module, AutoTokenizer]:
     os.makedirs(dataset_cache_dir, exist_ok=True)
     os.makedirs(model_cache_dir, exist_ok=True)
-    
-    use_local_model = check_local_model(model_name, model_cache_dir)
-    
+
+    model_load_id, use_local_model = resolve_pretrained_model_source(model_name, model_cache_dir)
+
+    # 当本地已有模型时，设置 HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE 环境变量。
+    # transformers>=4.45 的 tokenizer __init__ 内部 _patch_mistral_regex 会调用
+    # model_info(model_id) 发起 HTTP 请求，仅靠 local_files_only=True 无法阻止。
+    _prev_hub_offline = os.environ.get("HF_HUB_OFFLINE")
+    _prev_tf_offline = os.environ.get("TRANSFORMERS_OFFLINE")
+    if use_local_model:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
     # DDP 环境下让 Rank 0 先下载
     if ddp_enabled and world_size > 1 and rank != 0:
         dist.barrier()
-        
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name, 
-        cache_dir=model_cache_dir, 
-        local_files_only=use_local_model
-    )
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_load_id,
+            cache_dir=model_cache_dir,
+            local_files_only=use_local_model,
+        )
+    finally:
+        # 恢复环境变量，避免影响后续需要网络的操作（如数据集下载）
+        if _prev_hub_offline is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = _prev_hub_offline
+        if _prev_tf_offline is None:
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        else:
+            os.environ["TRANSFORMERS_OFFLINE"] = _prev_tf_offline
 
     if task_type == "nlu":
         # 如果是 GLUE 任务，load_dataset("glue", task_name)
@@ -512,7 +511,7 @@ def setup_data_and_model(
 
         if task_name == "stsb":
             base_model = AutoModelForSequenceClassification.from_pretrained(
-                model_name,
+                model_load_id,
                 num_labels=1,
                 problem_type="regression",
                 cache_dir=model_cache_dir,
@@ -525,7 +524,7 @@ def setup_data_and_model(
             else:
                 num_labels = len(set(dataset[train_split]["label"]))
             base_model = AutoModelForSequenceClassification.from_pretrained(
-                model_name,
+                model_load_id,
                 num_labels=num_labels,
                 cache_dir=model_cache_dir,
                 local_files_only=use_local_model,
@@ -654,9 +653,9 @@ def setup_data_and_model(
         train_loader, val_loader, val_loader_eval_full = _make_loaders_nlg(seed)
 
         base_model = AutoModelForSeq2SeqLM.from_pretrained(
-            model_name, 
+            model_load_id,
             cache_dir=model_cache_dir,
-            local_files_only=use_local_model
+            local_files_only=use_local_model,
         )
 
         # Rank 0 完成加载/下载后释放其它进程

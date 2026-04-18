@@ -39,6 +39,7 @@ from adalora_utils import (
 from sora_inject import inject_sora, SparseAdamW
 from flatlora_inject import FlatLoRAHookManager
 from toplora_inject import inject_toplora
+from hf_cache_utils import check_local_dataset, resolve_pretrained_model_source
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -49,16 +50,6 @@ os.makedirs("./datasets", exist_ok=True)
 os.environ.setdefault("HF_HOME", os.path.abspath("./models"))
 os.environ.setdefault("TRANSFORMERS_CACHE", os.path.abspath("./models"))
 os.environ.setdefault("HF_DATASETS_CACHE", os.path.abspath("./datasets"))
-
-def check_local_model(model_name_or_path, cache_dir="./models"):
-    """检查模型是否已存在于本地缓存中，以决定是否开启 offline 模式"""
-    if os.path.isdir(model_name_or_path):
-        return True
-    # 简单的 heuristic：检查 cache_dir 下是否有对应的 slug 文件夹
-    slug = model_name_or_path.replace("/", "--")
-    if os.path.exists(os.path.join(cache_dir, f"models--{slug}")):
-        return True
-    return False
 
 IGNORE_INDEX = -100
 
@@ -153,23 +144,43 @@ def build_model_and_peft(args, method: str):
     
     # 强制在单卡模式下使用 device_map="auto"；如果是 DDP 则先放置在分配的 gpu 上。
     # 为了避免与 deepspeed 冲突，DDP 环境使用空 cache 和 manual to(device)。
-    # 自动探测本地模型，若存在则开启 local_files_only 避免 403 检查
-    use_local = check_local_model(args.model_name_or_path, "./models")
+    # 自动探测本地 Hub 缓存（含 models/hub、并列 ./hub、./hf_home/hub），存在则 local_files_only 并解析快照路径
+    model_load_id, use_local = resolve_pretrained_model_source(args.model_name_or_path, "./models")
     if use_local:
-        logger.info(f"Model {args.model_name_or_path} detected in local cache. Enabling local_files_only.")
+        logger.info(
+            f"Model {args.model_name_or_path} detected in local cache (load id={model_load_id!r}). "
+            "Enabling local_files_only."
+        )
+
+    # transformers>=4.45 的 tokenizer/model __init__ 内部可能调用 model_info() 发起 HTTP 请求
+    _prev_hub_offline = os.environ.get("HF_HUB_OFFLINE")
+    _prev_tf_offline = os.environ.get("TRANSFORMERS_OFFLINE")
+    if use_local:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
     # 在 DDP 环境下，让 Rank 0 先加载（触发下载），其它 Rank 等待，防止缓存竞争
     if dist.is_initialized():
         if dist.get_rank() != 0:
             dist.barrier()
 
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-        cache_dir="./models",
-        local_files_only=use_local,
-    )
+    try:
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_load_id,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            cache_dir="./models",
+            local_files_only=use_local,
+        )
+    finally:
+        if _prev_hub_offline is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = _prev_hub_offline
+        if _prev_tf_offline is None:
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        else:
+            os.environ["TRANSFORMERS_OFFLINE"] = _prev_tf_offline
 
     if dist.is_initialized() and dist.get_rank() == 0:
         dist.barrier()
@@ -306,16 +317,35 @@ def run_sft_training(args, method: str):
     device = torch.device(f"cuda:{args.local_rank}" if args.local_rank != -1 else "cuda") if torch.cuda.is_available() else torch.device("cpu")
     dtype = torch.bfloat16 if args.bf16 else torch.float32
     
-    use_local = check_local_model(args.model_name_or_path, "./models")
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        args.model_name_or_path,
-        model_max_length=args.model_max_length,
-        padding_side="right",
-        use_fast=True,
-        trust_remote_code=True,
-        cache_dir="./models",
-        local_files_only=use_local
-    )
+    model_load_id, use_local = resolve_pretrained_model_source(args.model_name_or_path, "./models")
+
+    # transformers>=4.45 的 tokenizer __init__ 内部 _patch_mistral_regex 会调用
+    # model_info(model_id) 发起 HTTP 请求，仅靠 local_files_only=True 无法阻止。
+    _prev_hub_offline = os.environ.get("HF_HUB_OFFLINE")
+    _prev_tf_offline = os.environ.get("TRANSFORMERS_OFFLINE")
+    if use_local:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    try:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            model_load_id,
+            model_max_length=args.model_max_length,
+            padding_side="right",
+            use_fast=True,
+            trust_remote_code=True,
+            cache_dir="./models",
+            local_files_only=use_local,
+        )
+    finally:
+        if _prev_hub_offline is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = _prev_hub_offline
+        if _prev_tf_offline is None:
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        else:
+            os.environ["TRANSFORMERS_OFFLINE"] = _prev_tf_offline
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -338,7 +368,13 @@ def run_sft_training(args, method: str):
         if dist.is_initialized() and dist.get_rank() != 0:
             dist.barrier()
 
+        # 检查数据集是否已在本地缓存，若是则开启离线模式
+        _ds_local = check_local_dataset(args.data_path, cur_task, cache_dir="./datasets")
+        if _ds_local:
+            os.environ["HF_DATASETS_OFFLINE"] = "1"
         ds = load_dataset(args.data_path, data_dir=cur_task, split=cur_split, cache_dir="./datasets")
+        if _ds_local:
+            os.environ.pop("HF_DATASETS_OFFLINE", None)
         
         if dist.is_initialized() and dist.get_rank() == 0:
             dist.barrier()
