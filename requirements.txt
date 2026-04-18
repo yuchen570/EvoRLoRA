@@ -7,9 +7,24 @@ scikit-learn>=1.5.0
 scipy>=1.11.0
 wandb>=0.17.0
 evaluate>=0.4.0
+huggingface_hub>=0.23.0
 
 # NLP Tokenizers & Metrics Dependencies
 sentencepiece>=0.2.0
 tiktoken>=0.7.0
 protobuf>=4.25.0
 rouge_score>=0.1.2
+
+# NLG PiSSA 流水线（run_nlg_benchmark.py + scripts/eval_nlg_pissa.py）
+# HumanEval / MBPP：脚本通过 subprocess 调用 ``python -m evalplus.evaluate``
+evalplus>=0.2.0
+
+# MT-Bench（scripts/eval_mtbench.py，FastChat llm_judge）
+# - 仅生成回答：只需下面一行（无需 OPENAI_API_KEY、无需 openai）。
+# - GPT-4 裁判打分：需 ``OPENAI_API_KEY``，并另行 ``pip install 'openai>=1.0.0'``（勿与 fschat 写在同一约束里，易触发 pip 回溯/冲突）。
+# - 正确 extras 为 llm_judge、model_worker；不存在 ``model_judge``。
+# 版本固定为 ==0.2.36，避免 pip 将 ``fschat`` 与 ``fschat[...]`` 解成冲突依赖。
+fschat[llm_judge,model_worker]==0.2.36
+
+# 可选：vLLM 加速生成评测（scripts/eval_nlg_pissa.py 传 --use_vllm 时；与 CUDA 版本强相关，请按官方说明单独安装）
+# vllm>=0.6.0

@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import sys
 import random
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -19,7 +20,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import LambdaLR
 import transformers
-from datasets import load_dataset, concatenate_datasets
+from datasets import concatenate_datasets
 from peft import (
     LoraConfig,
     PeftModel,
@@ -34,12 +35,11 @@ from adalora_utils import (
     compute_adalora_orthogonal_loss,
     get_adalora_orth_reg_weight,
     normalize_adalora_schedule,
-    unwrap_inner_from_training_model,
 )
 from sora_inject import inject_sora, SparseAdamW
 from flatlora_inject import FlatLoRAHookManager
 from toplora_inject import inject_toplora
-from hf_cache_utils import check_local_dataset, resolve_pretrained_model_source
+from hf_cache_utils import load_fxmeng_pissa_split, resolve_pretrained_model_source
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -138,8 +138,65 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_traini
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
     return LambdaLR(optimizer, lr_lambda)
 
-def build_model_and_peft(args, method: str):
-    """构建 CausalLM 模型并注入对应的 PEFT 模块"""
+def _merge_evorank_into_base(model: nn.Module) -> None:
+    """将所有 EvoRankLoRAWrapper 中的 LoRA 旁路合并回 base_layer 权重，然后用 base_layer 替换 wrapper。"""
+    from train_integration import EvoRankLoRAWrapper, _set_module_by_path
+    replacements = []
+    for name, module in model.named_modules():
+        if isinstance(module, EvoRankLoRAWrapper):
+            module.lora_layer.merge(module.base_layer.weight)
+            replacements.append((name, module.base_layer))
+    for name, base_layer in replacements:
+        _set_module_by_path(model, name, base_layer)
+    logger.info(f"Merged {len(replacements)} EvoRank layers into base model.")
+
+
+def _merge_sora_into_base(model: nn.Module) -> None:
+    """将所有 SoRALinear 中的 ΔW = scaling * B @ diag(gate) @ A 合并回 base_layer 权重。"""
+    from sora_inject import SoRALinear
+    from train_integration import _set_module_by_path
+    replacements = []
+    for name, module in model.named_modules():
+        if isinstance(module, SoRALinear):
+            with torch.no_grad():
+                gate_diag = module.gate.squeeze(0).to(module.lora_A.dtype)
+                delta_W = (module.lora_B @ torch.diag(gate_diag) @ module.lora_A) * module.scaling
+                module.base_layer.weight.data += delta_W.to(module.base_layer.weight.dtype)
+            replacements.append((name, module.base_layer))
+    for name, base_layer in replacements:
+        _set_module_by_path(model, name, base_layer)
+    logger.info(f"Merged {len(replacements)} SoRA layers into base model.")
+
+
+def _merge_toplora_into_base(model: nn.Module) -> None:
+    """将 TopLoRALinear 近似合并回 base_layer。
+
+    TopLoRA 的 λ(x) = exp(RMSNorm(x @ W_λ)) 是 token-dependent 的，无法精确合并为
+    静态矩阵。这里使用 mean-field 近似：将 λ 视为全 1 向量（RMSNorm 输出均值趋近 0，
+    exp(0) = 1），等价于标准 LoRA 合并 ΔW = scaling * B @ A。
+    这是训练后评测的合理近似——在 RMSNorm 归一化下，λ 的 token 间方差通常较小。
+    """
+    from toplora_inject import TopLoRALinear
+    from train_integration import _set_module_by_path
+    replacements = []
+    for name, module in model.named_modules():
+        if isinstance(module, TopLoRALinear):
+            with torch.no_grad():
+                delta_W = (module.lora_B @ module.lora_A) * module.scaling
+                module.base_layer.weight.data += delta_W.to(module.base_layer.weight.dtype)
+            replacements.append((name, module.base_layer))
+    for name, base_layer in replacements:
+        _set_module_by_path(model, name, base_layer)
+    logger.info(f"Merged {len(replacements)} TopLoRA layers into base model (mean-field approx).")
+
+
+def build_model_and_peft(args, method: str, total_train_steps: Optional[int] = None):
+    """构建 CausalLM 模型并注入对应的 PEFT 模块。
+
+    total_train_steps
+        AdaLoRA（peft>=0.11）要求 ``AdaLoraConfig(total_step=...)`` 在构造时即 >0；
+        由 ``run_sft_training`` 在得到 ``train_loader`` 后传入实际总优化步数。
+    """
     dtype = torch.bfloat16 if args.bf16 else torch.float32
     
     # 强制在单卡模式下使用 device_map="auto"；如果是 DDP 则先放置在分配的 gpu 上。
@@ -225,6 +282,29 @@ def build_model_and_peft(args, method: str):
         # AdaLoRA 特殊处理：使用 HuggingFace 的 AdaLoRA 并同步超参
         if method == "adalora":
             from peft import AdaLoraConfig
+            _ts = total_train_steps
+            if _ts is None:
+                _ts = getattr(args, "adalora_total_steps", None)
+            if _ts is None or int(_ts) < 1:
+                raise ValueError(
+                    "AdaLoRA 需要有效的 total_train_steps（由数据与 batch 决定）。"
+                    "请确保在构造模型前已创建 train_loader 并传入 total_train_steps，"
+                    "或设置 --adalora_total_steps 为正整数。"
+                )
+            _ts = int(_ts)
+            _ti, _tf, _sched_warn = normalize_adalora_schedule(
+                total_steps=_ts,
+                adalora_tinit=int(args.adalora_tinit),
+                adalora_tfinal=int(args.adalora_tfinal),
+            )
+            _dt = max(1, min(int(args.adalora_delta_t), _ts))
+            _adalora_sched_warn = (not dist.is_initialized()) or (dist.get_rank() == 0)
+            if _adalora_sched_warn and _sched_warn is not None:
+                logger.warning(_sched_warn)
+            if _adalora_sched_warn and int(args.adalora_delta_t) != _dt:
+                logger.warning(
+                    f"AdaLoRA deltaT 已按 total_step={_ts} 收紧: {_dt} (was {args.adalora_delta_t})"
+                )
             peft_config = AdaLoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 target_modules=target_modules,
@@ -234,12 +314,13 @@ def build_model_and_peft(args, method: str):
                 lora_alpha=args.lora_alpha,
                 lora_dropout=args.lora_dropout,
                 init_r=args.lora_rank * 2,
-                tinit=args.adalora_tinit,
-                tfinal=args.adalora_tfinal,
-                deltaT=args.adalora_delta_t,
+                tinit=_ti,
+                tfinal=_tf,
+                deltaT=_dt,
                 beta1=0.85,
                 beta2=0.85,
                 orth_reg_weight=0.1,
+                total_step=_ts,
             )
             
         logger.info(f"Initialize {method} adapter from base model with r={args.lora_rank}")
@@ -351,13 +432,7 @@ def run_sft_training(args, method: str):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model, controller, meta = build_model_and_peft(args, method)
-    model.to(device)
-    
-    if method == "evorank":
-        model = DictFeatureClassifier(model)
-    
-    # ======= 加载与预处理数据 =======
+    # ======= 加载与预处理数据（须在 AdaLoRA 建模型前完成，以便计算 total_step）=======
     all_training_dataset = []
     for task in args.sub_task:
         if ":" in task: # e.g. metamath:100000
@@ -370,13 +445,10 @@ def run_sft_training(args, method: str):
         if dist.is_initialized() and dist.get_rank() != 0:
             dist.barrier()
 
-        # 检查数据集是否已在本地缓存，若是则开启离线模式
-        _ds_local = check_local_dataset(args.data_path, cur_task, cache_dir="./datasets")
-        if _ds_local:
-            os.environ["HF_DATASETS_OFFLINE"] = "1"
-        ds = load_dataset(args.data_path, data_dir=cur_task, split=cur_split, cache_dir="./datasets")
-        if _ds_local:
-            os.environ.pop("HF_DATASETS_OFFLINE", None)
+        # 不在此处设置 HF_DATASETS_OFFLINE（理由见上）；另见 hf_cache_utils.load_fxmeng_pissa_split：
+        # Hub 间歇不可达时 datasets 会走「仅缓存」路径并查找 default-data_dir=<task>，而磁盘常见为
+        # default-<hash>（config_name=default），会抛 Couldn't find cache；该 helper 在校验后回退加载。
+        ds = load_fxmeng_pissa_split(args.data_path, cur_task, cur_split, cache_dir="./datasets")
         
         if dist.is_initialized() and dist.get_rank() == 0:
             dist.barrier()
@@ -390,12 +462,25 @@ def run_sft_training(args, method: str):
 
     if dist.is_initialized():
         dist.barrier()
-        
+
+    _n_rows = len(raw_train_datasets)
+    _env_map = os.environ.get("NLG_DATASET_MAP_NUM_PROC")
+    if _env_map is not None:
+        _map_num_proc = max(1, int(_env_map))
+    elif sys.platform == "win32":
+        # Windows：datasets 多进程会 spawn 子进程并各自 import torch/CUDA，
+        # 易触发 WinError 1455（页面文件太小，无法加载 fbgemm/cufft 等 DLL）。
+        _map_num_proc = 1
+    else:
+        _map_num_proc = min(32, max(1, min(_n_rows, os.cpu_count() or 8)))
+    if is_main_process:
+        logger.info(f"Dataset map num_proc={_map_num_proc} (rows={_n_rows}, platform={sys.platform})")
+
     train_dataset = raw_train_datasets.map(
         train_tokenize_function,
         batched=True,
         batch_size=3000,
-        num_proc=32 if is_main_process else 1,
+        num_proc=_map_num_proc if is_main_process else 1,
         remove_columns=raw_train_datasets.column_names,
         load_from_cache_file=True,
         desc="Running tokenizer on train dataset",
@@ -418,6 +503,17 @@ def run_sft_training(args, method: str):
         pin_memory=True,
     )
 
+    total_steps = max(
+        1,
+        len(train_loader) * args.epochs // max(1, args.gradient_accumulation_steps),
+    )
+
+    model, controller, meta = build_model_and_peft(args, method, total_train_steps=total_steps)
+    model.to(device)
+
+    if method == "evorank":
+        model = DictFeatureClassifier(model)
+
     # 抽取 Mini-Validation Set 用于 EvoRank 的适应度评估
     mini_val_batches = []
     if method == "evorank":
@@ -428,23 +524,7 @@ def run_sft_training(args, method: str):
             mini_val_batches.append(batch)
 
     # ======= 定义优化器 =======
-    total_steps = len(train_loader) * args.epochs // args.gradient_accumulation_steps
     warmup_steps = int(total_steps * args.warmup_ratio)
-
-    if method == "adalora":
-        tinit_n, tfinal_n, sched_warn = normalize_adalora_schedule(
-            total_steps=total_steps,
-            adalora_tinit=args.adalora_tinit,
-            adalora_tfinal=args.adalora_tfinal,
-        )
-        inner = unwrap_inner_from_training_model(model)
-        cfg = getattr(inner, "peft_config", {}).get("default", None)
-        if cfg is not None:
-            cfg.tinit = int(tinit_n)
-            cfg.tfinal = int(tfinal_n)
-            cfg.total_step = int(total_steps)
-        if sched_warn is not None and is_main_process:
-            logger.warning(sched_warn)
 
     opt_class = SparseAdamW if method == "sora" else torch.optim.AdamW
     
@@ -559,21 +639,21 @@ def run_sft_training(args, method: str):
                     optimizer.step()
                 if method == "sora" and sparse_optimizer is not None:
                     sparse_optimizer.step()
-                    
-                lr_scheduler.step()
-                if method == "sora" and sparse_optimizer is not None:
-                    sparse_lr_scheduler.step()
-                    
-                optimizer.zero_grad(set_to_none=True)
-                if method == "sora" and sparse_optimizer is not None:
-                    sparse_optimizer.zero_grad(set_to_none=True)
-                    
-                # Huggingface Adalora 预算更新
+
+                # AdaLoRA 需在 zero_grad 之前调用（依赖本步仍存在的 p.grad 统计 IPT）
                 if method == "adalora":
                     model_to_update = model.module if hasattr(model, "module") else model
                     if hasattr(model_to_update, "peft_config") and hasattr(model_to_update, "update_and_allocate"):
                         model_to_update.update_and_allocate(global_step)
-                        
+
+                lr_scheduler.step()
+                if method == "sora" and sparse_optimizer is not None:
+                    sparse_lr_scheduler.step()
+
+                optimizer.zero_grad(set_to_none=True)
+                if method == "sora" and sparse_optimizer is not None:
+                    sparse_optimizer.zero_grad(set_to_none=True)
+
                 global_step += 1
                 
                 if is_main_process and global_step % 10 == 0:
@@ -586,15 +666,22 @@ def run_sft_training(args, method: str):
         model_to_save = model.module if hasattr(model, "module") else model
         if method == "evorank":
             model_to_save = model_to_save.inner
-        
-        # 将 PiSSA 或 LoRA 合并进 base model，以支持 vLLM 直接推理
-        if method in ["lora", "lora_kaiming", "pissa", "flatlora"]:
-            logger.info("Merging adapter into base model...")
-            model_to_save = model_to_save.merge_and_unload()
-        else:
-            logger.warning(f"Method {method} does not natively support merge_and_unload. Saving raw weights.")
-            
+
         os.makedirs(args.output_dir, exist_ok=True)
+
+        if method in ["lora", "lora_kaiming", "pissa", "flatlora", "adalora"]:
+            logger.info("Merging adapter into base model (PEFT merge_and_unload)...")
+            model_to_save = model_to_save.merge_and_unload()
+        elif method == "evorank":
+            logger.info("Merging EvoRank LoRA into base model...")
+            _merge_evorank_into_base(model_to_save)
+        elif method == "sora":
+            logger.info("Merging SoRA into base model...")
+            _merge_sora_into_base(model_to_save)
+        elif method == "toplora":
+            logger.info("Merging TopLoRA into base model...")
+            _merge_toplora_into_base(model_to_save)
+
         model_to_save.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
         

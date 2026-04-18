@@ -14,8 +14,14 @@ Hugging Face 本地缓存路径解析（与仓库内 ``models/``、``datasets/``
 
 from __future__ import annotations
 
+import glob
+import json
+import logging
 import os
+import re
 from typing import List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def hub_roots_for_model_cache(model_cache_dir: str) -> List[str]:
@@ -250,3 +256,131 @@ def check_local_dataset(path: str, name: Optional[str] = None, cache_dir: str = 
             return True
 
     return False
+
+
+def is_fxmeng_pissa_dataset(data_path: str) -> bool:
+    """是否为 Hub 上的 ``fxmeng/pissa-dataset``（用于 datasets 缓存键回退逻辑）。"""
+    norm = data_path.replace("\\", "/").strip().rstrip("/")
+    return norm == "fxmeng/pissa-dataset"
+
+
+def discover_pissa_materialized_arrow_dir(cache_dir: str, task: str) -> Optional[str]:
+    """
+    返回含 ``pissa-dataset-train.arrow`` 且 ``dataset_info.json`` 的下载列表含 ``/<task>/`` 的缓存目录
+    （通常为 ``.../default-*/0.0.0/<revision_hash>/``）。
+    """
+    root = os.path.join(os.path.abspath(cache_dir), "fxmeng___pissa-dataset")
+    if not os.path.isdir(root):
+        return None
+    needle = f"/{task}/"
+    pattern = os.path.join(root, "default-*", "0.0.0", "*", "dataset_info.json")
+    for info_path in glob.glob(pattern):
+        try:
+            with open(info_path, encoding="utf-8") as f:
+                info = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        ck = info.get("download_checksums")
+        if not isinstance(ck, dict):
+            continue
+        if not any(needle in str(k) for k in ck.keys()):
+            continue
+        hdir = os.path.dirname(info_path)
+        train_arrow = os.path.join(hdir, "pissa-dataset-train.arrow")
+        if os.path.isfile(train_arrow):
+            return hdir
+    return None
+
+
+def load_fxmeng_pissa_split_from_arrow(arrow_dir: str, split_spec: str):
+    """
+    从物化的 ``pissa-dataset-{train,test}.arrow`` 读取；``split_spec`` 仅支持
+    ``train``、``train[:N]``、``test``、``test[:N]``（与 ``datasets`` 常用切片字符串一致）。
+    """
+    from datasets import Dataset
+
+    m = re.match(r"^(train|test)(?:\[:(\d+)\])?$", split_spec.strip())
+    if not m:
+        raise ValueError(
+            f"物化 arrow 回退不支持 split={split_spec!r}；请使用 train、train[:N]、test、test[:N]。"
+        )
+    name, n = m.group(1), m.group(2)
+    path = os.path.join(arrow_dir, f"pissa-dataset-{name}.arrow")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"未找到物化数据文件: {path}")
+    ds = Dataset.from_file(path)
+    if n is None:
+        return ds
+    n_int = int(n)
+    return ds.select(range(min(n_int, len(ds))))
+
+
+def pissa_default_disk_cache_matches_task(cache_dir: str, task: str) -> bool:
+    """
+    磁盘上是否存在「config 名为 default-*」的 PiSSA 缓存，且其 ``download_checksums`` 含 ``/<task>/``。
+
+    说明：部分 ``datasets`` 版本在 Hub 不可达时会查找 ``default-data_dir=<task>``，而实际落盘目录为
+    ``default-<hash>``（``dataset_info.json`` 里 ``config_name`` 为 ``default``），导致
+    ``load_dataset(..., data_dir=task)`` 离线失败。此时应改从同目录下的 ``pissa-dataset-train.arrow``
+    物化文件读取（见 ``load_fxmeng_pissa_split`` 回退）。
+    """
+    root = os.path.join(os.path.abspath(cache_dir), "fxmeng___pissa-dataset")
+    if not os.path.isdir(root):
+        return False
+    needle = f"/{task}/"
+    pattern = os.path.join(root, "default-*", "0.0.0", "*", "dataset_info.json")
+    for info_path in glob.glob(pattern):
+        try:
+            with open(info_path, encoding="utf-8") as f:
+                info = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        ck = info.get("download_checksums")
+        if not isinstance(ck, dict):
+            continue
+        if any(needle in str(k) for k in ck.keys()):
+            return True
+    return False
+
+
+def load_fxmeng_pissa_split(
+    data_path: str,
+    data_dir: str,
+    split: str,
+    cache_dir: str = "datasets",
+):
+    """
+    加载 ``fxmeng/pissa-dataset`` 的某个子任务 split。
+
+    当 Hub 不可达且 ``datasets`` 报 ``Couldn't find cache``（含 ``default-data_dir=`` 或仅有
+    ``default-<hash>`` 的离线解析失败）时，若本地存在物化的 ``pissa-dataset-train.arrow`` /
+    ``pissa-dataset-test.arrow``，则从该目录直接 ``Dataset.from_file`` 并应用 ``split`` 切片。
+
+    其它 ``data_path`` 原样委托 ``datasets.load_dataset``。
+    """
+    from datasets import load_dataset
+
+    if not is_fxmeng_pissa_dataset(data_path):
+        return load_dataset(data_path, data_dir=data_dir, split=split, cache_dir=cache_dir)
+    try:
+        return load_dataset(data_path, data_dir=data_dir, split=split, cache_dir=cache_dir)
+    except ValueError as exc:
+        err = str(exc)
+        if "Couldn't find cache" not in err or "fxmeng/pissa-dataset" not in err:
+            raise
+        if not pissa_default_disk_cache_matches_task(cache_dir, data_dir):
+            raise
+        arrow_dir = discover_pissa_materialized_arrow_dir(cache_dir, data_dir)
+        if arrow_dir is None:
+            raise ValueError(
+                f"{err}\n"
+                f"无法在 {os.path.abspath(cache_dir)} 下找到与 data_dir={data_dir!r} 对应的 "
+                f"pissa-dataset-train.arrow（物化回退失败）。"
+            ) from exc
+        logger.warning(
+            "PiSSA 数据集：Hub/缓存解析失败，已从物化 arrow 加载（目录=%s，data_dir=%s，split=%r）。",
+            arrow_dir,
+            data_dir,
+            split,
+        )
+        return load_fxmeng_pissa_split_from_arrow(arrow_dir, split)
