@@ -701,6 +701,7 @@ def peft_factory(
     evorank_max_reallocate_candidates: int = 8,
     evorank_compensation_mode: str = "B",
     toplora_dropout: float = 0.05,
+    toplora_lambda_clamp: float =  3.0,
 ) -> Tuple[nn.Module, Optional[RankEvolutionController], Dict[str, Any]]:
     def _collect_all_linear_target_modules(m: nn.Module) -> List[str]:
         excluded_fragments = (
@@ -944,6 +945,7 @@ def peft_factory(
             r=target_rank,
             lora_alpha=effective_alpha,
             lora_dropout=_toplora_dropout,
+            lambda_clamp=toplora_lambda_clamp,
         )
         effective_dropout_val = float(_toplora_dropout)
 
@@ -2574,6 +2576,21 @@ def parse_args() -> argparse.Namespace:
         help="TopLoRA：dropout 系数（论文默认 0.05）。仅 method=toplora 使用，其他方法忽略。",
     )
     parser.add_argument(
+        "--toplora_lr",
+        type=float,
+        default=None,
+        help="TopLoRA 专用学习率覆盖。TopLoRA 的门控 exp(RMSNorm(x@W_λ)) 在高 lr 长训练下容易爆炸"
+             "（观测 seed=42 从 epoch=4 起 val=0）；官方脚本 lr=1e-4（Qwen2.5-3B + math_10k）。"
+             "None 时若全局 lr>2e-4 自动降为 lr/4（下限 1e-4）。",
+    )
+    parser.add_argument(
+        "--toplora_lambda_clamp",
+        type=float,
+        default=3.0,
+        help="TopLoRA 门控 exp 输入 clamp 上下界 ±C，使 λ∈[e^-C, e^C]，防止 exp 爆炸。"
+             "默认 3.0（λ∈[0.05, 20.09]）。设 0 或负数可关闭（对齐官方原始实现，但有数值风险）。",
+    )
+    parser.add_argument(
         "--max_grad_norm",
         type=float,
         default=None,
@@ -2653,10 +2670,38 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 method_warmup_ratio = float(args.warmup_ratio)
                 method_lr_scheduler_type = "linear"
                 method_lr = float(args.lr)
-                if method == "pissa" and getattr(args, "pissa_lr", None) is not None:
-                    method_lr = float(args.pissa_lr)
-                    if args.is_main_process:
-                        print(f"[pissa] 使用 --pissa_lr={method_lr} 覆盖全局 lr={args.lr}")
+                if method == "toplora":
+                    # TopLoRA 官方脚本 lr=1e-4（Qwen2.5-3B+math_10k），GLUE 8e-4 下观测到崩溃。
+                    # 原因：λ(x) = exp(RMSNorm(x @ W_λ)) 的 exp 非线性在高 lr 长训练下容易爆炸。
+                    if getattr(args, "toplora_lr", None) is not None:
+                        method_lr = float(args.toplora_lr)
+                        if args.is_main_process:
+                            print(f"[toplora] 使用 --toplora_lr={method_lr} 覆盖全局 lr={args.lr}")
+                    elif float(args.lr) > 2e-4:
+                        method_lr = max(float(args.lr) / 4.0, 1e-4)
+                        if args.is_main_process:
+                            print(
+                                f"[toplora] 自动降低学习率: {args.lr} -> {method_lr} "
+                                f"(TopLoRA 门控 exp(·) 在高 lr 长训练下易爆炸；"
+                                f"官方脚本 lr=1e-4；可通过 --toplora_lr 显式覆盖)"
+                            )
+                if method == "pissa":
+                    # PiSSA 官方脚本 lr=2e-5（Llama-2-7b+MetaMath），GLUE 小任务经验值 1e-4~2e-4。
+                    # 原因：PiSSA 的 SVD 初始化使 ||A||,||B|| ~ 7（LoRA 仅 ~0.01 + 0），
+                    # 用与 LoRA 相同 lr 会让 grad_norm 超过 clip 阈值数倍，主成分方向失真。
+                    if getattr(args, "pissa_lr", None) is not None:
+                        method_lr = float(args.pissa_lr)
+                        if args.is_main_process:
+                            print(f"[pissa] 使用 --pissa_lr={method_lr} 覆盖全局 lr={args.lr}")
+                    elif float(args.lr) > 2e-4:
+                        # 全局 lr 偏高时自动降为 lr/4，但下限 1e-4；显式 --pissa_lr 可覆盖该行为
+                        method_lr = max(float(args.lr) / 4.0, 1e-4)
+                        if args.is_main_process:
+                            print(
+                                f"[pissa] 自动降低学习率: {args.lr} -> {method_lr} "
+                                f"(PiSSA 对 lr 敏感，官方 2e-5，本任务 lr>2e-4 时默认 lr/4；"
+                                f"可通过 --pissa_lr 显式覆盖)"
+                            )
                 for seed in seeds:
                     random.seed(seed)
                     np.random.seed(seed)
@@ -2703,6 +2748,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         evorank_max_reallocate_candidates=args.evo_max_reallocate_candidates,
                         evorank_compensation_mode=args.evo_compensation_mode, # 传递评价中使用的补偿策略
                         toplora_dropout=args.toplora_dropout,
+                        toplora_lambda_clamp=args.toplora_lambda_clamp,
                     )
                     # === PiSSA / Flat-LoRA 初始化诊断 ===
                     if args.is_main_process and method in ("pissa", "flatlora"):

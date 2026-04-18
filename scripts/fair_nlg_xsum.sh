@@ -63,4 +63,9 @@ nohup torchrun --nproc_per_node=2 --master_port=29530 \
   --export_csv results_fair_nlg_xsum_ddp.csv \
   > logs/fair_nlg_xsum_ddp.out 2>&1 &
 
-echo "Started fair XSum comparison (BART-large, all methods). Check logs/fair_nlg_xsum_ddp.out"
+XSUM_PID=$!
+echo "Started fair XSum comparison (BART-large, all methods). Check logs/fair_nlg_xsum_ddp.out (pid=$XSUM_PID)"
+echo "When finished, render AdaLoRA-style Table 3 with:"
+echo "  python scripts/generate_nlg_table.py \\
+        --xsum_csv results_fair_nlg_xsum_ddp.csv \\
+        --out_md artifacts/nlg/table3_xsum.md"

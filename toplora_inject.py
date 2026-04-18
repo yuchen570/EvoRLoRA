@@ -33,12 +33,16 @@ class TopSingularValue(nn.Module):
     - W_λ: (d_in, r)，Kaiming fan_out 初始化
     - RMSNorm: 对 r 维做归一化，稳定训练
     - exp: 保证输出严格正值
+    - lambda_clamp: exp 输入 clamp ±C（数值稳定化）。官方实现未 clamp，在高 lr 长训练
+      下观测到 seed 级崩溃（某层 RMSNorm 输出峰值→exp 爆炸→分类头坍缩为常数输出）。
+      设 0/负数可关闭（等价于官方原始实现）。
     """
 
-    def __init__(self, token_dim: int, r: int, dtype=None):
+    def __init__(self, token_dim: int, r: int, dtype=None, lambda_clamp: float = 3.0):
         super().__init__()
         self.r = r
         self.token_dim = token_dim
+        self.lambda_clamp = float(lambda_clamp)
         self.weight = nn.Parameter(torch.empty((token_dim, r), dtype=dtype))
         self.rms_norm = nn.RMSNorm([r])
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5), mode="fan_out")
@@ -46,6 +50,9 @@ class TopSingularValue(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = x @ self.weight
         weight = self.rms_norm(weight)
+        if self.lambda_clamp > 0:
+            # λ ∈ [e^-C, e^C]，默认 C=3.0 → λ ∈ [0.05, 20.09]，足以保留 token-wise 缩放表达力
+            weight = weight.clamp(min=-self.lambda_clamp, max=self.lambda_clamp)
         weight = torch.exp(weight)
         return weight
 
@@ -66,6 +73,7 @@ class TopLoRALinear(nn.Module):
         r: int,
         lora_alpha: float,
         lora_dropout: float = 0.05,
+        lambda_clamp: float = 3.0,
     ):
         super().__init__()
         self.base_layer = base_layer
@@ -87,7 +95,7 @@ class TopLoRALinear(nn.Module):
         self.lora_B = nn.Parameter(torch.zeros(d_out, r))
 
         # TopLoRA 核心: token-wise singular value gating
-        self.lora_lambda = TopSingularValue(token_dim=d_in, r=r)
+        self.lora_lambda = TopSingularValue(token_dim=d_in, r=r, lambda_clamp=lambda_clamp)
 
         # 初始化: A 使用 Kaiming，B 清零（保证初始 delta=0）
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
@@ -112,6 +120,7 @@ def inject_toplora(
     r: int,
     lora_alpha: float,
     lora_dropout: float = 0.05,
+    lambda_clamp: float = 3.0,
 ) -> None:
     """将命中后缀的 nn.Linear 替换为 TopLoRALinear。
 
@@ -155,6 +164,7 @@ def inject_toplora(
             r=r,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
+            lambda_clamp=lambda_clamp,
         ).to(base_linear.weight.device)
         _set_module_by_path(model, name, wrapped)
 

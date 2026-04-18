@@ -63,4 +63,9 @@ nohup torchrun --nproc_per_node=2 --master_port=29520 \
   --export_csv results_fair_nlg_cnndm_ddp.csv \
   > logs/fair_nlg_cnndm_ddp.out 2>&1 &
 
-echo "Started fair CNN/DailyMail comparison (BART-large, all methods). Check logs/fair_nlg_cnndm_ddp.out"
+CNN_PID=$!
+echo "Started fair CNN/DailyMail comparison (BART-large, all methods). Check logs/fair_nlg_cnndm_ddp.out (pid=$CNN_PID)"
+echo "When finished, render AdaLoRA-style Table 3 with:"
+echo "  python scripts/generate_nlg_table.py \\
+        --cnndm_csv results_fair_nlg_cnndm_ddp.csv \\
+        --out_md artifacts/nlg/table3_cnndm.md"

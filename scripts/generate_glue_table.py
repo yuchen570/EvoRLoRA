@@ -1,7 +1,27 @@
+import argparse
 import os
 import csv
 from collections import defaultdict
 import glob
+
+# 与 ``fair_glue_deberta_common.sh`` 的 ``--export_csv results_fair_glue_deberta_${TASK}.csv`` 对齐
+GLUE_TASK_CSV = tuple(f"results_fair_glue_deberta_{t}.csv" for t in (
+    "cola", "mnli", "mrpc", "qqp", "qnli", "rte", "sst2", "stsb",
+))
+# 历史一键脚本导出的合并 CSV（若仍存在则优先读取）
+LEGACY_MERGED_CSVS = (
+    "results_fair_glue_deberta_large_ddp.csv",
+    "results_fair_glue_deberta_small_ddp.csv",
+)
+
+
+def _discover_glue_csvs() -> list[str]:
+    legacy = [f for f in LEGACY_MERGED_CSVS if os.path.exists(f)]
+    if legacy:
+        return legacy
+    per_task = [f for f in GLUE_TASK_CSV if os.path.exists(f)]
+    return per_task
+
 
 def format_metric(val):
     """格式化指标值为百分比字符串 (保留两位小数)。"""
@@ -15,14 +35,20 @@ def format_metric(val):
         return str(val)
 
 def main():
-    # 查找所有可能的 CSV 结果文件
+    ap = argparse.ArgumentParser(description="由 fair GLUE CSV 生成 Markdown 风格 GLUE 总表（打印到 stdout，可选写入文件）。")
+    ap.add_argument("--out_md", default=None, help="若提供，将表格写入该路径（UTF-8）。")
+    args = ap.parse_args()
+
     csv_files = glob.glob("artifacts/*.csv") + glob.glob("*.csv")
-    target_csvs = ["results_fair_glue_deberta_large_ddp.csv", "results_fair_glue_deberta_small_ddp.csv"]
-    valid_csvs = [f for f in target_csvs if os.path.exists(f)]
-    
+    valid_csvs = _discover_glue_csvs()
+
     if not valid_csvs:
-        print(f"未找到任何核心结果文件 {target_csvs}。请先运行测试脚本。")
-        print("当前存在的 CSV 文件:", csv_files)
+        print("未找到 GLUE 公平对比 CSV。请先运行：")
+        print("  bash scripts/fair_glue_deberta.sh")
+        print("或单任务： bash scripts/fair_glue_deberta_sst2.sh 等。")
+        print("期望文件名（每任务一个）：", list(GLUE_TASK_CSV))
+        print("或历史合并文件：", list(LEGACY_MERGED_CSVS))
+        print("当前目录下已有的 CSV：", sorted(set(csv_files))[:40])
         return
 
     # 数据结构: data[method][task] = {指标键: 指标值}
@@ -65,9 +91,9 @@ def main():
         if m not in present_methods:
             present_methods.append(m)
 
-    # 打印表头 (完全对齐用户要求的 UI 格式)
-    print("| Method | # Params | MNLI (m/mm) | SST-2 (Acc) | CoLA (Mcc) | QQP (Acc/F1) | QNLI (Acc) | RTE (Acc) | MRPC (Acc) | STS-B (Corr) | All (Ave.) |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|")
+    lines: list[str] = []
+    lines.append("| Method | # Params | MNLI (m/mm) | SST-2 (Acc) | CoLA (Mcc) | QQP (Acc/F1) | QNLI (Acc) | RTE (Acc) | MRPC (Acc) | STS-B (Corr) | All (Ave.) |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
 
     for method in present_methods:
         c_params = params.get(method, "-")
@@ -143,9 +169,22 @@ def main():
         else:
             avg_str = "-"
 
-        # 打印生成的表格行
         row_str = f"| {method} | {c_params} | {mnli_str} | {sst2_str} | {cola_str} | {qqp_str} | {qnli_str} | {rte_str} | {mrpc_str} | {stsb_str} | {avg_str} |"
-        print(row_str)
+        lines.append(row_str)
+
+    lines.append("")
+    lines.append(f"> 数据来源: `{', '.join(valid_csvs)}`")
+    text = "\n".join(lines)
+    print(text)
+    if args.out_md:
+        out_abs = os.path.abspath(args.out_md)
+        out_dir = os.path.dirname(out_abs)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(args.out_md, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+        print(f"\nWrote {args.out_md}")
+
 
 if __name__ == "__main__":
     main()

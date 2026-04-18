@@ -101,10 +101,12 @@ run_task() {
     --lambda_c 0.0 \
     --expand_init_mode gradient \
     --evo_compensation_mode B \
-    --mini_val_k 8 \
-    --evo_alpha_u 1.0 \
-    --evo_p_p 0.05 \
-    --evo_H_p 4 \
+    --mini_val_k 16 \
+    --evo_alpha_u 1.5 \
+    --evo_p_g 0.75 \
+    --evo_p_p 0.03 \
+    --evo_H_p 6 \
+    --evo_cooldown_steps 5 \
     --evo_max_reallocate_candidates 16 \
     --verify_n_samples 0 \
     --seed_list $SEEDS \
