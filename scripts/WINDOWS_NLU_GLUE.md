@@ -1,4 +1,4 @@
-# Windows 单卡 NLU（GLUE）Python 完整指令
+# Windows & Linux 单卡 NLU（GLUE）Python 完整指令
 
 与 [`fair_glue_deberta_common.sh`](fair_glue_deberta_common.sh) 及各 `fair_glue_deberta_<task>.sh` **超参与 batch 对齐**；在**仓库根目录**执行（需存在 `run_benchmark.py`）。此处为**单进程前台**运行：不用 `torchrun`、不设 `master_port`、不写后台日志文件。
 
@@ -17,13 +17,15 @@
 - 协议：`controlled_fair`，`protocol_dropout=0.05`
 - 模型：`microsoft/deberta-v3-base`，`target_rank=8`，`module_preset=default`，`flatlora_rho=0.05`
 - 训练：`warmup_ratio=0.06`，`max_grad_norm=1.0`，`batch_size=32`
-- EvoRank 等：`lambda_c=0`，`expand_init_mode=gradient`，`evo_compensation_mode=B`，`mini_val_k=8`，`evo_alpha_u=1.0`，`evo_p_p=0.05`，`evo_H_p=4`，`evo_max_reallocate_candidates=16`，`verify_n_samples=0`
+- EvoRank 等：`lambda_c=0.0`，`expand_init_mode=gradient`，`evo_compensation_mode=B`，`mini_val_k=16`，`evo_alpha_u=1.5`，`evo_p_g=0.75`，`evo_p_p=0.03`，`evo_H_p=6`，`evo_cooldown_steps=5`，`evo_max_reallocate_candidates=16`，`verify_n_samples=0`
 - 种子：`0 21 42 81 100`
 - SORA：`--sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4`
 
-## PowerShell 模板
+## 指令模板 (PowerShell & Bash)
 
 将 `<TASK>` 及下表中的占位符替换为实际值：
+
+#### PowerShell (Windows)
 
 ```powershell
 $env:CUDA_VISIBLE_DEVICES="0"   # 可选
@@ -47,11 +49,42 @@ python run_benchmark.py `
   --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 `
   --lambda_c 0.0 `
   --expand_init_mode gradient --evo_compensation_mode B `
-  --mini_val_k 8 --evo_alpha_u 1.0 --evo_p_p 0.05 --evo_H_p 4 --evo_max_reallocate_candidates 16 `
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 `
   --verify_n_samples 0 `
   --seed_list 0 21 42 81 100 `
   --log_dir runs/fair_glue_deberta_<TASK> `
   --output_dir artifacts `
+  --export_csv results_fair_glue_deberta_<TASK>.csv
+```
+
+#### Bash (Linux)
+
+```bash
+# 可选
+CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
+  --methods lora adalora evorank sora toplora flatlora pissa \
+  --comparison_protocol controlled_fair --protocol_dropout 0.05 \
+  --module_preset default --flatlora_rho 0.05 \
+  --task_list <TASK> \
+  --model_list microsoft/deberta-v3-base \
+  --target_rank 8 \
+  --lora_alpha <ALPHA> \
+  --epochs <EPOCHS> \
+  --batch_size 32 \
+  --max_length <MAX_LEN> \
+  --lr <LR> \
+  --warmup_ratio 0.06 \
+  --weight_decay <WD> \
+  --max_grad_norm 1.0 \
+  --adalora_tinit <TINIT> --adalora_tfinal <TFINAL> --adalora_delta_t <DELTA_T> --adalora_orth_reg_weight <ORTH> \
+  --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 \
+  --lambda_c 0.0 \
+  --expand_init_mode gradient --evo_compensation_mode B \
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 \
+  --verify_n_samples 0 \
+  --seed_list 0 21 42 81 100 \
+  --log_dir runs/fair_glue_deberta_<TASK> \
+  --output_dir artifacts \
   --export_csv results_fair_glue_deberta_<TASK>.csv
 ```
 
@@ -76,6 +109,8 @@ python run_benchmark.py `
 
 ### CoLA（[`fair_glue_deberta_cola.sh`](fair_glue_deberta_cola.sh)）
 
+#### PowerShell (Windows)
+
 ```powershell
 $env:CUDA_VISIBLE_DEVICES="0"
 
@@ -98,7 +133,7 @@ python run_benchmark.py `
   --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 `
   --lambda_c 0.0 `
   --expand_init_mode gradient --evo_compensation_mode B `
-  --mini_val_k 8 --evo_alpha_u 1.0 --evo_p_p 0.05 --evo_H_p 4 --evo_max_reallocate_candidates 16 `
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 `
   --verify_n_samples 0 `
   --seed_list 0 21 42 81 100 `
   --log_dir runs/fair_glue_deberta_cola `
@@ -106,7 +141,39 @@ python run_benchmark.py `
   --export_csv results_fair_glue_deberta_cola.csv
 ```
 
+#### Bash (Linux)
+
+```bash
+CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
+  --methods lora adalora evorank sora toplora flatlora pissa \
+  --comparison_protocol controlled_fair --protocol_dropout 0.05 \
+  --module_preset default --flatlora_rho 0.05 \
+  --task_list cola \
+  --model_list microsoft/deberta-v3-base \
+  --target_rank 8 \
+  --lora_alpha 32 \
+  --epochs 25 \
+  --batch_size 32 \
+  --max_length 64 \
+  --lr 8e-4 \
+  --warmup_ratio 0.06 \
+  --weight_decay 0.0 \
+  --max_grad_norm 1.0 \
+  --adalora_tinit 800 --adalora_tfinal 3500 --adalora_delta_t 10 --adalora_orth_reg_weight 0.1 \
+  --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 \
+  --lambda_c 0.0 \
+  --expand_init_mode gradient --evo_compensation_mode B \
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 \
+  --verify_n_samples 0 \
+  --seed_list 0 21 42 81 100 \
+  --log_dir runs/fair_glue_deberta_cola \
+  --output_dir artifacts \
+  --export_csv results_fair_glue_deberta_cola.csv
+```
+
 ### MNLI（[`fair_glue_deberta_mnli.sh`](fair_glue_deberta_mnli.sh)）
+
+#### PowerShell (Windows)
 
 ```powershell
 $env:CUDA_VISIBLE_DEVICES="0"
@@ -130,7 +197,7 @@ python run_benchmark.py `
   --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 `
   --lambda_c 0.0 `
   --expand_init_mode gradient --evo_compensation_mode B `
-  --mini_val_k 8 --evo_alpha_u 1.0 --evo_p_p 0.05 --evo_H_p 4 --evo_max_reallocate_candidates 16 `
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 `
   --verify_n_samples 0 `
   --seed_list 0 21 42 81 100 `
   --log_dir runs/fair_glue_deberta_mnli `
@@ -138,7 +205,39 @@ python run_benchmark.py `
   --export_csv results_fair_glue_deberta_mnli.csv
 ```
 
+#### Bash (Linux)
+
+```bash
+CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
+  --methods lora adalora evorank sora toplora flatlora pissa \
+  --comparison_protocol controlled_fair --protocol_dropout 0.05 \
+  --module_preset default --flatlora_rho 0.05 \
+  --task_list mnli \
+  --model_list microsoft/deberta-v3-base \
+  --target_rank 8 \
+  --lora_alpha 16 \
+  --epochs 7 \
+  --batch_size 32 \
+  --max_length 256 \
+  --lr 5e-4 \
+  --warmup_ratio 0.06 \
+  --weight_decay 0.0 \
+  --max_grad_norm 1.0 \
+  --adalora_tinit 8000 --adalora_tfinal 50000 --adalora_delta_t 100 --adalora_orth_reg_weight 0.1 \
+  --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 \
+  --lambda_c 0.0 \
+  --expand_init_mode gradient --evo_compensation_mode B \
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 \
+  --verify_n_samples 0 \
+  --seed_list 0 21 42 81 100 \
+  --log_dir runs/fair_glue_deberta_mnli \
+  --output_dir artifacts \
+  --export_csv results_fair_glue_deberta_mnli.csv
+```
+
 ### MRPC（[`fair_glue_deberta_mrpc.sh`](fair_glue_deberta_mrpc.sh)）
+
+#### PowerShell (Windows)
 
 ```powershell
 $env:CUDA_VISIBLE_DEVICES="0"
@@ -162,7 +261,7 @@ python run_benchmark.py `
   --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 `
   --lambda_c 0.0 `
   --expand_init_mode gradient --evo_compensation_mode B `
-  --mini_val_k 8 --evo_alpha_u 1.0 --evo_p_p 0.05 --evo_H_p 4 --evo_max_reallocate_candidates 16 `
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 `
   --verify_n_samples 0 `
   --seed_list 0 21 42 81 100 `
   --log_dir runs/fair_glue_deberta_mrpc `
@@ -170,7 +269,39 @@ python run_benchmark.py `
   --export_csv results_fair_glue_deberta_mrpc.csv
 ```
 
+#### Bash (Linux)
+
+```bash
+CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
+  --methods lora adalora evorank sora toplora flatlora pissa \
+  --comparison_protocol controlled_fair --protocol_dropout 0.05 \
+  --module_preset default --flatlora_rho 0.05 \
+  --task_list mrpc \
+  --model_list microsoft/deberta-v3-base \
+  --target_rank 8 \
+  --lora_alpha 32 \
+  --epochs 30 \
+  --batch_size 32 \
+  --max_length 320 \
+  --lr 1e-3 \
+  --warmup_ratio 0.06 \
+  --weight_decay 0.01 \
+  --max_grad_norm 1.0 \
+  --adalora_tinit 600 --adalora_tfinal 1800 --adalora_delta_t 1 --adalora_orth_reg_weight 0.1 \
+  --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 \
+  --lambda_c 0.0 \
+  --expand_init_mode gradient --evo_compensation_mode B \
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 \
+  --verify_n_samples 0 \
+  --seed_list 0 21 42 81 100 \
+  --log_dir runs/fair_glue_deberta_mrpc \
+  --output_dir artifacts \
+  --export_csv results_fair_glue_deberta_mrpc.csv
+```
+
 ### QQP（[`fair_glue_deberta_qqp.sh`](fair_glue_deberta_qqp.sh)）
+
+#### PowerShell (Windows)
 
 ```powershell
 $env:CUDA_VISIBLE_DEVICES="0"
@@ -194,7 +325,7 @@ python run_benchmark.py `
   --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 `
   --lambda_c 0.0 `
   --expand_init_mode gradient --evo_compensation_mode B `
-  --mini_val_k 8 --evo_alpha_u 1.0 --evo_p_p 0.05 --evo_H_p 4 --evo_max_reallocate_candidates 16 `
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 `
   --verify_n_samples 0 `
   --seed_list 0 21 42 81 100 `
   --log_dir runs/fair_glue_deberta_qqp `
@@ -202,7 +333,39 @@ python run_benchmark.py `
   --export_csv results_fair_glue_deberta_qqp.csv
 ```
 
+#### Bash (Linux)
+
+```bash
+CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
+  --methods lora adalora evorank sora toplora flatlora pissa \
+  --comparison_protocol controlled_fair --protocol_dropout 0.05 \
+  --module_preset default --flatlora_rho 0.05 \
+  --task_list qqp \
+  --model_list microsoft/deberta-v3-base \
+  --target_rank 8 \
+  --lora_alpha 16 \
+  --epochs 5 \
+  --batch_size 32 \
+  --max_length 320 \
+  --lr 8e-4 \
+  --warmup_ratio 0.06 \
+  --weight_decay 0.01 \
+  --max_grad_norm 1.0 \
+  --adalora_tinit 8000 --adalora_tfinal 25000 --adalora_delta_t 100 --adalora_orth_reg_weight 0.1 \
+  --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 \
+  --lambda_c 0.0 \
+  --expand_init_mode gradient --evo_compensation_mode B \
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 \
+  --verify_n_samples 0 \
+  --seed_list 0 21 42 81 100 \
+  --log_dir runs/fair_glue_deberta_qqp \
+  --output_dir artifacts \
+  --export_csv results_fair_glue_deberta_qqp.csv
+```
+
 ### QNLI（[`fair_glue_deberta_qnli.sh`](fair_glue_deberta_qnli.sh)）
+
+#### PowerShell (Windows)
 
 ```powershell
 $env:CUDA_VISIBLE_DEVICES="0"
@@ -226,7 +389,7 @@ python run_benchmark.py `
   --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 `
   --lambda_c 0.0 `
   --expand_init_mode gradient --evo_compensation_mode B `
-  --mini_val_k 8 --evo_alpha_u 1.0 --evo_p_p 0.05 --evo_H_p 4 --evo_max_reallocate_candidates 16 `
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 `
   --verify_n_samples 0 `
   --seed_list 0 21 42 81 100 `
   --log_dir runs/fair_glue_deberta_qnli `
@@ -234,7 +397,39 @@ python run_benchmark.py `
   --export_csv results_fair_glue_deberta_qnli.csv
 ```
 
+#### Bash (Linux)
+
+```bash
+CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
+  --methods lora adalora evorank sora toplora flatlora pissa \
+  --comparison_protocol controlled_fair --protocol_dropout 0.05 \
+  --module_preset default --flatlora_rho 0.05 \
+  --task_list qnli \
+  --model_list microsoft/deberta-v3-base \
+  --target_rank 8 \
+  --lora_alpha 32 \
+  --epochs 5 \
+  --batch_size 32 \
+  --max_length 512 \
+  --lr 5e-4 \
+  --warmup_ratio 0.06 \
+  --weight_decay 0.01 \
+  --max_grad_norm 1.0 \
+  --adalora_tinit 2000 --adalora_tfinal 8000 --adalora_delta_t 100 --adalora_orth_reg_weight 0.1 \
+  --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 \
+  --lambda_c 0.0 \
+  --expand_init_mode gradient --evo_compensation_mode B \
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 \
+  --verify_n_samples 0 \
+  --seed_list 0 21 42 81 100 \
+  --log_dir runs/fair_glue_deberta_qnli \
+  --output_dir artifacts \
+  --export_csv results_fair_glue_deberta_qnli.csv
+```
+
 ### RTE（[`fair_glue_deberta_rte.sh`](fair_glue_deberta_rte.sh)）
+
+#### PowerShell (Windows)
 
 ```powershell
 $env:CUDA_VISIBLE_DEVICES="0"
@@ -258,7 +453,7 @@ python run_benchmark.py `
   --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 `
   --lambda_c 0.0 `
   --expand_init_mode gradient --evo_compensation_mode B `
-  --mini_val_k 8 --evo_alpha_u 1.0 --evo_p_p 0.05 --evo_H_p 4 --evo_max_reallocate_candidates 16 `
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 `
   --verify_n_samples 0 `
   --seed_list 0 21 42 81 100 `
   --log_dir runs/fair_glue_deberta_rte `
@@ -266,7 +461,39 @@ python run_benchmark.py `
   --export_csv results_fair_glue_deberta_rte.csv
 ```
 
+#### Bash (Linux)
+
+```bash
+CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
+  --methods lora adalora evorank sora toplora flatlora pissa \
+  --comparison_protocol controlled_fair --protocol_dropout 0.05 \
+  --module_preset default --flatlora_rho 0.05 \
+  --task_list rte \
+  --model_list microsoft/deberta-v3-base \
+  --target_rank 8 \
+  --lora_alpha 32 \
+  --epochs 50 \
+  --batch_size 32 \
+  --max_length 320 \
+  --lr 1.2e-3 \
+  --warmup_ratio 0.06 \
+  --weight_decay 0.01 \
+  --max_grad_norm 1.0 \
+  --adalora_tinit 600 --adalora_tfinal 1800 --adalora_delta_t 1 --adalora_orth_reg_weight 0.3 \
+  --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 \
+  --lambda_c 0.0 \
+  --expand_init_mode gradient --evo_compensation_mode B \
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 \
+  --verify_n_samples 0 \
+  --seed_list 0 21 42 81 100 \
+  --log_dir runs/fair_glue_deberta_rte \
+  --output_dir artifacts \
+  --export_csv results_fair_glue_deberta_rte.csv
+```
+
 ### SST-2（[`fair_glue_deberta_sst2.sh`](fair_glue_deberta_sst2.sh)）
+
+#### PowerShell (Windows)
 
 ```powershell
 $env:CUDA_VISIBLE_DEVICES="0"
@@ -290,7 +517,7 @@ python run_benchmark.py `
   --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 `
   --lambda_c 0.0 `
   --expand_init_mode gradient --evo_compensation_mode B `
-  --mini_val_k 8 --evo_alpha_u 1.0 --evo_p_p 0.05 --evo_H_p 4 --evo_max_reallocate_candidates 16 `
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 `
   --verify_n_samples 0 `
   --seed_list 0 21 42 81 100 `
   --log_dir runs/fair_glue_deberta_sst2 `
@@ -298,7 +525,39 @@ python run_benchmark.py `
   --export_csv results_fair_glue_deberta_sst2.csv
 ```
 
+#### Bash (Linux)
+
+```bash
+CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
+  --methods lora adalora evorank sora toplora flatlora pissa \
+  --comparison_protocol controlled_fair --protocol_dropout 0.05 \
+  --module_preset default --flatlora_rho 0.05 \
+  --task_list sst2 \
+  --model_list microsoft/deberta-v3-base \
+  --target_rank 8 \
+  --lora_alpha 16 \
+  --epochs 24 \
+  --batch_size 32 \
+  --max_length 128 \
+  --lr 8e-4 \
+  --warmup_ratio 0.06 \
+  --weight_decay 0.01 \
+  --max_grad_norm 1.0 \
+  --adalora_tinit 6000 --adalora_tfinal 22000 --adalora_delta_t 100 --adalora_orth_reg_weight 0.1 \
+  --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 \
+  --lambda_c 0.0 \
+  --expand_init_mode gradient --evo_compensation_mode B \
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 \
+  --verify_n_samples 0 \
+  --seed_list 0 21 42 81 100 \
+  --log_dir runs/fair_glue_deberta_sst2 \
+  --output_dir artifacts \
+  --export_csv results_fair_glue_deberta_sst2.csv
+```
+
 ### STS-B（[`fair_glue_deberta_stsb.sh`](fair_glue_deberta_stsb.sh)）
+
+#### PowerShell (Windows)
 
 ```powershell
 $env:CUDA_VISIBLE_DEVICES="0"
@@ -322,11 +581,41 @@ python run_benchmark.py `
   --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 `
   --lambda_c 0.0 `
   --expand_init_mode gradient --evo_compensation_mode B `
-  --mini_val_k 8 --evo_alpha_u 1.0 --evo_p_p 0.05 --evo_H_p 4 --evo_max_reallocate_candidates 16 `
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 `
   --verify_n_samples 0 `
   --seed_list 0 21 42 81 100 `
   --log_dir runs/fair_glue_deberta_stsb `
   --output_dir artifacts `
+  --export_csv results_fair_glue_deberta_stsb.csv
+```
+
+#### Bash (Linux)
+
+```bash
+CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
+  --methods lora adalora evorank sora toplora flatlora pissa \
+  --comparison_protocol controlled_fair --protocol_dropout 0.05 \
+  --module_preset default --flatlora_rho 0.05 \
+  --task_list stsb \
+  --model_list microsoft/deberta-v3-base \
+  --target_rank 8 \
+  --lora_alpha 32 \
+  --epochs 25 \
+  --batch_size 32 \
+  --max_length 128 \
+  --lr 2.2e-3 \
+  --warmup_ratio 0.06 \
+  --weight_decay 0.1 \
+  --max_grad_norm 1.0 \
+  --adalora_tinit 800 --adalora_tfinal 2000 --adalora_delta_t 10 --adalora_orth_reg_weight 0.3 \
+  --sora_sparse_lambda 10 --sora_sparse_lambda_2 3e-4 \
+  --lambda_c 0.0 \
+  --expand_init_mode gradient --evo_compensation_mode B \
+  --mini_val_k 16 --evo_alpha_u 1.5 --evo_p_g 0.75 --evo_p_p 0.03 --evo_H_p 6 --evo_cooldown_steps 5 --evo_max_reallocate_candidates 16 \
+  --verify_n_samples 0 \
+  --seed_list 0 21 42 81 100 \
+  --log_dir runs/fair_glue_deberta_stsb \
+  --output_dir artifacts \
   --export_csv results_fair_glue_deberta_stsb.csv
 ```
 
