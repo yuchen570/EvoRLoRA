@@ -682,6 +682,13 @@ def run_sft_training(args, method: str):
             logger.info("Merging TopLoRA into base model...")
             _merge_toplora_into_base(model_to_save)
 
+        # 将模型移到 CPU 并释放 GPU 显存，防止 save_pretrained 期间 OOM
+        # （save_pretrained 会在 CPU 上创建序列化缓冲区；若模型仍在 GPU，
+        #   则 GPU + CPU 同时持有权重，峰值内存翻倍）
+        model_to_save.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         model_to_save.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
         
