@@ -24,7 +24,7 @@
 # 最终 scripts/summarize_nlg_pissa.py 会打印 Table 2 风格汇总。
 # ============================================================================
 
-set -e
+set -euo pipefail
 mkdir -p logs runs artifacts/nlg
 
 # ========================= 配置 =========================
@@ -77,7 +77,7 @@ for MODEL in "${MODELS[@]}"; do
             TAG="${MODEL_SHORT}_${TRAIN_SUB_TASK}_${METHOD}_seed${SEED}"
             TAG=${TAG//\//_}
             TAG=${TAG//:/_}
-            OUTPUT_DIR="artifacts/nlg/${TAG}"
+            OUTPUT_DIR="$(pwd)/artifacts/nlg/${TAG}"
             LOG_TAG="nlg_${MODEL_SHORT}_${TASK_NAME}_${METHOD}"
 
             torchrun --nproc_per_node=2 --master_port=29505 \

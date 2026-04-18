@@ -707,6 +707,11 @@ def run_sft_training(args, method: str):
         with open(os.path.join(args.output_dir, "benchmark_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
+    # 无论是否 is_main_process，DDP 模式下都在结尾增加全量同步屏障
+    # 目的是强行阻止 Rank 1 提前跳出训练函数并销毁 context，导致 torchrun 异常
+    if dist.is_initialized():
+        dist.barrier()
+
 def main():
     parser = argparse.ArgumentParser()
     # 基础配置

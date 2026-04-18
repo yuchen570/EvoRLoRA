@@ -203,9 +203,10 @@ def _extract_code(completion: str) -> str:
 
 def _generate_vllm(model_dir: str, prompts: Sequence[str], max_new_tokens: int, tp: int) -> List[str]:
     from vllm import LLM, SamplingParams  # type: ignore
+    model_dir_abs = os.path.abspath(model_dir)
 
     sp = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=max_new_tokens)
-    llm = LLM(model=model_dir, tensor_parallel_size=max(1, tp), dtype="bfloat16")
+    llm = LLM(model=model_dir_abs, tensor_parallel_size=max(1, tp), dtype="bfloat16")
     outs = llm.generate(list(prompts), sp)
     return [o.outputs[0].text for o in outs]
 
@@ -285,12 +286,17 @@ PROMPT_TEMPLATE = (
 
 
 def _load_test_dataset(data_path: str, sub_tasks: Sequence[str], split: str, cache_dir: str):
+    # 使用 hf_cache_utils 中带离线回退逻辑的函数，防止 datasets API 解析离线缓存失败
+    import sys
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+    from hf_cache_utils import load_fxmeng_pissa_split
+
     parts = []
     for t in sub_tasks:
         try:
-            ds = load_dataset(data_path, data_dir=t, split=split, cache_dir=cache_dir)
+            ds = load_fxmeng_pissa_split(data_path, data_dir=t, split=split, cache_dir=cache_dir)
         except Exception as e:
-            logger.warning(f"load_dataset({data_path}, data_dir={t}, split={split}) 失败：{e!r}；跳过")
+            logger.warning(f"load_fxmeng_pissa_split({data_path}, data_dir={t}, split={split}) 失败：{e!r}；跳过")
             continue
         parts.append(ds)
     if not parts:
