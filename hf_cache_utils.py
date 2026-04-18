@@ -73,9 +73,24 @@ def resolve_pretrained_model_source(model_name_or_path: str, model_cache_dir: st
         - 找到本地快照 → (快照目录路径, True)
         - 未找到 → (原始 model_name_or_path, False)
     """
-    # 1. 如果已经是本地目录路径，直接使用
+    # 1. 如果已经是本地目录路径
     if os.path.isdir(model_name_or_path):
-        return model_name_or_path, True
+        root = os.path.abspath(model_name_or_path)
+        if os.path.isfile(os.path.join(root, "config.json")):
+            return root, True
+        # Hub 缓存根目录 ``.../models--org--name/`` 的 config 在 ``snapshots/<rev>/`` 下
+        base = os.path.basename(root.rstrip(os.sep))
+        if base.startswith("models--"):
+            snap_root = os.path.join(root, "snapshots")
+            if os.path.isdir(snap_root):
+                try:
+                    for name in sorted(os.listdir(snap_root)):
+                        cand = os.path.join(snap_root, name)
+                        if os.path.isdir(cand) and os.path.isfile(os.path.join(cand, "config.json")):
+                            return cand, True
+                except OSError:
+                    pass
+        return root, True
 
     slug = model_name_or_path.replace("/", "--")
     try:

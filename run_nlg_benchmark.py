@@ -203,7 +203,9 @@ def build_model_and_peft(args, method: str):
         if method == "lora":
             init_weights = True
         elif method == "lora_kaiming":
-            init_weights = "kaiming"
+            # PEFT 不接受字符串 "kaiming"；init_lora_weights=True 即官方 LoRA 默认：
+            # lora_A 为 Kaiming uniform、lora_B 全零（与 microsoft/LoRA loralib 一致）。
+            init_weights = True
         elif method == "pissa":
             init_weights = getattr(args, "pissa_init_method", "pissa_niter_16") 
         elif method == "adalora":
@@ -287,7 +289,7 @@ def build_model_and_peft(args, method: str):
             lora_dropout=args.lora_dropout,
         )
     elif method == "flatlora":
-        # Flat-LoRA 基础是 LoRA（Kaiming）
+        # Flat-LoRA 基础是标准 LoRA；PEFT 的 True 即 Kaiming A + 零 B。
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             target_modules=target_modules,
@@ -295,7 +297,7 @@ def build_model_and_peft(args, method: str):
             r=args.lora_rank,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            init_lora_weights="kaiming",
+            init_lora_weights=True,
         )
         model = get_peft_model(model, peft_config)
     else:
