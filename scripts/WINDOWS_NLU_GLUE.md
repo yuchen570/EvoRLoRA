@@ -154,6 +154,8 @@ CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
   --lora_alpha 32 \
   --epochs 25 \
   --batch_size 32 \
+  --dataloader_num_workers 8 \
+  --pin_memory \
   --max_length 64 \
   --lr 8e-4 \
   --warmup_ratio 0.06 \
