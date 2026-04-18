@@ -140,6 +140,7 @@ def train_evo_lora_step(
     random_seed: Optional[int] = None,
     max_grad_norm: Optional[float] = None,
     include_noop_candidate: bool = True,
+    stop_step: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     论文 Alg. 1：双时间尺度训练步。
@@ -281,6 +282,10 @@ def train_evo_lora_step(
     should_evolve = (
         step >= warmup_steps and T_es > 0 and step % T_es == 0
     )
+    # 后期冻结（stop_step 之后只做权重优化）：用于缓解小数据集后期过拟合时 val_loss 信号
+    # 噪声过大导致的误剪枝（对标 AdaLoRA 的 tfinal 机制）。
+    if stop_step is not None and step >= int(stop_step):
+        should_evolve = False
     did_cache_stats = False
     if should_evolve:
         # 在梯度裁剪之前缓存 g_ℓ 与分量分数，对应 ∂L/∂ΔW（与论文一致）；裁剪会改变范数口径。

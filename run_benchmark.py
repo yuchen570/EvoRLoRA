@@ -702,6 +702,7 @@ def peft_factory(
     evorank_max_reallocate_candidates: int = 8,
     evorank_compensation_mode: str = "B",
     toplora_dropout: float = 0.05,
+    toplora_lambda_clamp: float = 3.0,
 ) -> Tuple[nn.Module, Optional[RankEvolutionController], Dict[str, Any]]:
     def _collect_all_linear_target_modules(m: nn.Module) -> List[str]:
         excluded_fragments = (
@@ -945,6 +946,7 @@ def peft_factory(
             r=target_rank,
             lora_alpha=effective_alpha,
             lora_dropout=_toplora_dropout,
+            lambda_clamp=float(toplora_lambda_clamp),
         )
         effective_dropout_val = float(_toplora_dropout)
 
@@ -1387,6 +1389,7 @@ def run_training_loop(
     flatlora_rho: float = 0.05,
     peft_meta: Optional[Dict[str, Any]] = None,
     evo_include_noop_candidate: bool = True,
+    evo_stop_step_ratio: float = 1.0,
 ) -> Dict[str, Any]:
     if ddp_enabled and dist.is_available() and dist.is_initialized():
         if not torch.cuda.is_available():
@@ -1486,6 +1489,12 @@ def run_training_loop(
     total_train_steps = max_train_steps if max_train_steps is not None else epochs * len(train_loader)
     warmup_steps = int(total_train_steps * warmup_ratio)
     steps_per_epoch = len(train_loader)
+    # EvoRank ES 后期冻结：stop_step_ratio<1.0 时，在 [stop_step, total_train_steps] 区间
+    # 禁用结构演化（对标 AdaLoRA 的 tfinal 机制）。防止在训练末期 val_loss 已被过拟合污染
+    # 的情况下，ES 基于错误信号误剪关键 rank-1 slot。
+    evo_stop_step: Optional[int] = None
+    if method_name == "evorank" and 0.0 < float(evo_stop_step_ratio) < 1.0:
+        evo_stop_step = max(1, int(float(evo_stop_step_ratio) * total_train_steps))
     # EvoRank warmup cap：LoRA B=0 零初始化 + 长 warmup 的 ΔW ∝ LR² 二次增长阻滞
     # 会导致训练崩溃（日志实证：warmup=374 → 0.47, warmup=18 → 0.82）。
     # 同时 cap LR warmup 和 ES warmup，上限取 10% epoch（≈30 步），保证 B 在第一
@@ -1533,6 +1542,7 @@ def run_training_loop(
                 "lr_warmup_steps": int(warmup_steps),
                 "es_warmup_steps": int(evo_warmup_steps) if method_name == "evorank" else None,
                 "evo_warmup_cap": int(evo_warmup_cap) if method_name == "evorank" else None,
+                "evo_stop_step": int(evo_stop_step) if evo_stop_step is not None else None,
             },
         )
         # endregion
@@ -1667,6 +1677,7 @@ def run_training_loop(
                         random_seed=random_seed,
                         max_grad_norm=max_grad_norm,
                         include_noop_candidate=evo_include_noop_candidate,
+                        stop_step=evo_stop_step,
                     )
                     train_loss = float(out["train_loss"])
                     avg_active_rank = float(
@@ -2512,6 +2523,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evo_H_g", type=int, default=2, help="EvoRank 扩张持久计数阈值 H_g。设为 1 可关闭持久化门槛")
     parser.add_argument("--evo_H_p", type=int, default=3, help="EvoRank 修剪持久计数阈值 H_p。设为 1 可关闭持久化门槛")
     parser.add_argument("--evo_cooldown_steps", type=int, default=2, help="EvoRank 扩张后冷却步数。设为 0 可关闭 cooldown")
+    parser.add_argument(
+        "--evo_stop_step_ratio",
+        type=float,
+        default=1.0,
+        help="EvoRank ES 停止时机（占总训练步数比例）。默认 1.0 表示全程运行 ES；"
+             "设为 0.7 则前 70% 步正常 ES，后 30% 冻结结构只做权重优化——"
+             "对标 AdaLoRA 的 tfinal，缓解小数据集（CoLA/RTE）后期过拟合时 val_loss 信号"
+             "噪声过大导致的误剪枝。",
+    )
     parser.add_argument("--evo_allow_reallocation", dest="evo_allow_reallocation", action="store_true", help="EvoRank：启用跨层 reallocation（默认开启）")
     parser.add_argument("--no_evo_allow_reallocation", dest="evo_allow_reallocation", action="store_false", help="EvoRank：关闭跨层 reallocation，只保留 grow / prune")
     parser.set_defaults(evo_allow_reallocation=True)
@@ -2573,6 +2593,21 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.05,
         help="TopLoRA：dropout 系数（论文默认 0.05）。仅 method=toplora 使用，其他方法忽略。",
+    )
+    parser.add_argument(
+        "--toplora_lr",
+        type=float,
+        default=None,
+        help="TopLoRA 专用学习率覆盖。TopLoRA 的门控 exp(RMSNorm(x@W_λ)) 在高 lr 长训练下容易爆炸"
+             "（观测 seed=42 从 epoch=4 起 val=0）；官方脚本 lr=1e-4（Qwen2.5-3B + math_10k）。"
+             "None 时若全局 lr>2e-4 自动降为 lr/4（下限 1e-4）。",
+    )
+    parser.add_argument(
+        "--toplora_lambda_clamp",
+        type=float,
+        default=3.0,
+        help="TopLoRA 门控 exp 输入 clamp 上下界 ±C，使 λ∈[e^-C, e^C]，防止 exp 爆炸。"
+             "默认 3.0（λ∈[0.05, 20.09]）。设 0 或负数可关闭（对齐官方原始实现，但有数值风险）。",
     )
     parser.add_argument(
         "--max_grad_norm",
@@ -2654,10 +2689,38 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 method_warmup_ratio = float(args.warmup_ratio)
                 method_lr_scheduler_type = "linear"
                 method_lr = float(args.lr)
-                if method == "pissa" and getattr(args, "pissa_lr", None) is not None:
-                    method_lr = float(args.pissa_lr)
-                    if args.is_main_process:
-                        print(f"[pissa] 使用 --pissa_lr={method_lr} 覆盖全局 lr={args.lr}")
+                if method == "toplora":
+                    # TopLoRA 官方脚本 lr=1e-4（Qwen2.5-3B+math_10k），GLUE 8e-4 下观测到崩溃。
+                    # 原因：λ(x) = exp(RMSNorm(x @ W_λ)) 的 exp 非线性在高 lr 长训练下容易爆炸。
+                    if getattr(args, "toplora_lr", None) is not None:
+                        method_lr = float(args.toplora_lr)
+                        if args.is_main_process:
+                            print(f"[toplora] 使用 --toplora_lr={method_lr} 覆盖全局 lr={args.lr}")
+                    elif float(args.lr) > 2e-4:
+                        method_lr = max(float(args.lr) / 4.0, 1e-4)
+                        if args.is_main_process:
+                            print(
+                                f"[toplora] 自动降低学习率: {args.lr} -> {method_lr} "
+                                f"(TopLoRA 门控 exp(·) 在高 lr 长训练下易爆炸；"
+                                f"官方脚本 lr=1e-4；可通过 --toplora_lr 显式覆盖)"
+                            )
+                if method == "pissa":
+                    # PiSSA 官方脚本 lr=2e-5（Llama-2-7b+MetaMath），GLUE 小任务经验值 1e-4~2e-4。
+                    # 原因：PiSSA 的 SVD 初始化使 ||A||,||B|| ~ 7（LoRA 仅 ~0.01 + 0），
+                    # 用与 LoRA 相同 lr 会让 grad_norm 超过 clip 阈值数倍，主成分方向失真。
+                    if getattr(args, "pissa_lr", None) is not None:
+                        method_lr = float(args.pissa_lr)
+                        if args.is_main_process:
+                            print(f"[pissa] 使用 --pissa_lr={method_lr} 覆盖全局 lr={args.lr}")
+                    elif float(args.lr) > 2e-4:
+                        # 全局 lr 偏高时自动降为 lr/4，但下限 1e-4；显式 --pissa_lr 可覆盖该行为
+                        method_lr = max(float(args.lr) / 4.0, 1e-4)
+                        if args.is_main_process:
+                            print(
+                                f"[pissa] 自动降低学习率: {args.lr} -> {method_lr} "
+                                f"(PiSSA 对 lr 敏感，官方 2e-5，本任务 lr>2e-4 时默认 lr/4；"
+                                f"可通过 --pissa_lr 显式覆盖)"
+                            )
                 for seed in seeds:
                     random.seed(seed)
                     np.random.seed(seed)
@@ -2704,6 +2767,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         evorank_max_reallocate_candidates=args.evo_max_reallocate_candidates,
                         evorank_compensation_mode=args.evo_compensation_mode, # 传递评价中使用的补偿策略
                         toplora_dropout=args.toplora_dropout,
+                        toplora_lambda_clamp=args.toplora_lambda_clamp,
                     )
                     # === PiSSA / Flat-LoRA 初始化诊断 ===
                     if args.is_main_process and method in ("pissa", "flatlora"):
@@ -2826,6 +2890,7 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         flatlora_rho=args.flatlora_rho,
                         peft_meta=meta,
                         evo_include_noop_candidate=args.evo_include_noop_candidate,
+                        evo_stop_step_ratio=args.evo_stop_step_ratio,
                     )
                     res.update(
                         {

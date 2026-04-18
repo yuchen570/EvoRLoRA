@@ -152,7 +152,10 @@ class FlatLoRAHookManager:
                     continue
 
                 module_idx = getattr(module, "_flatlora_module_idx", 0)
-                cur_seed = (step * 9973 + module_idx) % (2**32 - 1)
+                # 官方 FlatLoraTrainer 使用 time.time() 作 seed，每 rank 独立采样（DDP 下不同 rank 扰动不同），
+                # all-reduce 后的梯度近似 SAM 的 per-worker 平均。此处按 (step, module_idx, local_rank)
+                # 确定性生成 seed：既保证可复现，又保留 per-rank 扰动多样性。
+                cur_seed = (step * 9973 + module_idx * 131 + self._local_rank * 7919 + 1) % (2**32 - 1)
 
                 md = self._get_base_weight(module)
                 if do_log:
