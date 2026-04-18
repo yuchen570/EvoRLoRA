@@ -350,6 +350,8 @@ def setup_data_and_model(
     rank: int = 0,
     world_size: int = 1,
     seed: int = 42,
+    dataloader_num_workers: int = 4,
+    pin_memory: bool = True,
 ) -> Tuple[DataLoader, DataLoader, Optional[Union[DataLoader, Dict[str, DataLoader]]], nn.Module, AutoTokenizer]:
     os.makedirs(dataset_cache_dir, exist_ok=True)
     os.makedirs(model_cache_dir, exist_ok=True)
@@ -462,13 +464,16 @@ def setup_data_and_model(
                     rank=rank,
                 )
                 _train_loader = DataLoader(
-                    tokenized[train_split], batch_size=batch_size, sampler=_train_sampler, collate_fn=collator
+                    tokenized[train_split], batch_size=batch_size, sampler=_train_sampler, collate_fn=collator,
+                    num_workers=dataloader_num_workers, pin_memory=pin_memory
                 )
                 _val_loader = DataLoader(
-                    tokenized[val_split], batch_size=batch_size, sampler=_val_sampler, collate_fn=collator
+                    tokenized[val_split], batch_size=batch_size, sampler=_val_sampler, collate_fn=collator,
+                    num_workers=dataloader_num_workers, pin_memory=pin_memory
                 )
                 _val_loader_eval = DataLoader(
-                    tokenized[val_split], batch_size=batch_size, sampler=_val_eval_sampler, collate_fn=collator
+                    tokenized[val_split], batch_size=batch_size, sampler=_val_eval_sampler, collate_fn=collator,
+                    num_workers=dataloader_num_workers, pin_memory=pin_memory
                 )
                 if task_name == "mnli":
                     _val_m_sampler = _DistributedEvalSampler(
@@ -486,22 +491,24 @@ def setup_data_and_model(
                         batch_size=batch_size,
                         sampler=_val_m_sampler,
                         collate_fn=collator,
+                        num_workers=dataloader_num_workers, pin_memory=pin_memory
                     )
                     _val_mm_loader = DataLoader(
                         tokenized["validation_mismatched"],
                         batch_size=batch_size,
                         sampler=_val_mm_sampler,
                         collate_fn=collator,
+                        num_workers=dataloader_num_workers, pin_memory=pin_memory
                     )
                     _val_loader_eval_full = {"matched": _val_m_loader, "mismatched": _val_mm_loader}
                 else:
                     _val_loader_eval_full = _val_loader_eval
             else:
-                _train_loader = DataLoader(tokenized[train_split], batch_size=batch_size, shuffle=True, collate_fn=collator)
-                _val_loader = DataLoader(tokenized[val_split], batch_size=batch_size, shuffle=False, collate_fn=collator)
+                _train_loader = DataLoader(tokenized[train_split], batch_size=batch_size, shuffle=True, collate_fn=collator, num_workers=dataloader_num_workers, pin_memory=pin_memory)
+                _val_loader = DataLoader(tokenized[val_split], batch_size=batch_size, shuffle=False, collate_fn=collator, num_workers=dataloader_num_workers, pin_memory=pin_memory)
                 if task_name == "mnli":
-                    _val_m_loader = DataLoader(tokenized["validation_matched"], batch_size=batch_size, shuffle=False, collate_fn=collator)
-                    _val_mm_loader = DataLoader(tokenized["validation_mismatched"], batch_size=batch_size, shuffle=False, collate_fn=collator)
+                    _val_m_loader = DataLoader(tokenized["validation_matched"], batch_size=batch_size, shuffle=False, collate_fn=collator, num_workers=dataloader_num_workers, pin_memory=pin_memory)
+                    _val_mm_loader = DataLoader(tokenized["validation_mismatched"], batch_size=batch_size, shuffle=False, collate_fn=collator, num_workers=dataloader_num_workers, pin_memory=pin_memory)
                     _val_loader_eval_full = {"matched": _val_m_loader, "mismatched": _val_mm_loader}
                 else:
                     _val_loader_eval_full = _val_loader
@@ -636,17 +643,20 @@ def setup_data_and_model(
                     rank=rank,
                 )
                 _train_loader = DataLoader(
-                    tokenized["train"], batch_size=batch_size, sampler=_train_sampler, collate_fn=collator
+                    tokenized["train"], batch_size=batch_size, sampler=_train_sampler, collate_fn=collator,
+                    num_workers=dataloader_num_workers, pin_memory=pin_memory
                 )
                 _val_loader = DataLoader(
-                    tokenized[val_split_name], batch_size=batch_size, sampler=_val_sampler, collate_fn=collator
+                    tokenized[val_split_name], batch_size=batch_size, sampler=_val_sampler, collate_fn=collator,
+                    num_workers=dataloader_num_workers, pin_memory=pin_memory
                 )
                 _val_loader_eval_full = DataLoader(
-                    tokenized[val_split_name], batch_size=batch_size, sampler=_val_eval_sampler, collate_fn=collator
+                    tokenized[val_split_name], batch_size=batch_size, sampler=_val_eval_sampler, collate_fn=collator,
+                    num_workers=dataloader_num_workers, pin_memory=pin_memory
                 )
             else:
-                _train_loader = DataLoader(tokenized["train"], batch_size=batch_size, shuffle=True, collate_fn=collator)
-                _val_loader = DataLoader(tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator)
+                _train_loader = DataLoader(tokenized["train"], batch_size=batch_size, shuffle=True, collate_fn=collator, num_workers=dataloader_num_workers, pin_memory=pin_memory)
+                _val_loader = DataLoader(tokenized[val_split_name], batch_size=batch_size, shuffle=False, collate_fn=collator, num_workers=dataloader_num_workers, pin_memory=pin_memory)
                 _val_loader_eval_full = None
             return _train_loader, _val_loader, _val_loader_eval_full
 
@@ -2442,6 +2452,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=128)
+    parser.add_argument("--dataloader_num_workers", type=int, default=4, help="DataLoader num_workers 数量，多进程提取加快数据加载")
+    parser.add_argument("--pin_memory", action="store_true", help="启用 DataLoader 锁页内存加速")
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--head_lr", type=float, default=None, help="分类头等可训练参数学习率。None 时默认与 --lr 相同；需要更快收敛可显式调高")
     parser.add_argument("--pissa_lr", type=float, default=None, help="PiSSA 专用学习率覆盖。PiSSA 的 SVD 初始化使梯度幅度远大于标准 LoRA，通常需要更低的 lr（论文推荐 1e-4）。None 时使用 --lr")
@@ -2653,6 +2665,8 @@ def run_protocol_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                 rank=args.rank,
                 world_size=args.world_size,
                 seed=seeds[0],
+                dataloader_num_workers=args.dataloader_num_workers,
+                pin_memory=args.pin_memory,
             )
             planned_total_steps = (
                 args.max_train_steps if args.max_train_steps is not None else args.epochs * len(train_loader)

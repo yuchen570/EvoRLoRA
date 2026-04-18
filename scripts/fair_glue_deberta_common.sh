@@ -87,6 +87,8 @@ run_task() {
     --lora_alpha $ALPHA \
     --epochs $EPOCHS \
     --batch_size "$PER_DEVICE_BATCH_SIZE" \
+    --dataloader_num_workers 8 \
+    --pin_memory \
     --max_length $MAX_LEN \
     --lr $LR \
     --warmup_ratio 0.06 \
