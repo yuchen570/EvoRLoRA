@@ -57,6 +57,13 @@ for method in "${METHODS[@]}"; do
         echo -e "\n\033[1;36m========== [train] method=$method task=$task -> $out_dir ==========\033[0m"
         train_log="logs/smoke_${MODEL_TAG}_${task}_${method}_train.log"
 
+        # conversation 任务需要完整模型供 FastChat eval 使用，不能 adapter-only；
+        # 其它任务 eval 在内存中 merge adapter，无需写盘。
+        save_flag=""
+        if [ "$task" != "conversation" ]; then
+            save_flag="--save_adapter_only"
+        fi
+
         if ! python run_nlg_benchmark.py \
             --model_name_or_path "$MODEL_REL" \
             --method "$method" \
@@ -76,7 +83,7 @@ for method in "${METHODS[@]}"; do
             --model_max_length 128 \
             --pissa_init_method "pissa_niter_16" \
             --T_es 10000 \
-            --save_adapter_only \
+            $save_flag \
             --output_dir "$out_dir" \
             --seed "$SEED" $extra_args 2>&1 | tee "$train_log"; then
             echo -e "\033[1;31m[FAIL] train $method/$task\033[0m"
