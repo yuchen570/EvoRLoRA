@@ -609,6 +609,12 @@ def main():
     parser.add_argument("--pissa_init_method", type=str, default="pissa_niter_16", choices=["pissa", "pissa_niter_16"])
 
     args = parser.parse_args()
+
+    # torchrun / torch.distributed.run 在 PyTorch 2.x 起通过环境变量 LOCAL_RANK 分配进程与 GPU，
+    # 不再向子进程传入 --local_rank。若仍用默认值 -1，则 dist 不会初始化、device 退化为 cuda:0，
+    # 多进程会全部挤在同一张卡上（与 nvidia-smi 上两个 python 均占 GPU0 的现象一致）。
+    if args.local_rank == -1 and "LOCAL_RANK" in os.environ:
+        args.local_rank = int(os.environ["LOCAL_RANK"])
     
     if args.local_rank != -1:
         torch.cuda.set_device(args.local_rank)
