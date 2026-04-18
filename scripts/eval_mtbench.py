@@ -36,7 +36,18 @@ def _find_fastchat_judge_dir() -> Optional[str]:
     """定位 fastchat.llm_judge 的安装路径。"""
     try:
         import fastchat.llm_judge
-        return os.path.dirname(fastchat.llm_judge.__file__)
+        # __file__ 可能为 None（namespace package）；此时通过 __path__ 获取
+        if fastchat.llm_judge.__file__ is not None:
+            return os.path.dirname(fastchat.llm_judge.__file__)
+        # namespace package：__path__ 包含搜索目录列表
+        if hasattr(fastchat.llm_judge, "__path__") and list(fastchat.llm_judge.__path__):
+            return list(fastchat.llm_judge.__path__)[0]
+        # 兜底：用 importlib 查找
+        import importlib.util
+        spec = importlib.util.find_spec("fastchat.llm_judge")
+        if spec and spec.submodule_search_locations:
+            return list(spec.submodule_search_locations)[0]
+        return None
     except ImportError:
         return None
 

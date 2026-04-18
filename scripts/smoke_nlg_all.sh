@@ -1,25 +1,30 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # ==============================================================================
 # Linux Smoke Test Script for ALL Methods and ALL Tasks
 #
-# 该脚本在 Linux 环境下来回走通 8 种算法的（前向/反向/保存/评估）冒烟测试，
+# 该脚本在 Linux 环境下走通 8 种算法的（前向/反向/保存/评估）冒烟测试，
 # 不做性能测试，仅极小规模：
-# - 训练：4行样本, 1 epoch, r=8 
+# - 训练：4行样本, 1 epoch, r=8
 # - 评估：4个样本 (NLG) 或第1题 (MT-Bench)
 #
 # 使用方法：
-# conda activate yolo_torch2.6
+# conda activate evorank  (或对应环境名)
 # bash scripts/smoke_nlg_all.sh
+#
+# 可选环境变量：
+#   MODEL_REL   模型相对/绝对路径  (默认 models/meta-llama/Llama-2-7b-hf)
+#   MODEL_TAG   模型标签           (默认 Llama-2-7b-hf)
 # ==============================================================================
 
 # 确保在项目根目录运行
-cd "$(dirname "$0")/.."
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
 
-# 模型与参数配置
-MODEL_REL="models/models--Qwen--Qwen1.5-0.5B"
-MODEL_TAG="Qwen1.5-0.5B"
+# 模型与参数 —— 支持环境变量覆盖
+MODEL_REL="${MODEL_REL:-models/meta-llama/Llama-2-7b-hf}"
+MODEL_TAG="${MODEL_TAG:-Llama-2-7b-hf}"
 SEED=42
 
 # 冒烟规模
@@ -41,15 +46,19 @@ get_method_extra_args() {
     fi
 }
 
+FAIL_COUNT=0
+FAIL_LIST=""
+
 for method in "${METHODS[@]}"; do
     for task in "${TASKS[@]}"; do
-        out_dir="artifacts/nlg_smoke_${MODEL_TAG}_${task}_${method}_seed${SEED}"
+        out_dir="${REPO_ROOT}/artifacts/nlg_smoke_${MODEL_TAG}_${task}_${method}_seed${SEED}"
         extra_args=$(get_method_extra_args "$method")
-        
+
         echo -e "\n\033[1;36m========== [train] method=$method task=$task -> $out_dir ==========\033[0m"
-        train_log="logs/smoke_qwen_${task}_${method}_train.log"
-        
-        python run_nlg_benchmark.py \
+        train_log="logs/smoke_${MODEL_TAG}_${task}_${method}_train.log"
+
+        # 训练失败不中断整体循环，记录后继续下一组
+        if ! python run_nlg_benchmark.py \
             --model_name_or_path "$MODEL_REL" \
             --method "$method" \
             --target_modules "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
@@ -69,13 +78,26 @@ for method in "${METHODS[@]}"; do
             --pissa_init_method "pissa_niter_16" \
             --T_es 10000 \
             --output_dir "$out_dir" \
-            --seed "$SEED" $extra_args 2>&1 | tee "$train_log"
-            
-        # 根据任务类型执行不同的下流评估
+            --seed "$SEED" $extra_args 2>&1 | tee "$train_log"; then
+            echo -e "\033[1;31m[FAIL] train $method/$task\033[0m"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            FAIL_LIST="${FAIL_LIST}\n  train ${method}/${task}"
+            continue
+        fi
+
+        # 检查训练产出目录是否存在
+        if [ ! -d "$out_dir" ]; then
+            echo -e "\033[1;31m[FAIL] train $method/$task: output dir not created\033[0m"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            FAIL_LIST="${FAIL_LIST}\n  train ${method}/${task} (no output dir)"
+            continue
+        fi
+
+        # 根据任务类型执行不同的下游评估
         if [ "$task" == "conversation" ]; then
             echo -e "\033[1;32m========== [eval] mtbench $task method=$method ==========\033[0m"
-            eval_log="logs/smoke_qwen_${task}_${method}_eval.log"
-            python scripts/eval_mtbench.py \
+            eval_log="logs/smoke_${MODEL_TAG}_${task}_${method}_eval.log"
+            if ! python scripts/eval_mtbench.py \
                 --model_dir "$out_dir" \
                 --method "$method" \
                 --model_tag "$MODEL_TAG" \
@@ -83,11 +105,15 @@ for method in "${METHODS[@]}"; do
                 --max_new_tokens 256 \
                 --num_gpus 1 \
                 --question-begin 0 \
-                --question-end 1 2>&1 | tee "$eval_log"
+                --question-end 1 2>&1 | tee "$eval_log"; then
+                echo -e "\033[1;31m[FAIL] eval $method/$task\033[0m"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                FAIL_LIST="${FAIL_LIST}\n  eval ${method}/${task}"
+            fi
         else
             echo -e "\033[1;32m========== [eval] nlg $task method=$method ==========\033[0m"
-            eval_log="logs/smoke_qwen_${task}_${method}_eval.log"
-            python scripts/eval_nlg_pissa.py \
+            eval_log="logs/smoke_${MODEL_TAG}_${task}_${method}_eval.log"
+            if ! python scripts/eval_nlg_pissa.py \
                 --model_dir "$out_dir" \
                 --sub_task "$task" \
                 --dataset_split test \
@@ -96,9 +122,20 @@ for method in "${METHODS[@]}"; do
                 --seed "$SEED" \
                 --batch_size 2 \
                 --max_new_tokens 128 \
-                --max_samples "$EVAL_MAX_SAMPLES" 2>&1 | tee "$eval_log"
+                --max_samples "$EVAL_MAX_SAMPLES" 2>&1 | tee "$eval_log"; then
+                echo -e "\033[1;31m[FAIL] eval $method/$task\033[0m"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                FAIL_LIST="${FAIL_LIST}\n  eval ${method}/${task}"
+            fi
         fi
     done
 done
 
-echo -e "\n\033[1;33mSmoke: All ${#METHODS[@]} methods on all ${#TASKS[@]} tasks finished OK.\033[0m"
+echo ""
+echo "======================================================================"
+if [ "$FAIL_COUNT" -eq 0 ]; then
+    echo -e "\033[1;33mSmoke: All ${#METHODS[@]} methods × ${#TASKS[@]} tasks finished OK.\033[0m"
+else
+    echo -e "\033[1;31mSmoke: ${FAIL_COUNT} step(s) FAILED:${FAIL_LIST}\033[0m"
+    exit 1
+fi

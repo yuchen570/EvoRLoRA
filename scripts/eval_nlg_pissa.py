@@ -219,13 +219,17 @@ def _generate_hf(
 ) -> List[str]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+    # 本地训练产出目录：强制 local_files_only 防止 transformers 将相对路径当作 Hub repo_id 查询
+    _local_only = os.path.isdir(model_dir)
+
+    tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True, local_files_only=_local_only)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_dir, torch_dtype=dtype, trust_remote_code=True, device_map="auto"
+        model_dir, torch_dtype=dtype, trust_remote_code=True, device_map="auto",
+        local_files_only=_local_only,
     )
     model.eval()
 
