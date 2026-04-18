@@ -669,28 +669,38 @@ def run_sft_training(args, method: str):
 
         os.makedirs(args.output_dir, exist_ok=True)
 
-        if method in ["lora", "lora_kaiming", "pissa", "flatlora", "adalora"]:
-            logger.info("Merging adapter into base model (PEFT merge_and_unload)...")
-            model_to_save = model_to_save.merge_and_unload()
-        elif method == "evorank":
-            logger.info("Merging EvoRank LoRA into base model...")
-            _merge_evorank_into_base(model_to_save)
-        elif method == "sora":
-            logger.info("Merging SoRA into base model...")
-            _merge_sora_into_base(model_to_save)
-        elif method == "toplora":
-            logger.info("Merging TopLoRA into base model...")
-            _merge_toplora_into_base(model_to_save)
+        _is_peft = method in ["lora", "lora_kaiming", "pissa", "flatlora", "adalora"]
 
-        # 将模型移到 CPU 并释放 GPU 显存，防止 save_pretrained 期间 OOM
-        # （save_pretrained 会在 CPU 上创建序列化缓冲区；若模型仍在 GPU，
-        #   则 GPU + CPU 同时持有权重，峰值内存翻倍）
-        model_to_save.to("cpu")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if getattr(args, "save_adapter_only", False) and _is_peft:
+            # ---- 仅保存 adapter 权重（~10MB），跳过 merge + 全量写盘（~13GB/7B） ----
+            logger.info("Saving adapter only (skip merge) ...")
+            model_to_save.save_pretrained(args.output_dir)
+            tokenizer.save_pretrained(args.output_dir)
+            # 记录 base model 实际路径，供 eval 阶段自动重建完整模型
+            with open(os.path.join(args.output_dir, "base_model_path.json"), "w") as f:
+                json.dump({"base_model_path": os.path.abspath(model_load_id)}, f)
+        else:
+            # ---- 合并 adapter 到 base → 保存完整模型 ----
+            if _is_peft:
+                logger.info("Merging adapter into base model (PEFT merge_and_unload)...")
+                model_to_save = model_to_save.merge_and_unload()
+            elif method == "evorank":
+                logger.info("Merging EvoRank LoRA into base model...")
+                _merge_evorank_into_base(model_to_save)
+            elif method == "sora":
+                logger.info("Merging SoRA into base model...")
+                _merge_sora_into_base(model_to_save)
+            elif method == "toplora":
+                logger.info("Merging TopLoRA into base model...")
+                _merge_toplora_into_base(model_to_save)
 
-        model_to_save.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
+            # 将模型移到 CPU 并释放 GPU 显存，防止 save_pretrained 期间 OOM
+            model_to_save.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            model_to_save.save_pretrained(args.output_dir)
+            tokenizer.save_pretrained(args.output_dir)
         
         # 记录元数据
         meta["total_time_sec"] = time.time() - start_time
@@ -739,6 +749,8 @@ def main():
     parser.add_argument("--adalora_delta_t", type=int, default=10)
     parser.add_argument("--flatlora_rho", type=float, default=0.05)
     parser.add_argument("--pissa_init_method", type=str, default="pissa_niter_16", choices=["pissa", "pissa_niter_16"])
+    parser.add_argument("--save_adapter_only", action="store_true", default=False,
+                        help="PEFT 方法仅保存 adapter 权重（跳过 merge + 全量写盘），大幅加速冒烟测试")
 
     args = parser.parse_args()
 

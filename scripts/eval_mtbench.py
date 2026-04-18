@@ -212,9 +212,38 @@ def main() -> None:
 
     model_id = f"{args.model_tag}_{args.method}_seed{args.seed}"
 
+    # 若为 adapter-only 保存，先合并为完整模型再传给 FastChat
+    effective_model_dir = args.model_dir
+    _base_info = os.path.join(args.model_dir, "base_model_path.json")
+    _adapter_cfg = os.path.join(args.model_dir, "adapter_config.json")
+    if os.path.isfile(_base_info) and os.path.isfile(_adapter_cfg):
+        merged_dir = os.path.join(args.model_dir, "_merged")
+        if not (os.path.isdir(merged_dir) and os.path.isfile(os.path.join(merged_dir, "config.json"))):
+            logger.info("Adapter-only save detected; merging for FastChat eval ...")
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from peft import PeftModel
+            with open(_base_info) as f:
+                base_path = json.load(f)["base_model_path"]
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
+                local_files_only=True,
+            )
+            merged_model = PeftModel.from_pretrained(base_model, args.model_dir)
+            merged_model = merged_model.merge_and_unload()
+            os.makedirs(merged_dir, exist_ok=True)
+            merged_model.to("cpu")
+            merged_model.save_pretrained(merged_dir)
+            tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True, local_files_only=True)
+            tok.save_pretrained(merged_dir)
+            del merged_model, base_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        effective_model_dir = merged_dir
+
     # Step 1: 生成回答
     answer_file = _gen_model_answer(
-        args.model_dir,
+        effective_model_dir,
         model_id,
         judge_dir,
         args.max_new_tokens,

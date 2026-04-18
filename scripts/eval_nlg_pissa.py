@@ -222,15 +222,35 @@ def _generate_hf(
     # 本地训练产出目录：强制 local_files_only 防止 transformers 将相对路径当作 Hub repo_id 查询
     _local_only = os.path.isdir(model_dir)
 
-    tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True, local_files_only=_local_only)
+    # 检测 adapter-only 保存（由 --save_adapter_only 产生）
+    _base_info_file = os.path.join(model_dir, "base_model_path.json")
+    _adapter_cfg_file = os.path.join(model_dir, "adapter_config.json")
+    _is_adapter_only = os.path.isfile(_base_info_file) and os.path.isfile(_adapter_cfg_file)
+
+    tok = AutoTokenizer.from_pretrained(
+        model_dir, trust_remote_code=True,
+        local_files_only=_local_only or _is_adapter_only,
+    )
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir, torch_dtype=dtype, trust_remote_code=True, device_map="auto",
-        local_files_only=_local_only,
-    )
+    if _is_adapter_only:
+        with open(_base_info_file) as f:
+            _base_path = json.load(f)["base_model_path"]
+        logger.info(f"Adapter-only save detected; loading base from {_base_path}")
+        model = AutoModelForCausalLM.from_pretrained(
+            _base_path, torch_dtype=dtype, trust_remote_code=True, device_map="auto",
+            local_files_only=True,
+        )
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, model_dir)
+        model = model.merge_and_unload()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir, torch_dtype=dtype, trust_remote_code=True, device_map="auto",
+            local_files_only=_local_only,
+        )
     model.eval()
 
     out_texts: List[str] = []

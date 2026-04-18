@@ -9,29 +9,29 @@ set -euo pipefail
 # - 训练：4行样本, 1 epoch, r=8
 # - 评估：4个样本 (NLG) 或第1题 (MT-Bench)
 #
+# PEFT 方法 (lora/lora_kaiming/pissa/adalora/flatlora) 默认仅保存 adapter 权重
+# (~10MB)，跳过 merge + 全量写盘 (~13GB/7B)，大幅加速冒烟循环。eval 脚本会自动
+# 检测 adapter-only 保存并在内存中重建完整模型。
+#
 # 使用方法：
-# conda activate evorank  (或对应环境名)
-# bash scripts/smoke_nlg_all.sh
+#   conda activate evorank
+#   bash scripts/smoke_nlg_all.sh
 #
 # 可选环境变量：
 #   MODEL_REL   模型相对/绝对路径  (默认 models/meta-llama/Llama-2-7b-hf)
 #   MODEL_TAG   模型标签           (默认 Llama-2-7b-hf)
 # ==============================================================================
 
-# 确保在项目根目录运行
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# 模型与参数 —— 支持环境变量覆盖
 MODEL_REL="${MODEL_REL:-models/meta-llama/Llama-2-7b-hf}"
 MODEL_TAG="${MODEL_TAG:-Llama-2-7b-hf}"
 SEED=42
 
-# 冒烟规模
 SMOKE_ROWS=4
 EVAL_MAX_SAMPLES=4
 
-# 需要对比的算法与任务列表
 METHODS=("lora" "lora_kaiming" "pissa" "evorank" "adalora" "sora" "flatlora" "toplora")
 TASKS=("metamath" "python" "conversation")
 
@@ -57,7 +57,6 @@ for method in "${METHODS[@]}"; do
         echo -e "\n\033[1;36m========== [train] method=$method task=$task -> $out_dir ==========\033[0m"
         train_log="logs/smoke_${MODEL_TAG}_${task}_${method}_train.log"
 
-        # 训练失败不中断整体循环，记录后继续下一组
         if ! python run_nlg_benchmark.py \
             --model_name_or_path "$MODEL_REL" \
             --method "$method" \
@@ -77,6 +76,7 @@ for method in "${METHODS[@]}"; do
             --model_max_length 128 \
             --pissa_init_method "pissa_niter_16" \
             --T_es 10000 \
+            --save_adapter_only \
             --output_dir "$out_dir" \
             --seed "$SEED" $extra_args 2>&1 | tee "$train_log"; then
             echo -e "\033[1;31m[FAIL] train $method/$task\033[0m"
@@ -85,7 +85,6 @@ for method in "${METHODS[@]}"; do
             continue
         fi
 
-        # 检查训练产出目录是否存在
         if [ ! -d "$out_dir" ]; then
             echo -e "\033[1;31m[FAIL] train $method/$task: output dir not created\033[0m"
             FAIL_COUNT=$((FAIL_COUNT + 1))
@@ -93,7 +92,6 @@ for method in "${METHODS[@]}"; do
             continue
         fi
 
-        # 根据任务类型执行不同的下游评估
         if [ "$task" == "conversation" ]; then
             echo -e "\033[1;32m========== [eval] mtbench $task method=$method ==========\033[0m"
             eval_log="logs/smoke_${MODEL_TAG}_${task}_${method}_eval.log"
