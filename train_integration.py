@@ -242,11 +242,20 @@ def train_evo_lora_step(
             _reset_optimizer_state_for_mutation(opt, mutation.prune_mut)
             _reset_optimizer_state_for_mutation(opt, mutation.expand_mut)
 
+    should_evolve = (
+        step >= warmup_steps and T_es > 0 and step % T_es == 0
+    )
+
     model.train()
     inputs, targets = train_batch
     model_device = next(model.parameters()).device
 
     optimizer.zero_grad(set_to_none=True)
+    for layer in controller.layers.values():
+        layer.requires_exact_G = should_evolve
+        if hasattr(layer, 'begin_new_accumulation'):
+            layer.begin_new_accumulation()
+            
     logits = model(inputs)
     # 与 run_benchmark.py 非 EvoRank 分支对齐：loss 入口统一 fp32，
     # 避免 half logits 在特定环境下触发 Float/Half 反传冲突。
@@ -277,9 +286,6 @@ def train_evo_lora_step(
         "es_delta_complexity": None,
     }
 
-    should_evolve = (
-        step >= warmup_steps and T_es > 0 and step % T_es == 0
-    )
     if step == 0 or (should_evolve and not getattr(controller, "_device_synced", False)):
         _sync_controller_state_device(controller)
         controller._device_synced = True

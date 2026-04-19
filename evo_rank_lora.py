@@ -79,6 +79,13 @@ class EvoRankLoRALayer(nn.Module):
         self._cached_expand_bar_s: Optional[float] = None
         self._cached_grad_direction: Optional[Tuple[torch.Tensor, torch.Tensor, float]] = None
         
+        self._exact_G: Optional[torch.Tensor] = None
+        self._accumulation_step: int = 0
+        self._last_seen_step: int = -1
+        
+    def begin_new_accumulation(self):
+        """指示新一轮梯度累加开始（在 zero_grad 处调用）"""
+        self._accumulation_step += 1
     def reset_parameters(self):
         """标准 LoRA 初始化：A Kaiming, B Zero"""
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
@@ -102,13 +109,18 @@ class EvoRankLoRALayer(nn.Module):
 
         实现：仅提取 active_mask=1 的行/列做矩阵乘，不实例化 R_max 维完整乘积。
         """
+        if self.training:
+            if self._accumulation_step != self._last_seen_step:
+                self._exact_G = None
+                self._last_seen_step = self._accumulation_step
+
         active_indices = self.get_active_indices()
         
         # 若所有组件都被 de-activate（通常由 r_min 控制避免发生），直接返回 0
         if len(active_indices) == 0:
             return torch.zeros((*x.shape[:-1], self.out_features), device=x.device, dtype=x.dtype)
             
-        x = self.lora_dropout(x)
+        x_dropped = self.lora_dropout(x)
         
         # 仅截取激活维度的向量:
         # lora_A.weight 形状: (r_max, in_features)
@@ -117,11 +129,30 @@ class EvoRankLoRALayer(nn.Module):
         B_active = self.lora_B.weight[:, active_indices].to(x.dtype)
         
         # 计算低秩投影
-        out = x @ A_active.T @ B_active.T
+        out = x_dropped @ A_active.T @ B_active.T
         
-        # rsLoRA 缩放
+        # rsLoRA 缩贴
         scaling = self.get_scaling_factor(len(active_indices))
-        return out * scaling
+        output = out * scaling
+
+        if self.training and output.requires_grad and getattr(self, 'requires_exact_G', False):
+            x_captured = x_dropped.detach()
+            
+            def backward_hook(grad_out):
+                with torch.no_grad():
+                    g_flat = grad_out.flatten(0, -2)
+                    x_flat = x_captured.flatten(0, -2)
+                    with torch.autocast(device_type=grad_out.device.type if grad_out.device.type != "meta" else "cpu", enabled=False):
+                        G_incr = g_flat.float().T @ x_flat.float()
+                    
+                    if getattr(self, '_exact_G', None) is None:
+                        self._exact_G = G_incr
+                    else:
+                        self._exact_G += G_incr
+            
+            output.register_hook(backward_hook)
+            
+        return output
 
     @torch.no_grad()
     def activate_component(
@@ -236,6 +267,7 @@ class EvoRankLoRALayer(nn.Module):
         self._cached_prune_scores = None
         self._cached_expand_bar_s = None
         self._cached_grad_direction = None
+        self._exact_G = None
 
     @torch.no_grad()
     def cache_statistics_from_current_gradients(self, alpha1: float = 1.0, alpha2: float = 0.1):
@@ -245,58 +277,38 @@ class EvoRankLoRALayer(nn.Module):
         """
         if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
             raise ValueError("需要先调用 .backward() 计算出 lora_A 和 lora_B 的梯度")
-        active_idx = self.get_active_indices()
-        grad_proxy = self._build_grad_proxy(active_idx)
-        self._cached_demand_score = self._compute_demand_score_from_proxy(grad_proxy)
+        self._cached_demand_score = self.compute_demand_score()
         self._cached_prune_scores = self._compute_prune_scores_raw(alpha1, alpha2)
         self._cached_expand_bar_s = self._compute_expand_bar_s_raw()
-        self._cached_grad_direction = self._compute_gradient_rank1_direction_from_proxy(grad_proxy)
+        self._cached_grad_direction = self._compute_gradient_rank1_direction()
 
     # ------ 梯度引导的 rank-1 扩张方向 (论文 Proposition 3.2) ------
 
     @staticmethod
-    def _power_iteration_rank1(
-        N: torch.Tensor, M: torch.Tensor, num_iters: int = 5,
+    def _power_iteration_exact_G(
+        G: torch.Tensor, num_iters: int = 5,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
         """
-        论文 Proposition 3.2（Eq. 381–388）：最优 rank-1 扩张方向。
-
-        求 G ≈ N @ M 的主奇异三元组 (u₁, v₁, σ₁)，满足
-          max_{||a||=||b||=1} ⟨-G, b a^T⟩ = σ₁(G)
-        其中 u₁, v₁ 分别为 G 的主左、右奇异向量。
-
-        实现：power iteration（交替 Gv → u, G^Tu → v），每轮仅需
-        O(r·(out+in)) 运算，不构造 (out, in) 的完整 G 矩阵。
-        N: (out, r), M: (r, in); G = N @ M: (out, in)
-        Returns (u1, v1, sigma1) or None on degenerate input.
+        使用 exact G 计算主奇异方向：(out, in) 的 G 进行 power iteration。
         """
-        in_dim = M.size(1)
-        # 使用确定性初始向量（而非 torch.randn），确保 DDP 下各 GPU
-        # 在相同的 N、M 输入上产生完全一致的 power iteration 结果。
-        v = M[0].clone()
-        v_norm = v.norm()
-        if v_norm < 1e-12:
-            v = torch.ones(in_dim, device=N.device, dtype=N.dtype)
-            v_norm = v.norm()
-        v = v / (v_norm + 1e-12)
+        out_dim, in_dim = G.shape
+        v = torch.ones(in_dim, device=G.device, dtype=G.dtype)
+        v = v / (v.norm() + 1e-12)
 
         for _ in range(num_iters):
-            Mv = M @ v              # (r,)
-            u = N @ Mv               # (out,)
+            u = G @ v
             u_norm = u.norm()
             if u_norm < 1e-12:
                 return None
             u = u / u_norm
 
-            Ntu = N.T @ u            # (r,)
-            v = M.T @ Ntu            # (in,)
+            v = G.T @ u
             v_norm = v.norm()
             if v_norm < 1e-12:
                 return None
             v = v / v_norm
 
-        Mv = M @ v
-        sigma_signed = float(torch.dot(u, N @ Mv).item())
+        sigma_signed = float(torch.dot(u, G @ v).item())
         if sigma_signed < 0:
             u = -u
         return u, v, abs(sigma_signed)
@@ -307,24 +319,13 @@ class EvoRankLoRALayer(nn.Module):
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
         """
         论文 Proposition 3.2：计算近似 G = ∂L/∂ΔW 的主 rank-1 奇异方向。
-        复用 compute_demand_score 的 (A^TA+εI)^{-1}A^T 重建，然后做 power iteration。
+        直接对 exact_G 执行 power_iteration。
         """
-        if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
+        if getattr(self, '_exact_G', None) is None:
             return None
 
-        active_idx = self.get_active_indices()
-        grad_proxy = self._build_grad_proxy(active_idx)
-        return self._compute_gradient_rank1_direction_from_proxy(grad_proxy)
-
-    @torch.no_grad()
-    def _compute_gradient_rank1_direction_from_proxy(
-        self,
-        grad_proxy: Optional[Tuple[torch.Tensor, torch.Tensor]],
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, float]]:
-        if grad_proxy is None:
-            return None
-        n, m = grad_proxy
-        return self._power_iteration_rank1(n, m)
+        with torch.autocast(device_type=self._exact_G.device.type if self._exact_G.device.type != "meta" else "cpu", enabled=False):
+            return self._power_iteration_exact_G(self._exact_G.float())
 
     @torch.no_grad()
     def compute_gradient_rank1_direction(
@@ -432,74 +433,35 @@ class EvoRankLoRALayer(nn.Module):
     @torch.no_grad()
     def compute_demand_score(self, use_cached: bool = False) -> float:
         """
-        层需求信号 g_ℓ ≈ ||∂L/∂(ΔW_ℓ)||_F（论文式 138 的投影近似）。
+        计算真实的梯度需求信号 g_ℓ = ||∂L/∂(ΔW_ℓ)||_F。
 
-        注意：此实现计算的是真实 ||G||_F 的 **下界 (Lower Bound)**，而非精确值。
-        原因：pinv(A^T) 给出的是最小范数解，等价于将 G 投影到 A 的行空间上；
-        真实梯度矩阵 G 中正交于 A 行空间的分量被丢弃。在不使用 forward/backward
-        hooks 截获激活值的前提下，这是仅凭参数梯度所能做到的最优近似。
-
-        推导：前向为 ΔW = s · B_active A_active，故 ∂L/∂B = s G A^T、∂L/∂A = s B^T G，
-        由 G A^T = (∂L/∂B)/s 得 G_proj = (∂L/∂B/s) pinv(A^T)，且
-        ||G_proj||_F^2 = tr(N^T N M M^T)，其中 N = ∂L/∂B/s，M = pinv(A^T)。
+        使用前向时添加的 backward_hook 生成真实的 _exact_G。
         """
         if use_cached and self._cached_demand_score is not None:
             return self._cached_demand_score
 
-        if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
-             raise ValueError("需要先调用 .backward() 计算出 lora_A 和 lora_B 的梯度")
-        if self.debug and not self.lora_A.weight.grad.any():
-             warnings.warn("lora_A.grad 全为零，可能是 zero_grad() 之后未执行新的 backward()")
-
-        active_idx = self.get_active_indices()
-        grad_proxy = self._build_grad_proxy(active_idx)
-        return self._compute_demand_score_from_proxy(grad_proxy)
-
-    @torch.no_grad()
-    def _build_grad_proxy(
-        self,
-        active_idx: List[int],
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        共享梯度代理（N, M），供 demand_score 与 rank-1 direction 共用：
-          N = (∂L/∂B)/s           形状 (out, r)
-          M = (A^T A + εI)^(-1)A^T 形状 (r, in)
-        """
-        if len(active_idx) == 0:
-            return None
-
-        if self.lora_A.weight.grad is None or self.lora_B.weight.grad is None:
-            raise ValueError("需要先调用 .backward() 计算出 lora_A 和 lora_B 的梯度")
-
-        s = float(self.get_scaling_factor(len(active_idx)))
-        if s == 0.0:
-            return None
-
-        idx_t = torch.as_tensor(active_idx, device=self.lora_A.weight.device, dtype=torch.long)
-        with torch.autocast(device_type=self.lora_A.weight.device.type if self.lora_A.weight.device.type != "meta" else "cpu", enabled=False):
-            gb = self.lora_B.weight.grad.index_select(1, idx_t).float()
-            a = self.lora_A.weight.index_select(0, idx_t).float()
-            n = gb / s
-            at = a.T
-            ata = at.T @ at
-            m = torch.linalg.solve(
-                ata + 1e-6 * torch.eye(ata.size(0), device=ata.device, dtype=ata.dtype),
-                at.T,
+        if getattr(self, '_exact_G', None) is None:
+            if self.lora_A.weight.grad is None:
+                raise ValueError("需要先调用 .backward() 且由 hook 计算精确 G")
+            warnings.warn(
+                "compute_demand_score: _exact_G is None but gradients exist. "
+                "Returning 0.0 — EMA will drift toward pure capacity-norm signal.",
+                stacklevel=2,
             )
-        return n, m
-
-    @torch.no_grad()
-    def _compute_demand_score_from_proxy(
-        self,
-        grad_proxy: Optional[Tuple[torch.Tensor, torch.Tensor]],
-    ) -> float:
-        if grad_proxy is None:
             return 0.0
-        n, m = grad_proxy
-        s_mtx = n.T @ n
-        t_mtx = m @ m.T
-        gf_sq = torch.trace(s_mtx @ t_mtx).clamp(min=0.0)
-        return float(torch.sqrt(gf_sq).item())
+
+        exact_G = self._exact_G
+        
+        # DDP同步
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+             torch.distributed.all_reduce(exact_G, op=torch.distributed.ReduceOp.AVG)
+
+        with torch.autocast(device_type=exact_G.device.type if exact_G.device.type != "meta" else "cpu", enabled=False):
+             G_f32 = exact_G.float()
+             gf_sq = torch.sum(G_f32 ** 2).item()
+        res = float(math.sqrt(gf_sq))
+        self._cached_demand_score = res
+        return res
 
     def merge(self, W: nn.Parameter):
         """
