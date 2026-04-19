@@ -99,7 +99,7 @@ run_task() {
     --adalora_orth_reg_weight $ORTH_REG \
     --sora_sparse_lambda 10 \
     --sora_sparse_lambda_2 3e-4 \
-    --lambda_c 0.0 \
+    --lambda_c 0.00001 \
     --expand_init_mode gradient \
     --evo_compensation_mode B \
     --mini_val_k 16 \
