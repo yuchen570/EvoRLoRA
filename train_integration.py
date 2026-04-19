@@ -174,7 +174,7 @@ def train_evo_lora_step(
     def _sync_controller_state_device(ctrl: RankEvolutionController) -> None:
         """
         controller 在注入阶段可能构建在 CPU，但模型后续会被搬到 CUDA。
-        这里在每步前做一次轻量对齐，避免状态张量与 LoRA 参数跨设备导致 RuntimeError。
+        这里在首次训练步或首次演化前做一次轻量对齐，避免状态张量与 LoRA 参数跨设备。
         """
         layer_device = next(iter(ctrl.layers.values())).lora_A.weight.device
         for name in ctrl.layers:
@@ -243,7 +243,6 @@ def train_evo_lora_step(
             _reset_optimizer_state_for_mutation(opt, mutation.expand_mut)
 
     model.train()
-    _sync_controller_state_device(controller)
     inputs, targets = train_batch
     model_device = next(model.parameters()).device
 
@@ -281,6 +280,10 @@ def train_evo_lora_step(
     should_evolve = (
         step >= warmup_steps and T_es > 0 and step % T_es == 0
     )
+    if step == 0 or (should_evolve and not getattr(controller, "_device_synced", False)):
+        _sync_controller_state_device(controller)
+        controller._device_synced = True
+
     did_cache_stats = False
     if should_evolve:
         # 在梯度裁剪之前缓存 g_ℓ 与分量分数，对应 ∂L/∂ΔW（与论文一致）；裁剪会改变范数口径。
@@ -303,15 +306,27 @@ def train_evo_lora_step(
     # 2) 外环结构演化（论文 Alg. 1 line 7–12; 统计已在裁剪前写入 layer 缓存）
     if should_evolve:
         controller.update_statistics()
-        # DDP 下为避免统计量在各卡之间出现微小差异，进一步对 EMA 统计做全局一致化。
-        if dist.is_available() and dist.is_initialized():
+        # DDP 下梯度在 backward 已全局同步；EMA 二次 all_reduce 属于冗余通信。
+        # 仅在 debug 模式做一致性检查（告警，不写回）。
+        if (
+            dist.is_available()
+            and dist.is_initialized()
+            and any(layer.debug for layer in controller.layers.values())
+        ):
+            import warnings
             world_size = dist.get_world_size()
             for name in controller.layers:
-                u = torch.tensor([controller.ema_u[name]], device=model_device, dtype=torch.float32)
-                dist.all_reduce(u, op=dist.ReduceOp.SUM)
-                controller.ema_u[name] = (u / world_size).item()
-                dist.all_reduce(controller.ema_s[name], op=dist.ReduceOp.SUM)
-                controller.ema_s[name] = controller.ema_s[name] / world_size
+                u_local = torch.tensor([controller.ema_u[name]], device=model_device, dtype=torch.float32)
+                u_check = u_local.clone()
+                dist.all_reduce(u_check, op=dist.ReduceOp.SUM)
+                expected = u_check.item() / world_size
+                deviation = abs(controller.ema_u[name] - expected)
+                if deviation > 1e-4:
+                    warnings.warn(
+                        f"[EvoRank][DDP] EMA ema_u[{name}] 各卡不一致，"
+                        f"local={controller.ema_u[name]:.6f}, mean={expected:.6f}, "
+                        f"偏差={deviation:.2e}。请检查梯度同步是否正常。"
+                    )
         tau_grow, tau_prune = controller.compute_thresholds()
         controller.tick_evolution_state(tau_grow=tau_grow, tau_prune=tau_prune)
         mutations = controller.generate_mutations()
@@ -347,7 +362,7 @@ def train_evo_lora_step(
                     val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
                     val_targets_dev = val_targets.to(model_device)
                     base_logits = unwrapped_model(val_inputs_dev)
-                    base_eval_losses.append(loss_fn(base_logits, val_targets_dev).detach())
+                    base_eval_losses.append(loss_fn(base_logits.float(), val_targets_dev).detach())
                 base_eval_loss = torch.stack(base_eval_losses).mean()
                 if dist.is_available() and dist.is_initialized():
                     reduced_base = base_eval_loss.clone()
@@ -374,7 +389,7 @@ def train_evo_lora_step(
                             val_inputs_dev = {k: v.to(model_device) for k, v in val_inputs.items()}
                             val_targets_dev = val_targets.to(model_device)
                             val_logits = unwrapped_model(val_inputs_dev)
-                            batch_eval_loss = loss_fn(val_logits, val_targets_dev)
+                            batch_eval_loss = loss_fn(val_logits.float(), val_targets_dev)
                             eval_losses.append(batch_eval_loss.detach())
 
                         eval_loss = torch.stack(eval_losses).mean()

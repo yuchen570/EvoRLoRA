@@ -633,7 +633,7 @@ def run_qa_training(args, method: str):
         normal_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate")]
         optimizer = torch.optim.AdamW(normal_params, lr=args.learning_rate, weight_decay=args.weight_decay)
         sparse_optimizer = SparseAdamW(gate_params, lr=args.learning_rate,
-                                       weight_decay=args.weight_decay, eps=1e-8)
+                                       weight_decay=0.0, eps=1e-8)
     lr_sched = _cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
     sparse_sched = _cosine_schedule_with_warmup(sparse_optimizer, warmup_steps, total_steps) \
         if sparse_optimizer is not None else None

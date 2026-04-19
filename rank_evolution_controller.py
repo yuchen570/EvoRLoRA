@@ -174,6 +174,7 @@ class RankEvolutionController:
         
         # 内部状态变量
         self.ema_u: Dict[str, float] = {name: 0.0 for name in self.layers}
+        self._ema_u_corrected: Dict[str, float] = {name: 0.0 for name in self.layers}
         self.ema_s: Dict[str, torch.Tensor] = {name: torch.zeros(r_max, device=device) for name in self.layers}
         
         self.count_g: Dict[str, int] = {name: 0 for name in self.layers}
@@ -184,6 +185,9 @@ class RankEvolutionController:
         
         # 是否完成了冷启动第一帧 (Step 0 全零陷阱的防御标志)
         self._is_initialized = False
+        self._ema_step = 0
+        # 设备对齐状态：由 train_evo_lora_step 在首次训练/首次演化时置 True
+        self._device_synced = False
 
         self.max_expand_candidates = max_expand_candidates
         self.max_prune_candidates = max_prune_candidates
@@ -268,7 +272,31 @@ class RankEvolutionController:
             else:
                 self.ema_s[name][active] = self.rho * self.ema_s[name][active] + (1 - self.rho) * curr_s[active]
 
+        self._ema_step += 1
+        bc = 1.0 - (self.rho ** self._ema_step)
+        for name in self.layers:
+            if self._ema_step <= 1:
+                self._ema_u_corrected[name] = self.ema_u[name]
+            else:
+                self._ema_u_corrected[name] = self.ema_u[name] / (bc + 1e-12)
+
         self._is_initialized = True
+
+    @torch.no_grad()
+    def _select_expand_slot(self, layer: EvoRankLoRALayer) -> Optional[int]:
+        """
+        权重继承感知的扩张槽位选择：
+        在 inactive 槽中优先选择 ||a_i|| * ||b_i|| 最大的组件。
+        """
+        inactive_indices = layer.get_inactive_indices()
+        if not inactive_indices:
+            return None
+        idx_t = torch.as_tensor(inactive_indices, device=layer.lora_A.weight.device, dtype=torch.long)
+        norms_a = torch.norm(layer.lora_A.weight.index_select(0, idx_t), dim=1)
+        norms_b = torch.norm(layer.lora_B.weight.index_select(1, idx_t), dim=0)
+        scores = norms_a * norms_b
+        best_local = int(torch.argmax(scores).item())
+        return int(inactive_indices[best_local])
 
     def compute_thresholds(self) -> Tuple[float, float]:
         """
@@ -287,7 +315,7 @@ class RankEvolutionController:
             
         # 扩张阈值 tau_grow（统一在模型设备上计算，避免 CPU/GPU 设备间隙）
         device = next(iter(self.layers.values())).lora_A.weight.device
-        all_u = torch.tensor(list(self.ema_u.values()), dtype=torch.float32, device=device)
+        all_u = torch.tensor(list(self._ema_u_corrected.values()), dtype=torch.float32, device=device)
         if all_u.numel() > 0:
             tau_grow = torch.quantile(all_u, self.p_g).item()
         else:
@@ -305,7 +333,8 @@ class RankEvolutionController:
             all_valid_s = torch.cat(valid_s_list)
             tau_prune = torch.quantile(all_valid_s, self.p_p).item()
         else:
-            tau_prune = float('-inf') # 防崩溃
+            # 无有效候选时将阈值设为 -inf，使 ema_s < tau_prune 恒为 False，等效暂停剪枝。
+            tau_prune = float('-inf')
             
         return tau_grow, tau_prune
 
@@ -328,7 +357,7 @@ class RankEvolutionController:
             act_rank = layer.get_active_rank()
             
             # 1. 更新扩张计数 count_g
-            if self.ema_u[name] > tau_grow and act_rank < self.r_max:
+            if self._ema_u_corrected[name] > tau_grow and act_rank < self.r_max:
                 self.count_g[name] += 1
             else:
                 self.count_g[name] = 0
@@ -371,8 +400,8 @@ class RankEvolutionController:
         for name, layer in self.layers.items():
             if self.count_g[name] < self.H_g:
                 continue
-            inactive_indices = layer.get_inactive_indices()
-            if not inactive_indices:
+            expand_idx = self._select_expand_slot(layer)
+            if expand_idx is None:
                 continue
             grad_dir = (
                 layer.compute_gradient_rank1_direction(use_cached=True)
@@ -380,11 +409,11 @@ class RankEvolutionController:
                 else None
             )
             e_mut = ExpandMutation(
-                name, layer, inactive_indices[0],
+                name, layer, expand_idx,
                 init_mode=self.expand_init_mode,
                 grad_direction=grad_dir,
             )
-            expand_candidates.append((float(self.ema_u[name]), e_mut))
+            expand_candidates.append((float(self._ema_u_corrected[name]), e_mut))
 
         expand_candidates.sort(key=lambda x: x[0], reverse=True)
         if self.max_expand_candidates is not None:
@@ -464,6 +493,7 @@ class RankEvolutionController:
             self.count_g[expand_mut.layer_name] = 0
             self.cooldowns[expand_mut.layer_name][expand_mut.index] = self.cooldown_steps
             self.count_p[prune_mut.layer_name][prune_mut.index] = 0
+            self.ema_s[prune_mut.layer_name][prune_mut.index] = 0.0
             mutation.clear_cache()
             return
 
@@ -481,6 +511,7 @@ class RankEvolutionController:
              name = mutation.layer_name
              idx = mutation.index
              self.count_p[name][idx] = 0
+             self.ema_s[name][idx] = 0.0
 
         # 提交后不再需要 undo 缓存，主动释放以避免外部日志持有时的显存泄漏。
         mutation.clear_cache()

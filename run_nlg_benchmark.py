@@ -540,7 +540,7 @@ def run_sft_training(args, method: str):
         sora_params = [p for n, p in model.named_parameters() if p.requires_grad and n.endswith(".gate")]
         normal_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".gate")]
         optimizer = torch.optim.AdamW(normal_params, lr=args.learning_rate, weight_decay=args.weight_decay)
-        sparse_optimizer = SparseAdamW(sora_params, lr=args.learning_rate, weight_decay=args.weight_decay, eps=1e-8)
+        sparse_optimizer = SparseAdamW(sora_params, lr=args.learning_rate, weight_decay=0.0, eps=1e-8)
 
     lr_scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
     if sparse_optimizer is not None:
