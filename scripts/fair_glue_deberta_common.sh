@@ -11,7 +11,7 @@
 #   ADALORA_REF_GLOBAL_BATCH  AdaLoRA NLU 参考脚本的全局 batch（默认 32 = 1×32），用于缩放 tinit/tf/delta
 # =============================================================================
 
-METHODS="evorank toplora flatlora pissa"
+METHODS="evorank lora adalora sora toplora flatlora pissa"
 MODEL="microsoft/deberta-v3-base"
 SEEDS="0 21 42 81 100"
 PROTOCOL="controlled_fair"
@@ -107,7 +107,7 @@ run_task() {
     --evo_p_g 0.75 \
     --evo_p_p 0.03 \
     --evo_H_p 6 \
-    --evo_cooldown_steps 5 \
+    --evo_cooldown_steps 3 \
     --evo_max_reallocate_candidates 16 \
     --verify_n_samples 0 \
     --seed_list $SEEDS \
