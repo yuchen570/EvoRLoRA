@@ -10,4 +10,4 @@ cd "$REPO_ROOT"
 source "${SCRIPT_DIR}/fair_glue_deberta_common.sh"
 mkdir -p logs runs artifacts
 MASTER_PORT="${MASTER_PORT:-$(( ${BASE_MASTER_PORT:-29500} + 0 * ${MASTER_PORT_STEP:-100} ))}"
-run_task "$MASTER_PORT" cola 8e-4 15 64 32 0.01 800 3500 10 0.1
+run_task "$MASTER_PORT" cola 8e-4 25 64 32 0.01 800 3500 10 0.1
