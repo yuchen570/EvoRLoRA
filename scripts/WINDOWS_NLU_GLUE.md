@@ -220,6 +220,8 @@ CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
   --lora_alpha 16 \
   --epochs 7 \
   --batch_size 32 \
+  --dataloader_num_workers 8 \
+  --pin_memory \
   --max_length 256 \
   --lr 5e-4 \
   --warmup_ratio 0.06 \
@@ -284,6 +286,8 @@ CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
   --lora_alpha 32 \
   --epochs 30 \
   --batch_size 32 \
+  --dataloader_num_workers 8 \
+  --pin_memory \
   --max_length 320 \
   --lr 1e-3 \
   --warmup_ratio 0.06 \
@@ -348,6 +352,8 @@ CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
   --lora_alpha 16 \
   --epochs 5 \
   --batch_size 32 \
+  --dataloader_num_workers 8 \
+  --pin_memory \
   --max_length 320 \
   --lr 8e-4 \
   --warmup_ratio 0.06 \
@@ -412,6 +418,8 @@ CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
   --lora_alpha 32 \
   --epochs 5 \
   --batch_size 32 \
+  --dataloader_num_workers 8 \
+  --pin_memory \
   --max_length 512 \
   --lr 5e-4 \
   --warmup_ratio 0.06 \
@@ -476,6 +484,8 @@ CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
   --lora_alpha 32 \
   --epochs 50 \
   --batch_size 32 \
+  --dataloader_num_workers 8 \
+  --pin_memory \
   --max_length 320 \
   --lr 1.2e-3 \
   --warmup_ratio 0.06 \
@@ -540,6 +550,8 @@ CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
   --lora_alpha 16 \
   --epochs 24 \
   --batch_size 32 \
+  --dataloader_num_workers 8 \
+  --pin_memory \
   --max_length 128 \
   --lr 8e-4 \
   --warmup_ratio 0.06 \
@@ -604,6 +616,8 @@ CUDA_VISIBLE_DEVICES="0" python run_benchmark.py \
   --lora_alpha 32 \
   --epochs 25 \
   --batch_size 32 \
+  --dataloader_num_workers 8 \
+  --pin_memory \
   --max_length 128 \
   --lr 2.2e-3 \
   --warmup_ratio 0.06 \

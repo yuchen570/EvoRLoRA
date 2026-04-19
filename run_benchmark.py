@@ -350,8 +350,8 @@ def setup_data_and_model(
     rank: int = 0,
     world_size: int = 1,
     seed: int = 42,
-    dataloader_num_workers: int = 2,
-    pin_memory: bool = True,
+    dataloader_num_workers: int = 1,
+    pin_memory: bool = False,
 ) -> Tuple[DataLoader, DataLoader, Optional[Union[DataLoader, Dict[str, DataLoader]]], nn.Module, AutoTokenizer]:
     os.makedirs(dataset_cache_dir, exist_ok=True)
     os.makedirs(model_cache_dir, exist_ok=True)
